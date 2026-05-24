@@ -81,6 +81,25 @@ namespace srw
         }
     }
 
+    // The selectable source stereo layouts, shared by the tray menu and command
+    // handling so their order stays in sync.
+    struct StereoFormatEntry { StereoFormat fmt; const char* label; };
+    inline const StereoFormatEntry* StereoFormatList(int& count)
+    {
+        static const StereoFormatEntry list[] = {
+            { StereoFormat::FullSBS,           "Side-by-Side (full)" },
+            { StereoFormat::HalfSBS,           "Side-by-Side (half)" },
+            { StereoFormat::FullTAB,           "Top-and-Bottom (full)" },
+            { StereoFormat::HalfTAB,           "Top-and-Bottom (half)" },
+            { StereoFormat::Anaglyph,          "Anaglyph (red/cyan)" },
+            { StereoFormat::RowInterleaved,    "Row interleaved" },
+            { StereoFormat::ColumnInterleaved, "Column interleaved" },
+            { StereoFormat::Checkerboard,      "Checkerboard" },
+        };
+        count = (int)(sizeof(list) / sizeof(list[0]));
+        return list;
+    }
+
     // Show a modal error box (used for unrecoverable startup failures).
     inline void ShowError(const char* msg)
     {

@@ -66,11 +66,13 @@ add_executable(SRWeaver WIN32
     src/SRWeaver.cpp
     src/TrayIcon.cpp
     src/Capture.cpp
+    src/Converter.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
     src/TrayIcon.h
     src/Capture.h
+    src/Converter.h
     src/resource.h
     src/app.rc
 )
@@ -93,6 +95,7 @@ target_link_libraries(SRWeaver PRIVATE
     d3d11
     dxgi
     dxguid
+    d3dcompiler   # runtime HLSL compile for the conversion shaders
     shcore        # SetProcessDpiAwareness
     shell32       # Shell_NotifyIcon (tray)
     user32

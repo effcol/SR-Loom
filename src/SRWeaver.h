@@ -51,6 +51,11 @@ namespace srw
 
         void Shutdown();
 
+        // The loaded test image as a source for the converter.
+        ID3D11ShaderResourceView* SourceSRV() const { return m_viewSRV; }
+        int SourceWidth()  const { return m_imgW; }
+        int SourceHeight() const { return m_imgH; }
+
         bool HasContext() const { return m_context != nullptr; }
         bool HasWeaver()  const { return m_weaver != nullptr; }
 
@@ -61,5 +66,7 @@ namespace srw
         SR::IDX11Weaver1*         m_weaver  = nullptr;
         ID3D11Texture2D*          m_viewTex = nullptr;
         ID3D11ShaderResourceView* m_viewSRV = nullptr;
+        int                       m_imgW    = 0;   // loaded image full size
+        int                       m_imgH    = 0;
     };
 }

@@ -91,7 +91,7 @@ HWND TrayIcon::WindowAt(size_t index) const
 }
 
 void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                               SourceKind source)
+                               SourceKind source, StereoFormat format, bool swapEyes)
 {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -131,6 +131,18 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
     }
 
     AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(srcMenu), "Source");
+
+    // 3D format submenu (source stereo layout) + eye swap.
+    HMENU fmtMenu = CreatePopupMenu();
+    int fmtCount = 0;
+    const StereoFormatEntry* fmts = StereoFormatList(fmtCount);
+    for (int i = 0; i < fmtCount; ++i)
+        AppendMenuA(fmtMenu, MF_STRING | (fmts[i].fmt == format ? MF_CHECKED : 0),
+                    ID_TRAY_FMT_BASE + (UINT)i, fmts[i].label);
+    AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");
+    AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fmtMenu), "3D format");
+
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
 

@@ -7,6 +7,7 @@
 #include "SRWeaver.h"
 #include "TrayIcon.h"
 #include "Capture.h"
+#include "Converter.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -26,13 +27,16 @@ namespace
     struct AppState
     {
         HWND       hwnd          = nullptr;
-        Renderer   renderer;
-        SRWeaver   weaver;
-        TrayIcon   tray;
-        Capture    capture;
-        bool       weavingEnabled = true;
-        OutputMode mode           = OutputMode::Fullscreen;
-        SourceKind source         = SourceKind::TestImage;
+        Renderer     renderer;
+        SRWeaver     weaver;
+        TrayIcon     tray;
+        Capture      capture;
+        Converter    converter;
+        bool         weavingEnabled = true;
+        OutputMode   mode           = OutputMode::Fullscreen;
+        SourceKind   source         = SourceKind::TestImage;
+        StereoFormat format         = StereoFormat::FullSBS;  // source stereo layout
+        bool         swapEyes       = false;
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
@@ -234,6 +238,7 @@ namespace
                                           StereoFormat::FullSBS,
                                           app.renderer.BackBufferFormat());
         app.source = SourceKind::TestImage;
+        app.captureRebind = true;   // rebind the weaver to the converter output
         if (app.mode == OutputMode::WindowOverlay)   // overlay only makes sense for a window
             app.mode = OutputMode::Fullscreen;
         if (app.weavingEnabled) ApplyMode(app);
@@ -322,23 +327,39 @@ namespace
             return;
         }
 
-        // For passthrough, weave only the region of the monitor beneath the viewer.
-        if (app.source == SourceKind::CaptureMonitor && app.capture.FrameWidth() > 0)
+        // Resolve the current source frame: the test image, or a capture frame.
+        ID3D11ShaderResourceView* srcSRV = nullptr;
+        int srcW = 0, srcH = 0;
+        if (app.source == SourceKind::TestImage)
         {
-            RECT r = PassthroughRegion(app);
-            app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
+            srcSRV = app.weaver.SourceSRV();
+            srcW   = app.weaver.SourceWidth();
+            srcH   = app.weaver.SourceHeight();
+        }
+        else if (app.capture.IsActive())
+        {
+            // For passthrough, weave only the region of the monitor beneath the viewer.
+            if (app.source == SourceKind::CaptureMonitor && app.capture.FrameWidth() > 0)
+            {
+                RECT r = PassthroughRegion(app);
+                app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
+            }
+            bool sizeChanged = false;
+            app.capture.Update(sizeChanged);   // refresh the capture texture in place
+            srcSRV = app.capture.SRV();
+            srcW   = app.capture.Width();
+            srcH   = app.capture.Height();
         }
 
-        // Pull the newest captured frame and (re)point the weaver at it on resize.
-        if (app.source != SourceKind::TestImage && app.capture.IsActive())
+        // Convert the source into a side-by-side texture and feed it to the weaver.
+        if (srcSRV && srcW > 0 && srcH > 0)
         {
-            bool sizeChanged = false;
-            if (app.capture.Update(sizeChanged) && (sizeChanged || app.captureRebind))
+            app.converter.SetFormat(app.format, app.swapEyes);
+            bool resized = false;
+            if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
-                Log("RenderFrame: rebind weaver to capture %dx%d",
-                    app.capture.Width(), app.capture.Height());
-                app.weaver.SetInputView(app.capture.SRV(), app.capture.Width() / 2,
-                                        app.capture.Height(), app.capture.SRVFormat());
+                app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
+                                        app.converter.OutputHeight(), app.converter.OutputFormat());
                 app.captureRebind = false;
             }
         }
@@ -356,7 +377,8 @@ namespace
         {
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
-                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source);
+                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source,
+                                          app->format, app->swapEyes);
             return 0;
 
         case WM_COMMAND:
@@ -368,6 +390,15 @@ namespace
             if (cmd >= ID_TRAY_SRC_WINDOW_BASE && cmd <= ID_TRAY_SRC_WINDOW_MAX)
             {
                 UseWindow(*app, app->tray.WindowAt(cmd - ID_TRAY_SRC_WINDOW_BASE));
+                return 0;
+            }
+            // 3D-format items occupy another range.
+            if (cmd >= ID_TRAY_FMT_BASE && cmd <= ID_TRAY_FMT_MAX)
+            {
+                int n = 0;
+                const StereoFormatEntry* fmts = StereoFormatList(n);
+                const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
+                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; }
                 return 0;
             }
 
@@ -387,6 +418,7 @@ namespace
                 if (app->weavingEnabled) ApplyMode(*app);
                 return 0;
             case ID_TRAY_CAPTURE_FOREGROUND: CaptureForeground(*app); return 0;
+            case ID_TRAY_SWAP_EYES: app->swapEyes = !app->swapEyes; app->captureRebind = true; return 0;
             case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
             case ID_TRAY_SRC_MONITOR:
                 UsePassthrough(*app);
@@ -529,6 +561,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     const bool capInit = app.capture.Initialize(app.renderer.Device(), app.renderer.Context());
     Log("WinMain: capture.Initialize=%d", capInit ? 1 : 0);
 
+    // Initialize the format-conversion stage (capture/image -> SBS for the weaver).
+    if (!app.converter.Initialize(app.renderer.Device(), app.renderer.Context()))
+        return 7;
+    app.captureRebind = true;   // bind the weaver to the converter output on the first frame
+
     // Tray icon + global hotkeys.
     app.tray.Add(app.hwnd, "SR Weaver — weaving");
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
@@ -556,6 +593,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
     app.tray.Remove();
+    app.converter.Shutdown();
     app.capture.Shutdown();
     app.weaver.Shutdown();
     app.renderer.Shutdown();

@@ -149,11 +149,10 @@ bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
         return false;
     }
 
-    // The weaver samples the left half and right half of the SBS texture, so
-    // the per-eye width is half of the image width. (Half-SBS uses the same
-    // sampling; correct-aspect rescaling will come with the conversion stage.)
+    // Store the full image size; the converter consumes this as its source.
     (void)fmt;
-    SetInputView(m_viewSRV, w / 2, h, texFormat);
+    m_imgW = w;
+    m_imgH = h;
     return true;
 }
 
