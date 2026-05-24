@@ -32,8 +32,15 @@ namespace srw
         // finalize the SR context. Call after the D3D device exists.
         bool CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window);
 
-        // Load a stereo image from disk into the SBS view texture and register
-        // it with the weaver. fmt currently distinguishes SBS variants only.
+        // Register the texture the weaver should sample as its SBS input. The
+        // weaver re-samples this view live each weave(), so callers that update
+        // the underlying texture in place only need to call this on size change.
+        // perEyeWidth is half the full SBS width.
+        void SetInputView(ID3D11ShaderResourceView* srv, int perEyeWidth,
+                          int height, DXGI_FORMAT format);
+
+        // Load a stereo image from disk into an owned SBS texture and register
+        // it as the input. fmt currently distinguishes SBS variants only.
         bool SetStereoImageFromFile(ID3D11Device* device,
                                     const char* path,
                                     StereoFormat fmt,

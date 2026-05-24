@@ -153,10 +153,15 @@ bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
     // the per-eye width is half of the image width. (Half-SBS uses the same
     // sampling; correct-aspect rescaling will come with the conversion stage.)
     (void)fmt;
-    const int viewWidth  = w / 2;
-    const int viewHeight = h;
-    m_weaver->setInputViewTexture(m_viewSRV, viewWidth, viewHeight, texFormat);
+    SetInputView(m_viewSRV, w / 2, h, texFormat);
     return true;
+}
+
+void SRWeaver::SetInputView(ID3D11ShaderResourceView* srv, int perEyeWidth,
+                            int height, DXGI_FORMAT format)
+{
+    if (m_weaver && srv)
+        m_weaver->setInputViewTexture(srv, perEyeWidth, height, format);
 }
 
 void SRWeaver::Weave()

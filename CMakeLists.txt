@@ -65,10 +65,12 @@ add_executable(SRWeaver WIN32
     src/Renderer.cpp
     src/SRWeaver.cpp
     src/TrayIcon.cpp
+    src/Capture.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
     src/TrayIcon.h
+    src/Capture.h
     src/resource.h
     src/app.rc
 )
@@ -95,6 +97,7 @@ target_link_libraries(SRWeaver PRIVATE
     shell32       # Shell_NotifyIcon (tray)
     user32
     gdi32
+    windowsapp    # Windows.Graphics.Capture (WinRT)
 )
 
 # Copy the bundled test stereo image next to the executable.

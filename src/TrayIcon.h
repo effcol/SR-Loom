@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Common.h"
+#include <vector>
 
 namespace srw
 {
@@ -14,8 +15,14 @@ namespace srw
         ID_TRAY_TOGGLE_WEAVE = 40001,
         ID_TRAY_MODE_FULLSCREEN,
         ID_TRAY_MODE_WINDOWED,
+        ID_TRAY_SRC_TESTIMAGE,
+        ID_TRAY_SRC_MONITOR,
         ID_TRAY_EXIT
     };
+
+    // Window-list items get ids in this range; index = id - base.
+    constexpr UINT ID_TRAY_SRC_WINDOW_BASE = 41000;
+    constexpr UINT ID_TRAY_SRC_WINDOW_MAX  = 41999;
 
     class TrayIcon
     {
@@ -31,10 +38,17 @@ namespace srw
 
         // Build and show the right-click context menu, with current state
         // reflected as checkmarks/radio marks. Commands post as WM_COMMAND.
-        void ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode);
+        // Enumerates top-level windows into the Source submenu.
+        void ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
+                             SourceKind source);
+
+        // Resolve a window-list menu index (id - ID_TRAY_SRC_WINDOW_BASE) to its
+        // HWND, captured when the menu was last shown. Null if out of range.
+        HWND WindowAt(size_t index) const;
 
     private:
-        HWND m_hwnd  = nullptr;
-        bool m_added = false;
+        HWND              m_hwnd  = nullptr;
+        bool              m_added = false;
+        std::vector<HWND> m_windowList;   // mirrors the Source submenu order
     };
 }

@@ -19,7 +19,8 @@ bool Renderer::Initialize(HWND hwnd)
     if (m_width == 0)  m_width = 1280;
     if (m_height == 0) m_height = 720;
 
-    UINT flags = 0;
+    // BGRA support is required for interop with Windows.Graphics.Capture / D2D.
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif

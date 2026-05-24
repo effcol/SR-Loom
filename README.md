@@ -6,9 +6,10 @@ panels). It takes a stereo source — eventually captured from any window or the
 whole screen — converts it to the side-by-side form the SR weaver consumes, and
 weaves it with head-tracked depth, in either a window or fullscreen.
 
-> Status: **Milestone 1** — tray icon + a static side-by-side test image woven
-> into a window that toggles between fullscreen and windowed. The capture and
-> format-conversion stages come next.
+> Status: **Milestone 2** — live capture (Windows.Graphics.Capture) of a chosen
+> window or the primary monitor, woven as full SBS, selectable from the tray.
+> The format-conversion stage (TAB / anaglyph / interleaved / etc. → SBS) is
+> next.
 
 ## How it works
 
@@ -49,9 +50,14 @@ the modern `IDX11Weaver1` / `CreateDX11Weaver` API (windowed + fullscreen).
 
 ## Controls
 
-- **Tray right-click**: toggle weaving, choose Fullscreen / Windowed, Exit.
+- **Tray right-click**: toggle weaving; choose Fullscreen / Windowed; pick a
+  **Source** (Test image, Capture primary monitor, or any open window); Exit.
 - **Ctrl+Alt+W**: enable/disable weaving.
 - **Ctrl+Alt+F**: toggle fullscreen / windowed.
+
+Captured sources are currently treated as **full SBS**; point it at a window or
+screen already showing side-by-side stereo. Other layouts arrive with the
+conversion stage.
 
 ## License
 

@@ -6,6 +6,7 @@
 #endif
 #include <windows.h>
 #include <cstdio>
+#include <cstdarg>
 
 // Release a COM pointer and null it.
 #ifndef SAFE_RELEASE
@@ -19,6 +20,14 @@ namespace srw
     {
         Fullscreen,   // borderless window covering the SR display
         Windowed      // normal resizable window
+    };
+
+    // What the weaver is currently weaving.
+    enum class SourceKind
+    {
+        TestImage,        // bundled static SBS image
+        CaptureMonitor,   // live capture of the SR monitor
+        CaptureWindow     // live capture of a chosen window
     };
 
     // Stereo layout of the SOURCE that we convert into the side-by-side
@@ -36,6 +45,25 @@ namespace srw
         Checkerboard,       // quincunx
         FrameSequential     // alternating frames over time
     };
+
+    // Append a line to srweaver.log (next to the exe) and the debugger output.
+    inline void Log(const char* fmt, ...)
+    {
+        char buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        ::OutputDebugStringA(buf);
+        ::OutputDebugStringA("\n");
+        FILE* f = nullptr;
+        if (fopen_s(&f, "srweaver.log", "a") == 0 && f)
+        {
+            fputs(buf, f);
+            fputc('\n', f);
+            fclose(f);
+        }
+    }
 
     // Show a modal error box (used for unrecoverable startup failures).
     inline void ShowError(const char* msg)

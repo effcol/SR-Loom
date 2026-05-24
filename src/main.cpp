@@ -6,6 +6,7 @@
 #include "Renderer.h"
 #include "SRWeaver.h"
 #include "TrayIcon.h"
+#include "Capture.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -26,8 +27,11 @@ namespace
         Renderer   renderer;
         SRWeaver   weaver;
         TrayIcon   tray;
+        Capture    capture;
         bool       weavingEnabled = true;
         OutputMode mode           = OutputMode::Fullscreen;
+        SourceKind source         = SourceKind::TestImage;
+        bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
     };
 
@@ -87,6 +91,36 @@ namespace
         app.tray.SetTooltip(enable ? "SR Weaver — weaving" : "SR Weaver — paused");
     }
 
+    // --- Source selection -------------------------------------------------
+
+    void UseTestImage(AppState& app)
+    {
+        app.capture.Stop();
+        app.weaver.SetStereoImageFromFile(app.renderer.Device(), "test_sbs.jpg",
+                                          StereoFormat::FullSBS,
+                                          app.renderer.BackBufferFormat());
+        app.source = SourceKind::TestImage;
+    }
+
+    void UseWindow(AppState& app, HWND target)
+    {
+        if (target && app.capture.StartWindow(target))
+        {
+            app.source = SourceKind::CaptureWindow;
+            app.captureRebind = true;   // re-register the SRV once frames arrive
+        }
+    }
+
+    void UseMonitor(AppState& app)
+    {
+        HMONITOR mon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if (app.capture.StartMonitor(mon))
+        {
+            app.source = SourceKind::CaptureMonitor;
+            app.captureRebind = true;
+        }
+    }
+
     void RenderFrame(AppState& app)
     {
         if (!app.weavingEnabled || IsIconic(app.hwnd) || !app.renderer.IsValid())
@@ -94,6 +128,21 @@ namespace
             Sleep(10);
             return;
         }
+
+        // Pull the newest captured frame and (re)point the weaver at it on resize.
+        if (app.source != SourceKind::TestImage && app.capture.IsActive())
+        {
+            bool sizeChanged = false;
+            if (app.capture.Update(sizeChanged) && (sizeChanged || app.captureRebind))
+            {
+                Log("RenderFrame: rebind weaver to capture %dx%d",
+                    app.capture.Width(), app.capture.Height());
+                app.weaver.SetInputView(app.capture.SRV(), app.capture.Width() / 2,
+                                        app.capture.Height(), app.capture.SRVFormat());
+                app.captureRebind = false;
+            }
+        }
+
         app.renderer.BindAndClearBackBuffer();
         app.weaver.Weave();
         app.renderer.Present(true);
@@ -107,12 +156,22 @@ namespace
         {
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
-                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode);
+                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source);
             return 0;
 
         case WM_COMMAND:
+        {
             if (!app) break;
-            switch (LOWORD(wParam))
+            const UINT cmd = LOWORD(wParam);
+
+            // Window-list items occupy a command-id range.
+            if (cmd >= ID_TRAY_SRC_WINDOW_BASE && cmd <= ID_TRAY_SRC_WINDOW_MAX)
+            {
+                UseWindow(*app, app->tray.WindowAt(cmd - ID_TRAY_SRC_WINDOW_BASE));
+                return 0;
+            }
+
+            switch (cmd)
             {
             case ID_TRAY_TOGGLE_WEAVE: SetWeaving(*app, !app->weavingEnabled); return 0;
             case ID_TRAY_MODE_FULLSCREEN:
@@ -123,9 +182,12 @@ namespace
                 app->mode = OutputMode::Windowed;
                 if (app->weavingEnabled) ApplyMode(*app);
                 return 0;
+            case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
+            case ID_TRAY_SRC_MONITOR:   UseMonitor(*app);   return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
             }
             break;
+        }
 
         case WM_HOTKEY:
             if (!app) break;
@@ -224,6 +286,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
                                            app.renderer.BackBufferFormat()))
         return 6;
 
+    // Initialize live capture (optional — the test image still works without it).
+    const bool capInit = app.capture.Initialize(app.renderer.Device(), app.renderer.Context());
+    Log("WinMain: capture.Initialize=%d", capInit ? 1 : 0);
+
     // Tray icon + global hotkeys.
     app.tray.Add(app.hwnd, "SR Weaver — weaving");
     RegisterHotKey(app.hwnd, kHotkeyToggle, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
@@ -249,6 +315,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     app.tray.Remove();
+    app.capture.Shutdown();
     app.weaver.Shutdown();
     app.renderer.Shutdown();
     g_app = nullptr;

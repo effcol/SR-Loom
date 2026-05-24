@@ -64,7 +64,34 @@ void TrayIcon::SetTooltip(const char* tooltip)
     Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
 
-void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode)
+namespace
+{
+    struct EnumCtx { std::vector<HWND>* list; HWND owner; };
+
+    BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lp)
+    {
+        auto* ctx = reinterpret_cast<EnumCtx*>(lp);
+
+        if (hwnd == ctx->owner)                    return TRUE;  // skip our own window
+        if (!IsWindowVisible(hwnd))                return TRUE;
+        if (GetWindow(hwnd, GW_OWNER) != nullptr)  return TRUE;  // skip owned popups
+        if (GetWindowTextLengthA(hwnd) == 0)       return TRUE;
+
+        const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        if (ex & WS_EX_TOOLWINDOW)                 return TRUE;  // skip tool windows
+
+        ctx->list->push_back(hwnd);
+        return TRUE;
+    }
+}
+
+HWND TrayIcon::WindowAt(size_t index) const
+{
+    return (index < m_windowList.size()) ? m_windowList[index] : nullptr;
+}
+
+void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
+                               SourceKind source)
 {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -77,6 +104,28 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode)
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::Windowed ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_MODE_WINDOWED, "Windowed");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+
+    // Source submenu: test image, monitor, then live window list.
+    HMENU srcMenu = CreatePopupMenu();
+    AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::TestImage ? MF_CHECKED : 0),
+                ID_TRAY_SRC_TESTIMAGE, "Test image");
+    AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
+                ID_TRAY_SRC_MONITOR, "Capture primary monitor");
+    AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);
+
+    m_windowList.clear();
+    EnumCtx ctx{ &m_windowList, hwnd };
+    EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&ctx));
+
+    for (size_t i = 0; i < m_windowList.size() && i <= (ID_TRAY_SRC_WINDOW_MAX - ID_TRAY_SRC_WINDOW_BASE); ++i)
+    {
+        char title[128];
+        GetWindowTextA(m_windowList[i], title, (int)ARRAYSIZE(title));
+        AppendMenuA(srcMenu, MF_STRING, ID_TRAY_SRC_WINDOW_BASE + (UINT)i, title);
+    }
+
+    AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(srcMenu), "Source");
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
 
     POINT pt{};
@@ -87,5 +136,5 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode)
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
     PostMessage(hwnd, WM_NULL, 0, 0);
 
-    DestroyMenu(menu);
+    DestroyMenu(menu);  // also destroys the submenu
 }
