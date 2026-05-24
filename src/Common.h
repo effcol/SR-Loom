@@ -149,11 +149,11 @@ namespace srw
     inline const char* const* AnaglyphModeList(int& count)
     {
         static const char* const modes[] = {
-            "Recovered colour",              // per-eye luminance + shared, de-fringed chroma (default)
+            "DeAnaglyph",                    // per-eye luminance + shared, de-fringed chroma (default)
             "Colour (filtered)",             // each eye keeps only its own channels
             "Half colour",                   // blend toward grey
             "Mono (black & white)",
-            "DeAnaglyph",                    // multi-scale disparity-aligned colour recovery (red/cyan)
+            "Recovered colour",              // multi-scale disparity-aligned colour recovery (red/cyan)
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
         return modes;

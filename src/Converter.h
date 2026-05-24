@@ -37,12 +37,22 @@ namespace srw
         DXGI_FORMAT  OutputFormat()       const { return m_format; }
 
     private:
+        // A render-to-texture disparity level (RGBA16F: dLR, dRL, confidence).
+        struct DispTarget
+        {
+            ID3D11Texture2D*          tex = nullptr;
+            ID3D11RenderTargetView*   rtv = nullptr;
+            ID3D11ShaderResourceView* srv = nullptr;
+            int w = 0, h = 0;
+        };
+
         bool EnsureOutput(int width, int height);
         void ReleaseOutput();
         bool EnsureHistory(int width, int height);
         void ReleaseHistory();
-        bool EnsureDisparity(int width, int height);
-        void ReleaseDisparity();
+        bool EnsureDispTarget(DispTarget& t, int width, int height);
+        void ReleaseDispTarget(DispTarget& t);
+        void ReleaseDisparity();   // releases all disparity levels
 
         static const int kHistory = 6;  // frame-history ring depth (delay 1..5)
 
@@ -50,15 +60,16 @@ namespace srw
         ID3D11DeviceContext*     m_context = nullptr;
         ID3D11VertexShader*      m_vs      = nullptr;
         ID3D11PixelShader*       m_ps      = nullptr;
-        ID3D11PixelShader*       m_psCoarse = nullptr;  // coarse anaglyph disparity pass
+        ID3D11PixelShader*       m_psCoarse = nullptr;  // full-search disparity (coarsest level)
+        ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
+        ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
-        // Coarse L<->R disparity map for multi-scale anaglyph recovery (R16G16_FLOAT).
-        ID3D11Texture2D*          m_dispTex = nullptr;
-        ID3D11RenderTargetView*   m_dispRTV = nullptr;
-        ID3D11ShaderResourceView* m_dispSRV = nullptr;
-        int                       m_dispW = 0, m_dispH = 0;
+        // Multi-scale L<->R disparity pyramid for anaglyph recovery (all RGBA16F).
+        DispTarget m_disp0;   // coarsest (1/16) full search
+        DispTarget m_disp1;   // refined   (1/4)
+        DispTarget m_dispF;   // occlusion-filled (1/4); the compose pass reads this
 
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;
