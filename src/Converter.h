@@ -63,13 +63,15 @@ namespace srw
         ID3D11PixelShader*       m_psCoarse = nullptr;  // full-search disparity (coarsest level)
         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
+        ID3D11PixelShader*       m_psSmooth = nullptr;  // edge-aware disparity smoothing
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
         // Multi-scale L<->R disparity pyramid for anaglyph recovery (all RGBA16F).
         DispTarget m_disp0;   // coarsest (1/16) full search
         DispTarget m_disp1;   // refined   (1/4)
-        DispTarget m_dispF;   // occlusion-filled (1/4); the compose pass reads this
+        DispTarget m_disp2;   // occlusion-filled (1/4)
+        DispTarget m_dispF;   // edge-aware smoothed (1/4); the compose pass reads this
 
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;
