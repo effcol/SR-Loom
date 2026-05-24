@@ -104,7 +104,7 @@ namespace srw
     {
         static const char* const combos[] = {
             "Red / Cyan", "Red / Green", "Red / Blue",
-            "Green / Magenta", "Amber / Blue", "Magenta / Cyan",
+            "Green / Magenta", "Amber / Blue", "Cyan / Magenta",
         };
         count = (int)(sizeof(combos) / sizeof(combos[0]));
         return combos;
@@ -114,13 +114,20 @@ namespace srw
     inline const char* const* AnaglyphModeList(int& count)
     {
         static const char* const modes[] = {
-            "Colour (filtered)",       // each eye keeps its own channels
-            "Colour (recovered)",      // fuller colour, mild crosstalk (Dubois-style)
-            "Half colour",             // blend toward grey
+            "Colour (filtered)",       // each eye keeps its own channels (default)
+            "Half colour",             // blend toward grey (reduces colour rivalry)
             "Mono (black & white)",
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
         return modes;
+    }
+
+    // Index of a format within StereoFormatList (-1 if absent).
+    inline int StereoFormatIndex(StereoFormat f)
+    {
+        int n = 0; const StereoFormatEntry* l = StereoFormatList(n);
+        for (int i = 0; i < n; ++i) if (l[i].fmt == f) return i;
+        return -1;
     }
 
     // Show a modal error box (used for unrecoverable startup failures).

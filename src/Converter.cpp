@@ -33,24 +33,16 @@ float3 anaFilter(float3 c, int combo, int e)
     if (combo == 2) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, 0, c.b);   // Red/Blue
     if (combo == 3) return (e == 0) ? float3(0, c.g, 0)   : float3(c.r, 0, c.b); // Green/Magenta
     if (combo == 4) return (e == 0) ? float3(c.r, c.g, 0) : float3(0, 0, c.b);   // Amber/Blue
-    return                (e == 0) ? float3(c.r, 0, c.b) : float3(0, c.g, c.b);  // Magenta/Cyan
-}
-
-// Fuller-colour recovery: each eye keeps its channels and borrows a fraction of
-// the rest to fill in colour (mild crosstalk / retinal rivalry).
-float3 anaRecover(float3 c, int combo, int e)
-{
-    float3 f = anaFilter(c, combo, e);
-    return saturate(f + (c - f) * 0.35);
+    return                (e == 0) ? float3(0, c.g, c.b) : float3(c.r, 0, c.b);  // Cyan/Magenta
 }
 
 float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
 {
-    float3 col = (mode == 1) ? anaRecover(c, combo, e) : anaFilter(c, combo, e);
+    float3 col = anaFilter(c, combo, e);
     float  g   = dot(col, float3(0.299, 0.587, 0.114));
-    if (mode == 2) return lerp(col, g.xxx, 0.5);   // half colour
-    if (mode == 3) return g.xxx;                   // mono
-    return col;                                    // colour (filtered / recovered)
+    if (mode == 1) return lerp(col, g.xxx, 0.5);   // half colour
+    if (mode == 2) return g.xxx;                   // mono
+    return col;                                    // colour (filtered)
 }
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -67,9 +59,12 @@ VSOut VSMain(uint id : SV_VertexID)
 float4 PSMain(VSOut i) : SV_Target
 {
     float2 uv = i.uv;                       // 0..1 across the SBS output
-    bool right = uv.x >= 0.5;
+    bool rightPane = uv.x >= 0.5;           // which output half we're filling
+    // within-pane 0..1 (from the OUTPUT pane, always valid)
+    float2 e = float2(rightPane ? (uv.x - 0.5) * 2.0 : uv.x * 2.0, uv.y);
+    // which eye's content goes into this pane (eye swap only affects content)
+    bool right = rightPane;
     if (g_swap) right = !right;
-    float2 e = float2(right ? (uv.x - 0.5) * 2.0 : uv.x * 2.0, uv.y);  // within-eye 0..1
 
     if (g_format == 1)        // Top-and-bottom: top=left, bottom=right
     {

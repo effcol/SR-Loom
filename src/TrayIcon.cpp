@@ -135,11 +135,37 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
 
     // 3D format submenu (source stereo layout) + eye swap.
     HMENU fmtMenu = CreatePopupMenu();
-    int fmtCount = 0;
-    const StereoFormatEntry* fmts = StereoFormatList(fmtCount);
-    for (int i = 0; i < fmtCount; ++i)
-        AppendMenuA(fmtMenu, MF_STRING | (fmts[i].fmt == format ? MF_CHECKED : 0),
-                    ID_TRAY_FMT_BASE + (UINT)i, fmts[i].label);
+    auto addFmt = [&](HMENU m, StereoFormat f, const char* label)
+    {
+        int idx = StereoFormatIndex(f);
+        if (idx < 0) return;
+        AppendMenuA(m, MF_STRING | (format == f ? MF_CHECKED : 0),
+                    ID_TRAY_FMT_BASE + (UINT)idx, label);
+    };
+    auto groupChecked = [&](StereoFormat a, StereoFormat b)
+    {
+        return (format == a || format == b) ? (UINT)MF_CHECKED : 0u;
+    };
+
+    HMENU sbsMenu = CreatePopupMenu();
+    addFmt(sbsMenu, StereoFormat::FullSBS, "Full");
+    addFmt(sbsMenu, StereoFormat::HalfSBS, "Half");
+    AppendMenuA(fmtMenu, MF_POPUP | groupChecked(StereoFormat::FullSBS, StereoFormat::HalfSBS),
+                reinterpret_cast<UINT_PTR>(sbsMenu), "Side-by-Side");
+
+    HMENU tabMenu = CreatePopupMenu();
+    addFmt(tabMenu, StereoFormat::FullTAB, "Full");
+    addFmt(tabMenu, StereoFormat::HalfTAB, "Half");
+    AppendMenuA(fmtMenu, MF_POPUP | groupChecked(StereoFormat::FullTAB, StereoFormat::HalfTAB),
+                reinterpret_cast<UINT_PTR>(tabMenu), "Top-and-Bottom");
+
+    HMENU ilMenu = CreatePopupMenu();
+    addFmt(ilMenu, StereoFormat::RowInterleaved,    "Row");
+    addFmt(ilMenu, StereoFormat::ColumnInterleaved, "Column");
+    AppendMenuA(fmtMenu, MF_POPUP | groupChecked(StereoFormat::RowInterleaved, StereoFormat::ColumnInterleaved),
+                reinterpret_cast<UINT_PTR>(ilMenu), "Interleaved");
+
+    addFmt(fmtMenu, StereoFormat::Checkerboard, "Checkerboard");
 
     // Anaglyph submenu: colour combinations + decode mode.
     HMENU anaMenu = CreatePopupMenu();

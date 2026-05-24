@@ -514,9 +514,12 @@ namespace
     }
 }
 
-int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
+int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
     SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+
+    // Testing aid: "-noexclude" leaves the window visible to screen capture.
+    const bool excludeFromCapture = !(lpCmdLine && strstr(lpCmdLine, "-noexclude"));
 
     AppState app;
     g_app = &app;
@@ -563,7 +566,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     // Exclude our own window from screen capture so passthrough / monitor weaving
     // doesn't recursively capture its own output (no feedback loop).
-    SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
+    if (excludeFromCapture)
+        SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
 
     // Set up Direct3D + the weaver + the static SBS test image.
     if (!app.renderer.Initialize(app.hwnd))
