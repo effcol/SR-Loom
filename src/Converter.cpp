@@ -84,9 +84,25 @@ VSOut VSMain(uint id : SV_VertexID)
     return o;
 }
 
-// Coarse disparity pass (red/cyan anaglyph): renders a low-resolution map of the
-// horizontal disparity between the L (red) and R (cyan = (g+b)/2) views, in both
-// directions. Low resolution makes winner-take-all matching robust and smooth.
+// Gradient descriptor for anaglyph matching (SIRA, Kunze 2020, re-implemented):
+// match the DIFFERENCE between adjacent pixels, not raw intensity, so the red and
+// cyan views match by STRUCTURE despite their photometric (colour) mismatch. We
+// match red against the GREEN channel only (green carries most luminance; mixing
+// in blue adds noise). 5-tap window -> 4 adjacent differences per channel.
+void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
+{
+    float rr[5], gg[5];
+    [unroll] for (int w = 0; w < 5; ++w)
+    {
+        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
+        rr[w] = s.r; gg[w] = s.g;
+    }
+    [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
+}
+
+// Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal
+// disparity between the L (red) and R (green) views, both directions, via gradient
+// matching. Low resolution makes winner-take-all robust and smooth.
 // Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
 float4 PSAnaDisp(VSOut i) : SV_Target
 {
@@ -94,41 +110,21 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     float  ctx = 1.0 / max(g_coarseW, 1.0);   // one coarse texel in UV (match window step)
     float  maxD = g_dispMaxUV;
     const int N = 24;                          // search steps each direction
-    const int W = 2;                           // window half-width (5 taps)
     float  step = maxD / (float)N;
 
-    // Reference windows (L=red, R=cyan luma) at uv, plus their means. ZERO-MEAN
-    // matching removes the per-channel brightness offset, so red can be matched
-    // against cyan by STRUCTURE even where the two views differ in colour.
-    float refL[5], refR[5], mRefL = 0, mRefR = 0;
-    [unroll] for (int w = -W; w <= W; ++w)
-    {
-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)w * ctx, 0), 0).rgb;
-        float rcy = (s.g + s.b) * 0.5;
-        refL[w + W] = s.r; refR[w + W] = rcy;
-        mRefL += s.r; mRefR += rcy;
-    }
-    mRefL *= 0.2; mRefR *= 0.2;
+    float rgR[4], rgG[4]; gradWindow(uv, ctx, rgR, rgG);   // reference gradients at uv
 
     float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
     [loop] for (int k = -N; k <= N; ++k)
     {
         float d = (float)k * step;
-        float cL[5], cR[5], mcL = 0, mcR = 0;
-        [unroll] for (int w = -W; w <= W; ++w)
-        {
-            float3 s = srcTex.SampleLevel(samp, uv + float2(d + (float)w * ctx, 0), 0).rgb;
-            float rcy = (s.g + s.b) * 0.5;
-            cL[w + W] = s.r; cR[w + W] = rcy;
-            mcL += s.r; mcR += rcy;
-        }
-        mcL *= 0.2; mcR *= 0.2;
+        float cgR[4], cgG[4]; gradWindow(uv + float2(d, 0), ctx, cgR, cgG);
         float bias = abs(d) / max(maxD, 1e-4) * 0.06;   // gentle small-disparity tie-break
         float sadL = bias, sadR = bias;
-        [unroll] for (int w = 0; w < 5; ++w)
+        [unroll] for (int k2 = 0; k2 < 4; ++k2)
         {
-            sadL += abs((refL[w] - mRefL) - (cR[w] - mcR));   // L red vs candidate cyan
-            sadR += abs((refR[w] - mRefR) - (cL[w] - mcL));   // R cyan vs candidate red
+            sadL += abs(rgR[k2] - cgG[k2]);   // dLR: ref red-grad vs candidate green-grad
+            sadR += abs(rgG[k2] - cgR[k2]);   // dRL: ref green-grad vs candidate red-grad
         }
         if (sadL < bestL) { bestL = sadL; dL = d; }
         if (sadR < bestR) { bestR = sadR; dR = d; }
@@ -137,42 +133,28 @@ float4 PSAnaDisp(VSOut i) : SV_Target
 }
 
 // Pyramid refine: start from a coarser level (dispTex = prior) and do a local
-// zero-mean search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
+// gradient-matching search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
 float4 PSAnaRefine(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
     float  ctx = 1.0 / max(g_coarseW, 1.0);
     float2 prior = dispTex.SampleLevel(samp, uv, 0.0).rg;
-    const int W = 2, M = 6;
+    const int M = 6;
 
-    float refL[5], refR[5], mRefL = 0, mRefR = 0;
-    [unroll] for (int w = -W; w <= W; ++w)
-    {
-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)w * ctx, 0), 0).rgb;
-        float rcy = (s.g + s.b) * 0.5;
-        refL[w + W] = s.r; refR[w + W] = rcy; mRefL += s.r; mRefR += rcy;
-    }
-    mRefL *= 0.2; mRefR *= 0.2;
+    float rgR[4], rgG[4]; gradWindow(uv, ctx, rgR, rgG);   // reference gradients at uv
 
     float bestL = 1e9, dL = prior.r, bestR = 1e9, dR = prior.g;
     [loop] for (int k = -M; k <= M; ++k)
     {
-        float ddL = prior.r + (float)k * ctx;
-        float ddR = prior.g + (float)k * ctx;
-        float cR[5], cL[5], mcR = 0, mcL = 0;
-        [unroll] for (int w = -W; w <= W; ++w)
-        {
-            float3 sL = srcTex.SampleLevel(samp, uv + float2(ddL + (float)w * ctx, 0), 0).rgb;
-            float3 sR = srcTex.SampleLevel(samp, uv + float2(ddR + (float)w * ctx, 0), 0).rgb;
-            cR[w + W] = (sL.g + sL.b) * 0.5; mcR += cR[w + W];
-            cL[w + W] = sR.r;                mcL += cL[w + W];
-        }
-        mcR *= 0.2; mcL *= 0.2;
+        float ddL = prior.r + (float)k * ctx;   // candidate for dLR (match green)
+        float ddR = prior.g + (float)k * ctx;   // candidate for dRL (match red)
+        float lR[4], lG[4]; gradWindow(uv + float2(ddL, 0), ctx, lR, lG);
+        float rR[4], rG[4]; gradWindow(uv + float2(ddR, 0), ctx, rR, rG);
         float sadL = 0, sadR = 0;
-        [unroll] for (int w = 0; w < 5; ++w)
+        [unroll] for (int k2 = 0; k2 < 4; ++k2)
         {
-            sadL += abs((refL[w] - mRefL) - (cR[w] - mcR));
-            sadR += abs((refR[w] - mRefR) - (cL[w] - mcL));
+            sadL += abs(rgR[k2] - lG[k2]);   // ref red-grad vs candidate green-grad
+            sadR += abs(rgG[k2] - rR[k2]);   // ref green-grad vs candidate red-grad
         }
         if (sadL < bestL) { bestL = sadL; dL = ddL; }
         if (sadR < bestR) { bestR = sadR; dR = ddR; }
@@ -265,35 +247,25 @@ float4 PSMain(VSOut i) : SV_Target
         if (g_anaMode == 4 && g_anaCombo == 0)
         {
             float px = 1.0 / g_srcW;
+            float py = 1.0 / g_srcH;
             float3 dC = dispTex.SampleLevel(samp, e, 0.0).rgb;   // (dLR, dRL, confidence)
             float d0 = (eye == 0) ? dC.r : dC.g;                 // this eye -> the other
             float baseConf = dC.b;                               // from the fill pass
 
-            // Reference window (3-tap) + mean for zero-mean matching.
-            float refY[3], mRef = 0;
-            [unroll] for (int w = -1; w <= 1; ++w)
-            {
-                float3 cc = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
-                refY[w + 1] = (eye == 0) ? cc.r : (cc.g + cc.b) * 0.5;
-                mRef += refY[w + 1];
-            }
-            mRef /= 3.0;
+            // Reference gradient descriptor at e (red for the left eye, green for the
+            // right) for the full-res gradient-matching refine.
+            float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
 
             // Full-res refine (±3 px) with sub-pixel parabola fit on the cost curve.
             float sads[7];
             [unroll] for (int r = 0; r < 7; ++r)
             {
                 float d = d0 + (float)(r - 3) * px;
-                float cand[3], mc = 0;
-                [unroll] for (int w = -1; w <= 1; ++w)
-                {
-                    float3 cb = srcTex.SampleLevel(samp, float2(e.x + d + (float)w * px, e.y), 0.0).rgb;
-                    cand[w + 1] = (eye == 0) ? (cb.g + cb.b) * 0.5 : cb.r;
-                    mc += cand[w + 1];
-                }
-                mc /= 3.0;
+                float cR[4], cG[4]; gradWindow(float2(e.x + d, e.y), px, cR, cG);
                 float sd = 0.0;
-                [unroll] for (int w = 0; w < 3; ++w) sd += abs((refY[w] - mRef) - (cand[w] - mc));
+                [unroll] for (int k2 = 0; k2 < 4; ++k2)
+                    sd += (eye == 0) ? abs(rgR[k2] - cG[k2])    // left: red ref vs green cand
+                                     : abs(rgG[k2] - cR[k2]);   // right: green ref vs red cand
                 sads[r] = sd;
             }
             int bi = 0; float bs = sads[0];
@@ -308,7 +280,13 @@ float4 PSMain(VSOut i) : SV_Target
             }
 
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
-            float3 there = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
+            // Block processing (SIRA): borrow the aligned colour as a small patch
+            // average, not a single pixel, to smooth residual fringing.
+            float3 there = 0;
+            [unroll] for (int by = -1; by <= 1; ++by)
+            [unroll] for (int bx = -1; bx <= 1; ++bx)
+                there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+            there /= 9.0;
             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
                                            : float3(there.r, c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
