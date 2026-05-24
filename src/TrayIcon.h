@@ -45,6 +45,10 @@ namespace srw
     constexpr UINT ID_TRAY_PULF_ND_BASE    = 43130;  // +0..N ND level
     constexpr UINT ID_TRAY_PULF_MAX        = 43199;
 
+    // Frame-packing presets (1080p / 720p).
+    constexpr UINT ID_TRAY_FP_BASE = 43200;
+    constexpr UINT ID_TRAY_FP_MAX  = 43219;
+
     // State the context menu reflects (checkmarks).
     struct MenuState
     {
@@ -59,6 +63,7 @@ namespace srw
         int          pulfrichEye;     // 0 left, 1 right
         int          pulfrichDelay;   // 1..4
         int          pulfrichNd;      // index into PulfrichNdLevels
+        int          framePackMode;   // index into FramePackPresets
     };
 
     class TrayIcon

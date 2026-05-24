@@ -47,8 +47,23 @@ namespace srw
         ColumnInterleaved,  // alternating columns
         Checkerboard,       // quincunx
         FrameSequential,    // alternating frames over time
-        Pulfrich            // mono source -> depth via per-eye delay or ND darkening
+        Pulfrich,           // mono source -> depth via per-eye delay or ND darkening
+        FramePacking        // HDMI 1.4: top eye, blanking gap, bottom eye
     };
+
+    // HDMI 1.4 frame-packing presets. 720p and 1080p share the same proportions
+    // (each eye 48.98% of height, ~2.04% blanking gap), so the decode is identical;
+    // the selector is offered for clarity. eyeFrac/gapFrac are fractions of height.
+    struct FramePackPreset { const char* label; float eyeFrac; float gapFrac; };
+    inline const FramePackPreset* FramePackPresets(int& count)
+    {
+        static const FramePackPreset presets[] = {
+            { "1080p (1920x2205, 45-line gap)", 1080.0f / 2205.0f, 45.0f / 2205.0f },
+            { "720p (1280x1470, 30-line gap)",   720.0f / 1470.0f, 30.0f / 1470.0f },
+        };
+        count = (int)(sizeof(presets) / sizeof(presets[0]));
+        return presets;
+    }
 
     // Pulfrich: how the affected eye is treated.
     enum class PulfrichMode { TimeDelay, NDFilter };

@@ -25,8 +25,8 @@ cbuffer Params : register(b0)
     int   g_pulfMode; // 0 time-delay, 1 ND filter
     int   g_pulfEye;  // affected eye: 0 left, 1 right
     float g_ndTrans;  // ND transmission (affected eye brightness)
-    float g_pad0;
-    float g_pad1;
+    float g_fpEyeFrac; // frame packing: each eye's fraction of the source height
+    float g_fpGapFrac; // frame packing: blanking gap fraction
     float g_pad2;
 };
 
@@ -113,6 +113,14 @@ float4 PSMain(VSOut i) : SV_Target
         if (g_pulfMode == 1)    return float4(cur * g_ndTrans, 1); // ND: darken this eye
         return float4(srcPrev.Sample(samp, e).rgb, 1);           // time delay: older frame
     }
+    // Frame-packing decode informed by 3DToElse / 3DToElse_NTM3D
+    // (CC BY 3.0, Jose Negrete "BlueSkyDefender" + NTM3D); re-implemented here.
+    else if (g_format == 7)   // HDMI 1.4 frame packing: top eye, gap, bottom eye
+    {
+        float v = right ? (g_fpEyeFrac + g_fpGapFrac + e.y * g_fpEyeFrac)
+                        : (e.y * g_fpEyeFrac);
+        return srcTex.Sample(samp, float2(e.x, v));
+    }
 
     // Default: side-by-side. left=left half, right=right half.
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, e.y);
@@ -131,6 +139,7 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::ColumnInterleaved: return 4;
         case StereoFormat::Checkerboard:      return 5;
         case StereoFormat::Pulfrich:          return 6;
+        case StereoFormat::FramePacking:      return 7;
         default:                              return 0;  // SBS (and unimplemented)
         }
     }
@@ -154,7 +163,7 @@ float4 PSMain(VSOut i) : SV_Target
 
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
-               float ndTrans; float pad0; float pad1; float pad2; };
+               float ndTrans; float fpEyeFrac; float fpGapFrac; float pad2; };
 }
 
 Converter::~Converter()
@@ -215,6 +224,12 @@ void Converter::SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmis
     m_pulfDelay = delayFrames < 1 ? 1 : (delayFrames > kHistory - 1 ? kHistory - 1 : delayFrames);
 }
 
+void Converter::SetFramePacking(float eyeFrac, float gapFrac)
+{
+    m_fpEyeFrac = eyeFrac;
+    m_fpGapFrac = gapFrac;
+}
+
 bool Converter::EnsureOutput(int width, int height)
 {
     if (m_outTex && width == m_outWidth && height == m_outHeight)
@@ -252,6 +267,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
 
     int ew = 0, eh = 0;
     PerEyeSize(m_fmt, srcWidth, srcHeight, ew, eh);
+    if (m_fmt == StereoFormat::FramePacking)   // each eye is eyeFrac of the source height
+        eh = (int)(srcHeight * m_fpEyeFrac + 0.5f);
+    if (eh < 1) eh = 1;
     outputResized = EnsureOutput(ew * 2, eh);
     if (!m_outRTV)
         return false;
@@ -266,7 +284,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
 
     CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
            m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
-           m_ndTrans, 0, 0, 0 };
+           m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0 };
     m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
 
     // Shared pipeline state.

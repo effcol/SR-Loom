@@ -43,6 +43,7 @@ namespace
         int          pulfrichEye    = 1;   // affected eye (0 left, 1 right)
         int          pulfrichDelay  = 1;   // delay frames (time-delay mode)
         int          pulfrichNd     = 1;   // ND level index (default Medium)
+        int          framePackMode  = 0;   // FramePackPresets index (0 = 1080p)
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
@@ -366,6 +367,11 @@ namespace
                 const float trans = nd[(app.pulfrichNd >= 0 && app.pulfrichNd < ndN) ? app.pulfrichNd : 0].transmission;
                 app.converter.SetPulfrich(app.pulfrichMode, app.pulfrichEye, trans, app.pulfrichDelay);
             }
+            {
+                int fpN = 0; const FramePackPreset* fps = FramePackPresets(fpN);
+                const FramePackPreset& fp = fps[(app.framePackMode >= 0 && app.framePackMode < fpN) ? app.framePackMode : 0];
+                app.converter.SetFramePacking(fp.eyeFrac, fp.gapFrac);
+            }
             bool resized = false;
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
@@ -391,7 +397,8 @@ namespace
             {
                 MenuState ms{ app->weavingEnabled, app->mode, app->source, app->format,
                               app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
-                              app->pulfrichMode, app->pulfrichEye, app->pulfrichDelay, app->pulfrichNd };
+                              app->pulfrichMode, app->pulfrichEye, app->pulfrichDelay, app->pulfrichNd,
+                              app->framePackMode };
                 app->tray.ShowContextMenu(hwnd, ms);
             }
             return 0;
@@ -444,6 +451,13 @@ namespace
                     app->pulfrichMode = (cmd == ID_TRAY_PULF_MODE_BASE) ? PulfrichMode::TimeDelay
                                                                         : PulfrichMode::NDFilter;
                 app->format = StereoFormat::Pulfrich;
+                app->captureRebind = true;
+                return 0;
+            }
+            if (cmd >= ID_TRAY_FP_BASE && cmd <= ID_TRAY_FP_MAX)
+            {
+                app->framePackMode = (int)(cmd - ID_TRAY_FP_BASE);
+                app->format = StereoFormat::FramePacking;
                 app->captureRebind = true;
                 return 0;
             }

@@ -30,3 +30,11 @@ redistributed under the MIT terms above.
 Bundled third-party source:
   - third_party/stb_image.h : public domain / MIT (Sean Barrett), used to load
     the test stereo image.
+
+Attribution:
+  - The HDMI 1.4 frame-packing decode in src/Converter.cpp was informed by
+    "3DToElse" / "3DToElse_NTM3D.fx" by Jose Negrete (AKA BlueSkyDefender) with
+    modifications by NTM3D, which is licensed under the Creative Commons
+    Attribution 3.0 Unported License (CC BY 3.0,
+    https://creativecommons.org/licenses/by/3.0/). The decode here is an
+    independent re-implementation; this attribution is provided with thanks.

@@ -22,6 +22,9 @@ namespace srw
         // Pulfrich settings (used only when format == Pulfrich).
         void SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmission, int delayFrames);
 
+        // Frame-packing layout (fractions of source height), used when FramePacking.
+        void SetFramePacking(float eyeFrac, float gapFrac);
+
         // Convert the source view into the internal SBS texture. Sets
         // outputResized=true when the SBS texture was (re)created (the caller
         // must then re-register OutputSRV() with the weaver).
@@ -69,6 +72,8 @@ namespace srw
         int          m_pulfEye  = 1;       // affected eye (0 left, 1 right)
         float        m_ndTrans  = 0.30f;   // ND transmission
         int          m_pulfDelay = 1;      // delay frames
+        float        m_fpEyeFrac = 1080.0f / 2205.0f;  // frame-packing eye height fraction
+        float        m_fpGapFrac = 45.0f / 2205.0f;    // frame-packing gap fraction
         DXGI_FORMAT  m_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };
 }
