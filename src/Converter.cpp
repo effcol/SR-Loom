@@ -41,13 +41,31 @@ float3 anaFilter(float3 c, int combo, int e)
     return                (e == 0) ? float3(0, c.g, c.b) : float3(c.r, 0, c.b);  // Cyan/Magenta
 }
 
+// Per-eye luminance from an anaglyph combo (carries that eye's view / disparity).
+float anaEyeLuma(float3 c, int combo, int e)
+{
+    if (combo == 0) return (e == 0) ? c.r : (c.g + c.b) * 0.5; // Red/Cyan
+    if (combo == 1) return (e == 0) ? c.r : c.g;               // Red/Green
+    if (combo == 2) return (e == 0) ? c.r : c.b;               // Red/Blue
+    if (combo == 3) return (e == 0) ? c.g : (c.r + c.b) * 0.5; // Green/Magenta
+    if (combo == 4) return (e == 0) ? (c.r + c.g) * 0.5 : c.b; // Amber/Blue
+    return                (e == 0) ? (c.g + c.b) * 0.5 : (c.r + c.b) * 0.5; // Cyan/Magenta
+}
+
 float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
 {
+    if (mode == 0)   // Shared colour: per-eye luminance, shared anaglyph chrominance.
+    {
+        float anaY = max(dot(c, float3(0.299, 0.587, 0.114)), 1e-3);
+        float eyeY = anaEyeLuma(c, combo, e);
+        return saturate(c * (eyeY / anaY));   // same hue both eyes, eye-specific brightness
+    }
+
     float3 col = anaFilter(c, combo, e);
     float  g   = dot(col, float3(0.299, 0.587, 0.114));
-    if (mode == 1) return lerp(col, g.xxx, 0.5);   // half colour
-    if (mode == 2) return g.xxx;                   // mono
-    return col;                                    // colour (filtered)
+    if (mode == 2) return lerp(col, g.xxx, 0.5);   // half colour
+    if (mode == 3) return g.xxx;                   // mono
+    return col;                                    // mode 1: colour (filtered)
 }
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };

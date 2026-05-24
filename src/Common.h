@@ -149,8 +149,9 @@ namespace srw
     inline const char* const* AnaglyphModeList(int& count)
     {
         static const char* const modes[] = {
-            "Colour (filtered)",       // each eye keeps its own channels (default)
-            "Half colour",             // blend toward grey (reduces colour rivalry)
+            "Colour (shared - low rivalry)", // per-eye luminance, shared chrominance (default)
+            "Colour (filtered)",             // each eye keeps only its own channels
+            "Half colour",                   // blend toward grey
             "Mono (black & white)",
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
