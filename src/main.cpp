@@ -34,7 +34,8 @@ namespace
         OutputMode mode           = OutputMode::Fullscreen;
         SourceKind source         = SourceKind::TestImage;
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
-        bool       loupeInteractive = true;  // looking glass: draggable (true) vs click-through (false)
+        bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
+        bool       loupeDragging  = false;   // looking glass: in a move/resize loop
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
     };
@@ -107,10 +108,10 @@ namespace
             const int w = 960, h = 600;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
-            // Borderless, click-through by default (layered+transparent). Hold
-            // Ctrl+Alt to drag (anywhere) and mouse-wheel to resize; releasing
-            // restores click-through.
-            style   = WS_POPUP;
+            // Normal window chrome (title bar + resize edges). Click-through on
+            // the glass by default; UpdateLoupeInteractivity makes it grabbable
+            // while the cursor is over the chrome or during a move/resize.
+            style   = WS_OVERLAPPEDWINDOW;
             exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
             zorder  = HWND_TOPMOST;
             rect    = { x, y, x + w, y + h };
@@ -141,23 +142,42 @@ namespace
                      rect.right - rect.left, rect.bottom - rect.top, flags);
     }
 
-    // The looking glass is click-through by default. While Ctrl+Alt is held it
-    // becomes grabbable so the frame can be dragged/resized; releasing restores
-    // click-through. This keeps passthrough "always on" except while moving it.
+    // The looking glass passes clicks through the glass, but becomes grabbable
+    // when the cursor is over its chrome (title bar / resize edges) or while a
+    // move/resize is in progress — then returns to click-through. The cursor is
+    // polled directly so this works even while the window is click-through.
     void UpdateLoupeInteractivity(AppState& app)
     {
         if (app.mode != OutputMode::LookingGlass) return;
 
-        const bool grab = (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-                          (GetAsyncKeyState(VK_MENU)    & 0x8000);
-        if (grab == app.loupeInteractive) return;   // loupeInteractive == "grabbable now"
-        app.loupeInteractive = grab;
+        bool interactive;
+        if (app.loupeDragging)
+        {
+            interactive = true;   // stay grabbable for the whole move/resize
+        }
+        else
+        {
+            POINT pt{};
+            GetCursorPos(&pt);
+            RECT wr{}, cr{};
+            GetWindowRect(app.hwnd, &wr);
+            GetClientRect(app.hwnd, &cr);
+            POINT tl{ cr.left, cr.top }, br{ cr.right, cr.bottom };
+            ClientToScreen(app.hwnd, &tl);
+            ClientToScreen(app.hwnd, &br);
+            const bool inWindow = pt.x >= wr.left && pt.x < wr.right && pt.y >= wr.top && pt.y < wr.bottom;
+            const bool inGlass  = pt.x >= tl.x   && pt.x < br.x     && pt.y >= tl.y   && pt.y < br.y;
+            interactive = inWindow && !inGlass;   // over the chrome
+        }
 
-        LONG_PTR ex = WS_EX_TOPMOST | WS_EX_LAYERED | (grab ? 0 : WS_EX_TRANSPARENT);
+        if (interactive == app.loupeInteractive) return;
+        app.loupeInteractive = interactive;
+
+        LONG_PTR ex = WS_EX_TOPMOST | WS_EX_LAYERED | (interactive ? 0 : WS_EX_TRANSPARENT);
         SetWindowLongPtr(app.hwnd, GWL_EXSTYLE, ex);
         SetLayeredWindowAttributes(app.hwnd, 0, 255, LWA_ALPHA);
         SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
     }
 
     // Keep the overlay aligned with the tracked source window each frame.
@@ -405,9 +425,11 @@ namespace
         // render loop — which stops weave() and freezes head-tracked weaving. Keep
         // rendering from a timer during the move.
         case WM_ENTERSIZEMOVE:
+            if (app) app->loupeDragging = true;
             SetTimer(hwnd, kRenderTimer, 8, nullptr);
             return 0;
         case WM_EXITSIZEMOVE:
+            if (app) app->loupeDragging = false;
             KillTimer(hwnd, kRenderTimer);
             return 0;
         case WM_TIMER:
@@ -423,33 +445,6 @@ namespace
             return 0;
         }
 
-        // While the looking glass is grabbable (Ctrl+Alt held), drag it from
-        // anywhere and resize it with the mouse wheel.
-        case WM_LBUTTONDOWN:
-            if (app && app->mode == OutputMode::LookingGlass && app->loupeInteractive)
-            {
-                ReleaseCapture();
-                SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-                return 0;
-            }
-            break;
-
-        case WM_MOUSEWHEEL:
-            if (app && app->mode == OutputMode::LookingGlass && app->loupeInteractive)
-            {
-                RECT r{};
-                GetWindowRect(hwnd, &r);
-                const int w = r.right - r.left, h = r.bottom - r.top;
-                const int step = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? 1 : -1;
-                int nw = w + step * w / 10; if (nw < 200) nw = 200;
-                int nh = h + step * h / 10; if (nh < 150) nh = 150;
-                // Resize about the center.
-                const int nx = r.left + (w - nw) / 2;
-                const int ny = r.top  + (h - nh) / 2;
-                SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, nw, nh, SWP_NOACTIVATE);
-                return 0;
-            }
-            break;
 
 
 
