@@ -17,6 +17,7 @@ namespace srw
         ID_TRAY_MODE_WINDOWED,
         ID_TRAY_MODE_OVERLAY,
         ID_TRAY_LOOKING_GLASS,
+        ID_TRAY_TOGGLE_LOUPE,
         ID_TRAY_CAPTURE_FOREGROUND,
         ID_TRAY_SRC_TESTIMAGE,
         ID_TRAY_SRC_MONITOR,
@@ -43,7 +44,7 @@ namespace srw
         // reflected as checkmarks/radio marks. Commands post as WM_COMMAND.
         // Enumerates top-level windows into the Source submenu.
         void ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                             SourceKind source);
+                             SourceKind source, bool loupeInteractive);
 
         // Resolve a window-list menu index (id - ID_TRAY_SRC_WINDOW_BASE) to its
         // HWND, captured when the menu was last shown. Null if out of range.

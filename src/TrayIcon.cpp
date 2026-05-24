@@ -91,7 +91,7 @@ HWND TrayIcon::WindowAt(size_t index) const
 }
 
 void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                               SourceKind source)
+                               SourceKind source, bool loupeInteractive)
 {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -107,6 +107,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
                 ID_TRAY_MODE_OVERLAY, "Overlay source window (in-place 3D)");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::LookingGlass ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_LOOKING_GLASS, "Looking glass (passthrough loupe)");
+    if (mode == OutputMode::LookingGlass)
+        AppendMenuA(menu, MF_STRING | (loupeInteractive ? MF_UNCHECKED : MF_CHECKED),
+                    ID_TRAY_TOGGLE_LOUPE, "    └ Click-through\tCtrl+Alt+G");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);

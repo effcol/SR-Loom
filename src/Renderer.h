@@ -31,7 +31,7 @@ namespace srw
         ID3D11Device*        Device() const        { return m_device; }
         ID3D11DeviceContext* Context() const       { return m_context; }
         // The sRGB format the weaver should treat its input/output as.
-        DXGI_FORMAT          BackBufferFormat() const { return m_rtvFormat; }
+        DXGI_FORMAT          BackBufferFormat() const { return m_format; }
         bool                 IsValid() const        { return m_device != nullptr; }
 
     private:
@@ -44,10 +44,8 @@ namespace srw
         ID3D11RenderTargetView* m_rtv      = nullptr;
         UINT                    m_width    = 0;
         UINT                    m_height   = 0;
-        // Flip-model swap chains can't use an sRGB buffer format, so the buffer
-        // is UNORM and we create an sRGB render-target VIEW over it. That keeps
-        // the weaver's hardware sRGB path working.
-        DXGI_FORMAT             m_bufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-        DXGI_FORMAT             m_rtvFormat    = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        // Bit-blt swap chain (DXGI_SWAP_EFFECT_DISCARD) so the window can be made
+        // layered for click-through; bit-blt allows an sRGB buffer directly.
+        DXGI_FORMAT             m_format   = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };
 }

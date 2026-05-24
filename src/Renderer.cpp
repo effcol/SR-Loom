@@ -65,11 +65,11 @@ bool Renderer::Initialize(HWND hwnd)
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width            = m_width;
     sd.Height           = m_height;
-    sd.Format           = m_bufferFormat;
+    sd.Format           = m_format;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount      = 2;
-    sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SwapEffect       = DXGI_SWAP_EFFECT_DISCARD;  // bit-blt: works with layered windows
 
     hr = factory->CreateSwapChainForHwnd(m_device, hwnd, &sd, nullptr, nullptr, &m_swapChain);
 
@@ -101,11 +101,7 @@ bool Renderer::CreateBackBufferView()
         return false;
     }
 
-    // sRGB view over the UNORM buffer (flip-model requirement).
-    D3D11_RENDER_TARGET_VIEW_DESC rtvd{};
-    rtvd.Format        = m_rtvFormat;
-    rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-    hr = m_device->CreateRenderTargetView(backBuffer, &rtvd, &m_rtv);
+    hr = m_device->CreateRenderTargetView(backBuffer, nullptr, &m_rtv);
     SAFE_RELEASE(backBuffer);
     if (FAILED(hr))
     {

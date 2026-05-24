@@ -21,6 +21,7 @@ namespace
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
     constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
+    constexpr int   kHotkeyLoupe   = 4;   // Ctrl+Alt+G : loupe move/passthrough toggle
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     struct AppState
@@ -34,6 +35,7 @@ namespace
         OutputMode mode           = OutputMode::Fullscreen;
         SourceKind source         = SourceKind::TestImage;
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
+        bool       loupeInteractive = true;  // looking glass: draggable (true) vs click-through (false)
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
     };
@@ -56,47 +58,60 @@ namespace
     }
 
     // Apply fullscreen (borderless on the SR display) or windowed styling.
+    // Click-through (layered+transparent) is wanted whenever the weave overlays
+    // live content the user interacts with beneath it.
+    bool WantsClickThrough(const AppState& app)
+    {
+        switch (app.mode)
+        {
+        case OutputMode::WindowOverlay: return true;
+        case OutputMode::LookingGlass:  return !app.loupeInteractive;
+        case OutputMode::Fullscreen:    return app.source == SourceKind::CaptureMonitor; // passthrough
+        default:                        return false;
+        }
+    }
+
     void ApplyMode(AppState& app)
     {
         const RECT& d = app.srDisplayRect;
         const int dw = d.right - d.left;
         const int dh = d.bottom - d.top;
         const HWND hwnd = app.hwnd;
+        const bool ct = WantsClickThrough(app);
+
+        DWORD    style   = WS_POPUP;
+        LONG_PTR exStyle = 0;
+        RECT     rect    { d.left, d.top, d.left + dw, d.top + dh };
+        HWND     zorder  = HWND_TOP;
 
         switch (app.mode)
         {
         case OutputMode::Fullscreen:
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, 0);
-            SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            SetWindowPos(hwnd, HWND_TOP, d.left, d.top, dw, dh,
-                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            style   = WS_POPUP;
+            exStyle = ct ? (WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) : 0;
+            zorder  = ct ? HWND_TOPMOST : HWND_TOP;
             break;
 
         case OutputMode::WindowOverlay:
-        {
-            // Borderless, always-on-top, click-through, doesn't steal focus.
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE,
-                             WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
-            SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            RECT r{ d.left, d.top, d.left + 1280, d.top + 720 };
+            style   = WS_POPUP;
+            exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            zorder  = HWND_TOPMOST;
+            rect    = { d.left, d.top, d.left + 1280, d.top + 720 };
             if (app.sourceWindow && IsWindow(app.sourceWindow))
-                GetWindowRect(app.sourceWindow, &r);
-            SetWindowPos(hwnd, HWND_TOPMOST, r.left, r.top,
-                         r.right - r.left, r.bottom - r.top,
-                         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                GetWindowRect(app.sourceWindow, &rect);
             break;
-        }
 
         case OutputMode::LookingGlass:
         {
-            // Resizable, draggable, always-on-top loupe you place over content.
+            // Visible frame for dragging/resizing; click-through (locked) toggles
+            // layered+transparent without changing the frame (Ctrl+Alt+G).
             const int w = 960, h = 600;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, WS_EX_TOPMOST);
-            SetWindowLongPtr(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h,
-                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            style   = WS_OVERLAPPEDWINDOW;
+            exStyle = WS_EX_TOPMOST | (ct ? (WS_EX_LAYERED | WS_EX_TRANSPARENT) : 0);
+            zorder  = HWND_TOPMOST;
+            rect    = { x, y, x + w, y + h };
             break;
         }
 
@@ -106,13 +121,38 @@ namespace
             const int w = 1280, h = 720;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, 0);
-            SetWindowLongPtr(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-            SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h,
-                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            style   = WS_OVERLAPPEDWINDOW;
+            exStyle = 0;
+            zorder  = HWND_NOTOPMOST;
+            rect    = { x, y, x + w, y + h };
             break;
         }
         }
+
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
+        SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_VISIBLE);
+        if (exStyle & WS_EX_LAYERED)
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);  // fully opaque
+        UINT flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW;
+        if (exStyle & WS_EX_NOACTIVATE) flags |= SWP_NOACTIVATE;
+        SetWindowPos(hwnd, zorder, rect.left, rect.top,
+                     rect.right - rect.left, rect.bottom - rect.top, flags);
+    }
+
+    // Toggle the looking glass between draggable and click-through, in place.
+    void ToggleLoupeInteractive(AppState& app)
+    {
+        if (app.mode != OutputMode::LookingGlass) return;
+        app.loupeInteractive = !app.loupeInteractive;
+        const HWND hwnd = app.hwnd;
+        LONG_PTR ex = WS_EX_TOPMOST | (app.loupeInteractive ? 0 : (WS_EX_LAYERED | WS_EX_TRANSPARENT));
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
+        if (ex & WS_EX_LAYERED)
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+        app.tray.SetTooltip(app.loupeInteractive ? "SR Weaver — loupe: move mode"
+                                                 : "SR Weaver — loupe: passthrough");
     }
 
     // Keep the overlay aligned with the tracked source window each frame.
@@ -290,7 +330,8 @@ namespace
         {
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
-                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source);
+                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source,
+                                          app->loupeInteractive);
             return 0;
 
         case WM_COMMAND:
@@ -330,8 +371,10 @@ namespace
             case ID_TRAY_LOOKING_GLASS:
                 UsePassthrough(*app);
                 app->mode = OutputMode::LookingGlass;
+                app->loupeInteractive = true;   // start draggable so you can place it
                 if (app->weavingEnabled) ApplyMode(*app);
                 return 0;
+            case ID_TRAY_TOGGLE_LOUPE: ToggleLoupeInteractive(*app); return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
             }
             break;
@@ -347,6 +390,7 @@ namespace
                 if (app->weavingEnabled) ApplyMode(*app);
             }
             else if (wParam == kHotkeyCapture) CaptureForeground(*app);
+            else if (wParam == kHotkeyLoupe)   ToggleLoupeInteractive(*app);
             return 0;
 
         case WM_SIZE:
@@ -376,15 +420,6 @@ namespace
             return 0;
         }
 
-        // In looking-glass mode, let clicks fall through the glass (client area)
-        // to the content beneath, while the frame stays draggable/resizable.
-        case WM_NCHITTEST:
-            if (app && app->mode == OutputMode::LookingGlass)
-            {
-                LRESULT hit = DefWindowProc(hwnd, msg, wParam, lParam);
-                return (hit == HTCLIENT) ? HTTRANSPARENT : hit;
-            }
-            break;
 
         case WM_CLOSE:
             // Closing the window just pauses weaving and hides to the tray.
@@ -472,6 +507,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
     RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+    RegisterHotKey(app.hwnd, kHotkeyLoupe,   MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
 
     // Show and weave.
     ApplyMode(app);
@@ -493,6 +529,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
+    UnregisterHotKey(app.hwnd, kHotkeyLoupe);
     app.tray.Remove();
     app.capture.Shutdown();
     app.weaver.Shutdown();
