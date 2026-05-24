@@ -1,0 +1,4 @@
+#include "resource.h"
+
+// Tray / application icon: the white Dimenco logo mark on transparency.
+IDI_TRAY ICON "../assets/sr_weaver.ico"

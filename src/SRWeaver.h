@@ -1,0 +1,58 @@
+// SRWeaver.h — wraps the Simulated Reality context and the DirectX 11 weaver.
+// Owns the SBS "view" texture that is handed to the weaver each frame.
+#pragma once
+
+#include "Common.h"
+#include <d3d11.h>
+
+// Forward declarations of SR SDK types (kept out of the header to avoid
+// leaking <windows.h>/SDK includes into the rest of the app).
+namespace SR
+{
+    class SRContext;
+    class IDX11Weaver1;
+}
+
+namespace srw
+{
+    class SRWeaver
+    {
+    public:
+        SRWeaver() = default;
+        ~SRWeaver();
+
+        // Connect to the SR service. Waits up to maxSeconds for it to come up.
+        bool CreateContext(double maxSeconds);
+
+        // Query the SR display's screen rectangle (virtual-desktop coords).
+        // Returns false until the display is connected/ready.
+        bool GetSRDisplayRect(RECT& out);
+
+        // Create the weaver bound to the output window + device context, then
+        // finalize the SR context. Call after the D3D device exists.
+        bool CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window);
+
+        // Load a stereo image from disk into the SBS view texture and register
+        // it with the weaver. fmt currently distinguishes SBS variants only.
+        bool SetStereoImageFromFile(ID3D11Device* device,
+                                    const char* path,
+                                    StereoFormat fmt,
+                                    DXGI_FORMAT texFormat);
+
+        // Perform weaving into the currently-bound render target.
+        void Weave();
+
+        void Shutdown();
+
+        bool HasContext() const { return m_context != nullptr; }
+        bool HasWeaver()  const { return m_weaver != nullptr; }
+
+    private:
+        void ReleaseViewTexture();
+
+        SR::SRContext*            m_context = nullptr;
+        SR::IDX11Weaver1*         m_weaver  = nullptr;
+        ID3D11Texture2D*          m_viewTex = nullptr;
+        ID3D11ShaderResourceView* m_viewSRV = nullptr;
+    };
+}

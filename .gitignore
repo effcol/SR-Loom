@@ -1,0 +1,22 @@
+# Vendored SDKs / helper repos — large and partly proprietary (SR SDK) or
+# differently licensed (ShaderGlass GPL, etc.). Not redistributed here; the
+# SR SDK must be installed locally. See README.
+/lib/
+
+# Build output
+/build/
+/out/
+*.exe
+*.pdb
+*.ilk
+*.obj
+
+# Visual Studio
+.vs/
+*.user
+slnx.sqlite
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
