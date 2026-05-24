@@ -120,8 +120,19 @@ float4 PSMain(VSOut i) : SV_Target
     }
     else if (g_format == 2)   // Anaglyph: decode per combo + mode
     {
+        int eye = right ? 1 : 0;
         float3 c = srcTex.Sample(samp, e).rgb;
-        return float4(decodeAnaglyph(c, g_anaCombo, right ? 1 : 0, g_anaMode), 1);
+        if (g_anaMode == 0)   // Recovered colour: per-eye luminance + shared, horizontally
+        {                     // blurred chrominance (blur reduces red/cyan fringing).
+            float eyeY = anaEyeLuma(c, g_anaCombo, eye);   // sharp per-eye luminance
+            float3 acc = 0;
+            [unroll] for (int k = -4; k <= 4; ++k)
+                acc += srcTex.Sample(samp, float2(e.x + (float)k / g_srcW, e.y)).rgb;
+            float3 cb = acc / 9.0;                         // horizontally blurred colour
+            float anaY = max(dot(cb, float3(0.299, 0.587, 0.114)), 1e-3);
+            return float4(saturate(cb * (eyeY / anaY)), 1);
+        }
+        return float4(decodeAnaglyph(c, g_anaCombo, eye, g_anaMode), 1);
     }
     else if (g_format == 6)   // Pulfrich: mono source -> per-eye delay / ND darken
     {

@@ -12,7 +12,9 @@
 #include "resource.h"
 
 #include <shellscalingapi.h>
+#include <dwmapi.h>
 #pragma comment(lib, "shcore.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 using namespace srw;
 
@@ -71,6 +73,17 @@ namespace
     }
 
     // Apply fullscreen (borderless on the SR display) or windowed styling.
+    // The VISIBLE window rectangle. GetWindowRect includes ~7px of invisible
+    // resize border on Win10/11, which made the in-place overlay sit slightly
+    // larger than the window; the DWM extended frame bounds exclude it.
+    RECT VisibleWindowRect(HWND hwnd)
+    {
+        RECT r{};
+        if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r))))
+            GetWindowRect(hwnd, &r);
+        return r;
+    }
+
     // Click-through (layered+transparent) is wanted whenever the weave overlays
     // live content the user interacts with beneath it.
     bool WantsClickThrough(const AppState& app)
@@ -111,7 +124,7 @@ namespace
             zorder  = HWND_TOPMOST;
             rect    = { d.left, d.top, d.left + 1280, d.top + 720 };
             if (app.sourceWindow && IsWindow(app.sourceWindow))
-                GetWindowRect(app.sourceWindow, &rect);
+                rect = VisibleWindowRect(app.sourceWindow);
             break;
 
         case OutputMode::LookingGlass:
@@ -209,8 +222,7 @@ namespace
             return;
         }
 
-        RECT r{}, cur{};
-        GetWindowRect(src, &r);
+        RECT r = VisibleWindowRect(src), cur{};
         GetWindowRect(app.hwnd, &cur);
         if (!EqualRect(&r, &cur))
         {
