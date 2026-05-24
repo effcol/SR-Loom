@@ -173,6 +173,7 @@ void Capture::Stop()
     if (m_impl->framePool) { m_impl->framePool.Close();  m_impl->framePool = nullptr; }
     m_impl->item = nullptr;
     m_active = false;
+    m_regX = m_regY = m_regW = m_regH = 0;   // reset crop to full frame
 }
 
 bool Capture::Update(bool& sizeChanged)
@@ -192,9 +193,21 @@ bool Capture::Update(bool& sizeChanged)
 
         D3D11_TEXTURE2D_DESC desc{};
         frameTex->GetDesc(&desc);
+        m_frameW = (int)desc.Width;
+        m_frameH = (int)desc.Height;
 
-        sizeChanged = EnsureTarget((int)desc.Width, (int)desc.Height);
-        m_context->CopyResource(m_tex, frameTex.get());
+        // Resolve the crop region (default = whole frame), clamped to the frame.
+        int rx = m_regX, ry = m_regY, rw = m_regW, rh = m_regH;
+        if (rw <= 0 || rh <= 0) { rx = 0; ry = 0; rw = m_frameW; rh = m_frameH; }
+        if (rx < 0) rx = 0;
+        if (ry < 0) ry = 0;
+        if (rx + rw > m_frameW) rw = m_frameW - rx;
+        if (ry + rh > m_frameH) rh = m_frameH - ry;
+        if (rw <= 0 || rh <= 0) { frame.Close(); return false; }  // fully off-screen
+
+        sizeChanged = EnsureTarget(rw, rh);
+        D3D11_BOX box{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
+        m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
 
         frame.Close();
 
@@ -212,6 +225,11 @@ bool Capture::Update(bool& sizeChanged)
     {
         return false;
     }
+}
+
+void Capture::SetSourceRegion(int x, int y, int w, int h)
+{
+    m_regX = x; m_regY = y; m_regW = w; m_regH = h;
 }
 
 bool Capture::EnsureTarget(int width, int height)

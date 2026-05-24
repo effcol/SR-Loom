@@ -34,10 +34,18 @@ namespace srw
         // capture dimensions changed (the caller must then re-register SRV()).
         bool Update(bool& sizeChanged);
 
+        // Restrict what gets fed to the weaver to a sub-rectangle of the captured
+        // frame, in capture-frame (physical) pixels. Pass w<=0 or h<=0 for the
+        // whole frame. Used by the looking-glass / passthrough to weave only the
+        // region beneath the viewer.
+        void SetSourceRegion(int x, int y, int w, int h);
+
         ID3D11ShaderResourceView* SRV() const { return m_srv; }
-        int         Width()     const { return m_width; }   // full SBS width
-        int         Height()    const { return m_height; }
-        DXGI_FORMAT SRVFormat() const { return m_srvFormat; }
+        int         Width()      const { return m_width; }   // region (weave-input) width
+        int         Height()     const { return m_height; }
+        int         FrameWidth()  const { return m_frameW; } // full captured-frame size
+        int         FrameHeight() const { return m_frameH; }
+        DXGI_FORMAT SRVFormat()  const { return m_srvFormat; }
 
         static bool IsSupported();
 
@@ -53,8 +61,11 @@ namespace srw
         ID3D11DeviceContext*      m_context = nullptr;
         ID3D11Texture2D*          m_tex     = nullptr;  // persistent copy target
         ID3D11ShaderResourceView* m_srv     = nullptr;
-        int                       m_width   = 0;
+        int                       m_width   = 0;   // region (weave-input) size
         int                       m_height  = 0;
+        int                       m_frameW  = 0;   // full captured-frame size
+        int                       m_frameH  = 0;
+        int                       m_regX = 0, m_regY = 0, m_regW = 0, m_regH = 0; // crop, frame px
         bool                      m_active  = false;
         // TYPELESS buffer so we can copy the BGRA frame into it and still create
         // an sRGB shader view (sRGB casting isn't allowed on a fully-typed res).

@@ -21,6 +21,7 @@ namespace
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
     constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
+    constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     struct AppState
     {
@@ -86,8 +87,20 @@ namespace
             break;
         }
 
+        case OutputMode::LookingGlass:
+        {
+            // Resizable, draggable, always-on-top loupe you place over content.
+            const int w = 960, h = 600;
+            const int x = d.left + (dw - w) / 2;
+            const int y = d.top  + (dh - h) / 2;
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, WS_EX_TOPMOST);
+            SetWindowLongPtr(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h,
+                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            break;
+        }
+
         case OutputMode::Windowed:
-        case OutputMode::LookingGlass:   // TODO: dedicated loupe; windowed for now
         default:
         {
             const int w = 1280, h = 720;
@@ -183,18 +196,48 @@ namespace
             UseWindow(app, fg);
     }
 
-    void UseMonitor(AppState& app)
+    // Start a passthrough capture of the SR display. What gets woven is the
+    // region of that monitor beneath our (capture-excluded) window — full screen
+    // in Fullscreen, or just the viewer's area in Windowed/LookingGlass.
+    void UsePassthrough(AppState& app)
     {
         app.sourceWindow = nullptr;
-        HMONITOR mon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+        const RECT& d = app.srDisplayRect;
+        POINT center{ (d.left + d.right) / 2, (d.top + d.bottom) / 2 };
+        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTOPRIMARY);
         if (app.capture.StartMonitor(mon))
         {
             app.source = SourceKind::CaptureMonitor;
             app.captureRebind = true;
         }
-        if (app.mode == OutputMode::WindowOverlay)
-            app.mode = OutputMode::Fullscreen;
-        if (app.weavingEnabled) ApplyMode(app);
+    }
+
+    // Map our window's client area to a rectangle in the captured frame's pixels.
+    RECT PassthroughRegion(AppState& app)
+    {
+        const double fw = app.capture.FrameWidth();
+        const double fh = app.capture.FrameHeight();
+
+        HMONITOR mon = MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfo(mon, &mi);
+        const RECT m = mi.rcMonitor;
+        const double sx = fw / (m.right - m.left);
+        const double sy = fh / (m.bottom - m.top);
+
+        // Client area in screen coordinates.
+        RECT c{};
+        GetClientRect(app.hwnd, &c);
+        POINT tl{ c.left, c.top }, br{ c.right, c.bottom };
+        ClientToScreen(app.hwnd, &tl);
+        ClientToScreen(app.hwnd, &br);
+
+        RECT r;
+        r.left   = (LONG)((tl.x - m.left) * sx);
+        r.top    = (LONG)((tl.y - m.top) * sy);
+        r.right  = (LONG)((br.x - m.left) * sx);
+        r.bottom = (LONG)((br.y - m.top) * sy);
+        return r;
     }
 
     void RenderFrame(AppState& app)
@@ -211,6 +254,13 @@ namespace
         {
             Sleep(10);
             return;
+        }
+
+        // For passthrough, weave only the region of the monitor beneath the viewer.
+        if (app.source == SourceKind::CaptureMonitor && app.capture.FrameWidth() > 0)
+        {
+            RECT r = PassthroughRegion(app);
+            app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
         }
 
         // Pull the newest captured frame and (re)point the weaver at it on resize.
@@ -272,7 +322,16 @@ namespace
                 return 0;
             case ID_TRAY_CAPTURE_FOREGROUND: CaptureForeground(*app); return 0;
             case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
-            case ID_TRAY_SRC_MONITOR:   UseMonitor(*app);   return 0;
+            case ID_TRAY_SRC_MONITOR:
+                UsePassthrough(*app);
+                if (app->mode == OutputMode::WindowOverlay) app->mode = OutputMode::Fullscreen;
+                if (app->weavingEnabled) ApplyMode(*app);
+                return 0;
+            case ID_TRAY_LOOKING_GLASS:
+                UsePassthrough(*app);
+                app->mode = OutputMode::LookingGlass;
+                if (app->weavingEnabled) ApplyMode(*app);
+                return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
             }
             break;
@@ -293,6 +352,20 @@ namespace
         case WM_SIZE:
             if (app && wParam != SIZE_MINIMIZED)
                 app->renderer.Resize(LOWORD(lParam), HIWORD(lParam));
+            return 0;
+
+        // While the user drags/resizes the window, the modal move loop blocks our
+        // render loop — which stops weave() and freezes head-tracked weaving. Keep
+        // rendering from a timer during the move.
+        case WM_ENTERSIZEMOVE:
+            SetTimer(hwnd, kRenderTimer, 8, nullptr);
+            return 0;
+        case WM_EXITSIZEMOVE:
+            KillTimer(hwnd, kRenderTimer);
+            return 0;
+        case WM_TIMER:
+            if (app && wParam == kRenderTimer)
+                RenderFrame(*app);
             return 0;
 
         case WM_GETMINMAXINFO:
@@ -365,6 +438,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         ShowError("Failed to create output window.");
         return 3;
     }
+
+    // Exclude our own window from screen capture so passthrough / monitor weaving
+    // doesn't recursively capture its own output (no feedback loop).
+    SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
 
     // Set up Direct3D + the weaver + the static SBS test image.
     if (!app.renderer.Initialize(app.hwnd))

@@ -105,6 +105,8 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
                 ID_TRAY_MODE_WINDOWED, "Windowed");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::WindowOverlay ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_MODE_OVERLAY, "Overlay source window (in-place 3D)");
+    AppendMenuA(menu, MF_STRING | (mode == OutputMode::LookingGlass ? MF_CHECKED : MF_UNCHECKED),
+                ID_TRAY_LOOKING_GLASS, "Looking glass (passthrough loupe)");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
@@ -114,7 +116,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::TestImage ? MF_CHECKED : 0),
                 ID_TRAY_SRC_TESTIMAGE, "Test image");
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
-                ID_TRAY_SRC_MONITOR, "Capture primary monitor");
+                ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor (passthrough)");
     AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);
 
     m_windowList.clear();
