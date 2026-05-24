@@ -40,7 +40,6 @@ namespace
         int          anaglyphCombo  = 0;   // 0..5 colour combination
         int          anaglyphMode   = 0;   // 0..3 decode mode (colour by default)
         PulfrichMode pulfrichMode   = PulfrichMode::TimeDelay;
-        int          pulfrichEye    = 1;   // affected eye (0 left, 1 right)
         int          pulfrichDelay  = 1;   // delay frames (time-delay mode)
         int          pulfrichNd     = 1;   // ND level index (default Medium)
         int          framePackMode  = 0;   // FramePackPresets index (0 = 1080p)
@@ -365,7 +364,8 @@ namespace
             {
                 int ndN = 0; const NdLevel* nd = PulfrichNdLevels(ndN);
                 const float trans = nd[(app.pulfrichNd >= 0 && app.pulfrichNd < ndN) ? app.pulfrichNd : 0].transmission;
-                app.converter.SetPulfrich(app.pulfrichMode, app.pulfrichEye, trans, app.pulfrichDelay);
+                // Affected eye is always the right pane; Swap eyes moves it to the left.
+                app.converter.SetPulfrich(app.pulfrichMode, 1, trans, app.pulfrichDelay);
             }
             {
                 int fpN = 0; const FramePackPreset* fps = FramePackPresets(fpN);
@@ -397,7 +397,7 @@ namespace
             {
                 MenuState ms{ app->weavingEnabled, app->mode, app->source, app->format,
                               app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
-                              app->pulfrichMode, app->pulfrichEye, app->pulfrichDelay, app->pulfrichNd,
+                              app->pulfrichMode, app->pulfrichDelay, app->pulfrichNd,
                               app->framePackMode };
                 app->tray.ShowContextMenu(hwnd, ms);
             }
@@ -445,8 +445,6 @@ namespace
                     app->pulfrichNd = (int)(cmd - ID_TRAY_PULF_ND_BASE);
                 else if (cmd >= ID_TRAY_PULF_DELAY_BASE)
                     app->pulfrichDelay = (int)(cmd - ID_TRAY_PULF_DELAY_BASE) + 1;
-                else if (cmd >= ID_TRAY_PULF_EYE_BASE)
-                    app->pulfrichEye = (int)(cmd - ID_TRAY_PULF_EYE_BASE);
                 else
                     app->pulfrichMode = (cmd == ID_TRAY_PULF_MODE_BASE) ? PulfrichMode::TimeDelay
                                                                         : PulfrichMode::NDFilter;

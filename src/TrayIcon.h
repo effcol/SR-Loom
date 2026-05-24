@@ -60,7 +60,6 @@ namespace srw
         int          anaglyphCombo;
         int          anaglyphMode;
         PulfrichMode pulfrichMode;
-        int          pulfrichEye;     // 0 left, 1 right
         int          pulfrichDelay;   // 1..4
         int          pulfrichNd;      // index into PulfrichNdLevels
         int          framePackMode;   // index into FramePackPresets

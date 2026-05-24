@@ -166,12 +166,14 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
                 reinterpret_cast<UINT_PTR>(tabMenu), "Top-and-Bottom");
 
     HMENU ilMenu = CreatePopupMenu();
-    addFmt(ilMenu, StereoFormat::RowInterleaved,    "Row");
-    addFmt(ilMenu, StereoFormat::ColumnInterleaved, "Column");
-    AppendMenuA(fmtMenu, MF_POPUP | groupChecked(StereoFormat::RowInterleaved, StereoFormat::ColumnInterleaved),
-                reinterpret_cast<UINT_PTR>(ilMenu), "Interleaved");
-
-    addFmt(fmtMenu, StereoFormat::Checkerboard, "Checkerboard");
+    addFmt(ilMenu, StereoFormat::RowInterleaved,    "Row interleaved");
+    addFmt(ilMenu, StereoFormat::ColumnInterleaved, "Column interleaved");
+    addFmt(ilMenu, StereoFormat::Checkerboard,      "Checkerboard");
+    const UINT ilChecked = (format == StereoFormat::RowInterleaved ||
+                            format == StereoFormat::ColumnInterleaved ||
+                            format == StereoFormat::Checkerboard) ? (UINT)MF_CHECKED : 0u;
+    AppendMenuA(fmtMenu, MF_POPUP | ilChecked,
+                reinterpret_cast<UINT_PTR>(ilMenu), "Interleaved / Checkerboard");
 
     // Anaglyph submenu: colour combinations + decode mode.
     HMENU anaMenu = CreatePopupMenu();
@@ -196,11 +198,6 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
                 ID_TRAY_PULF_MODE_BASE + 0, "Mode: Time delay");
     AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichMode == PulfrichMode::NDFilter) ? MF_CHECKED : 0),
                 ID_TRAY_PULF_MODE_BASE + 1, "Mode: ND filter");
-    AppendMenuA(pulfMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichEye == 0) ? MF_CHECKED : 0),
-                ID_TRAY_PULF_EYE_BASE + 0, "Affected eye: Left");
-    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichEye == 1) ? MF_CHECKED : 0),
-                ID_TRAY_PULF_EYE_BASE + 1, "Affected eye: Right");
     AppendMenuA(pulfMenu, MF_SEPARATOR, 0, nullptr);
     for (int d = 1; d <= 4; ++d)
     {
