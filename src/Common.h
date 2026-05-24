@@ -153,6 +153,7 @@ namespace srw
             "Colour (filtered)",             // each eye keeps only its own channels
             "Half colour",                   // blend toward grey
             "Mono (black & white)",
+            "Recovered colour (aligned, exp)", // disparity-matched channel recovery (red/cyan)
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
         return modes;

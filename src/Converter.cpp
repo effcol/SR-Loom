@@ -122,8 +122,43 @@ float4 PSMain(VSOut i) : SV_Target
     {
         int eye = right ? 1 : 0;
         float3 c = srcTex.Sample(samp, e).rgb;
-        if (g_anaMode == 0)   // Recovered colour: per-eye luminance + shared, horizontally
-        {                     // blurred chrominance (blur reduces red/cyan fringing).
+
+        // Experimental aligned recovery (red/cyan only): find the horizontal
+        // disparity between the L (red) and R (cyan) views, borrow the missing
+        // channels from the matched location -> full per-eye colour, de-fringed.
+        if (g_anaMode == 4 && g_anaCombo == 0)
+        {
+            float px = 1.0 / g_srcW;
+            const int R = 16;
+            float bestSAD = 1e9, bestD = 0.0;
+            // SampleLevel (explicit LOD 0): Sample's implicit gradients are
+            // undefined inside dynamic flow control and hang some GPUs.
+            [loop] for (int d = -R; d <= R; ++d)
+            {
+                float sad = 0.0;
+                [unroll] for (int w = -1; w <= 1; ++w)
+                {
+                    float3 ca = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
+                    float3 cb = srcTex.SampleLevel(samp, float2(e.x + (float)(d + w) * px, e.y), 0.0).rgb;
+                    float la = (eye == 0) ? ca.r : (ca.g + ca.b) * 0.5;
+                    float lb = (eye == 0) ? (cb.g + cb.b) * 0.5 : cb.r;
+                    sad += abs(la - lb);
+                }
+                if (sad < bestSAD) { bestSAD = sad; bestD = (float)d; }
+            }
+            float3 there = srcTex.SampleLevel(samp, float2(e.x + bestD * px, e.y), 0.0).rgb;
+            float3 aligned = (eye == 0) ? float3(c.r, there.g, there.b)
+                                        : float3(there.r, c.g, c.b);
+            // Fall back to shared chroma where the match is weak (avoids artifacts).
+            float eyeY = anaEyeLuma(c, g_anaCombo, eye);
+            float anaY = max(dot(c, float3(0.299, 0.587, 0.114)), 1e-3);
+            float3 sharedCol = saturate(c * (eyeY / anaY));
+            float conf = saturate(1.0 - (bestSAD / 3.0) * 6.0);
+            return float4(lerp(sharedCol, aligned, conf), 1);
+        }
+
+        if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
+        {                                      // horizontally blurred chrominance (reduces fringing).
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);   // sharp per-eye luminance
             float3 acc = 0;
             [unroll] for (int k = -4; k <= 4; ++k)
@@ -210,12 +245,24 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
 #ifdef _DEBUG
     flags |= D3DCOMPILE_DEBUG;
 #endif
+    auto reportCompileError = [](const char* stage, ID3DBlob* errBlob) {
+        std::string msg = std::string("Converter ") + stage + " compile failed.";
+        if (errBlob && errBlob->GetBufferSize() > 0)
+        {
+            msg += "\n\n";
+            msg.append(reinterpret_cast<const char*>(errBlob->GetBufferPointer()),
+                       errBlob->GetBufferSize());
+        }
+        Log("%s", msg.c_str());
+        ShowError(msg.c_str());
+    };
+
     HRESULT hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
                             "VSMain", "vs_5_0", flags, 0, &vsBlob, &err);
-    if (FAILED(hr)) { if (err) err->Release(); ShowError("Converter VS compile failed."); return false; }
+    if (FAILED(hr)) { reportCompileError("VS", err); if (err) err->Release(); return false; }
     hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
                     "PSMain", "ps_5_0", flags, 0, &psBlob, &err);
-    if (FAILED(hr)) { if (err) err->Release(); SAFE_RELEASE(vsBlob); ShowError("Converter PS compile failed."); return false; }
+    if (FAILED(hr)) { reportCompileError("PS", err); if (err) err->Release(); SAFE_RELEASE(vsBlob); return false; }
 
     hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs);
     if (SUCCEEDED(hr))
