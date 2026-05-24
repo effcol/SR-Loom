@@ -39,6 +39,10 @@ namespace
         bool         swapEyes       = false;
         int          anaglyphCombo  = 0;   // 0..5 colour combination
         int          anaglyphMode   = 0;   // 0..3 decode mode (colour by default)
+        PulfrichMode pulfrichMode   = PulfrichMode::TimeDelay;
+        int          pulfrichEye    = 1;   // affected eye (0 left, 1 right)
+        int          pulfrichDelay  = 1;   // delay frames (time-delay mode)
+        int          pulfrichNd     = 1;   // ND level index (default Medium)
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
@@ -357,6 +361,11 @@ namespace
         if (srcSRV && srcW > 0 && srcH > 0)
         {
             app.converter.SetFormat(app.format, app.swapEyes, app.anaglyphCombo, app.anaglyphMode);
+            {
+                int ndN = 0; const NdLevel* nd = PulfrichNdLevels(ndN);
+                const float trans = nd[(app.pulfrichNd >= 0 && app.pulfrichNd < ndN) ? app.pulfrichNd : 0].transmission;
+                app.converter.SetPulfrich(app.pulfrichMode, app.pulfrichEye, trans, app.pulfrichDelay);
+            }
             bool resized = false;
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
@@ -379,9 +388,12 @@ namespace
         {
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
-                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source,
-                                          app->format, app->swapEyes,
-                                          app->anaglyphCombo, app->anaglyphMode);
+            {
+                MenuState ms{ app->weavingEnabled, app->mode, app->source, app->format,
+                              app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
+                              app->pulfrichMode, app->pulfrichEye, app->pulfrichDelay, app->pulfrichNd };
+                app->tray.ShowContextMenu(hwnd, ms);
+            }
             return 0;
 
         case WM_COMMAND:
@@ -416,6 +428,22 @@ namespace
             {
                 app->anaglyphMode = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
                 app->format = StereoFormat::Anaglyph;
+                app->captureRebind = true;
+                return 0;
+            }
+            // Pulfrich sub-options (each also selects the Pulfrich format).
+            if (cmd >= ID_TRAY_PULF_MODE_BASE && cmd <= ID_TRAY_PULF_MAX)
+            {
+                if (cmd >= ID_TRAY_PULF_ND_BASE)
+                    app->pulfrichNd = (int)(cmd - ID_TRAY_PULF_ND_BASE);
+                else if (cmd >= ID_TRAY_PULF_DELAY_BASE)
+                    app->pulfrichDelay = (int)(cmd - ID_TRAY_PULF_DELAY_BASE) + 1;
+                else if (cmd >= ID_TRAY_PULF_EYE_BASE)
+                    app->pulfrichEye = (int)(cmd - ID_TRAY_PULF_EYE_BASE);
+                else
+                    app->pulfrichMode = (cmd == ID_TRAY_PULF_MODE_BASE) ? PulfrichMode::TimeDelay
+                                                                        : PulfrichMode::NDFilter;
+                app->format = StereoFormat::Pulfrich;
                 app->captureRebind = true;
                 return 0;
             }

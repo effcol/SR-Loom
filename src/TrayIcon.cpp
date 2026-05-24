@@ -90,10 +90,16 @@ HWND TrayIcon::WindowAt(size_t index) const
     return (index < m_windowList.size()) ? m_windowList[index] : nullptr;
 }
 
-void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                               SourceKind source, StereoFormat format, bool swapEyes,
-                               int anaglyphCombo, int anaglyphMode)
+void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
 {
+    const bool         weavingEnabled = s.weaving;
+    const OutputMode   mode           = s.mode;
+    const SourceKind   source         = s.source;
+    const StereoFormat format         = s.format;
+    const bool         swapEyes       = s.swapEyes;
+    const int          anaglyphCombo  = s.anaglyphCombo;
+    const int          anaglyphMode   = s.anaglyphMode;
+
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
 
@@ -182,6 +188,37 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
                     ID_TRAY_ANA_MODE_BASE + (UINT)i, modes[i]);
     AppendMenuA(fmtMenu, MF_POPUP | (anaActive ? MF_CHECKED : 0),
                 reinterpret_cast<UINT_PTR>(anaMenu), "Anaglyph");
+
+    // Pulfrich submenu: mode, affected eye, delay (time-delay), ND level.
+    HMENU pulfMenu = CreatePopupMenu();
+    const bool pulfActive = (format == StereoFormat::Pulfrich);
+    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichMode == PulfrichMode::TimeDelay) ? MF_CHECKED : 0),
+                ID_TRAY_PULF_MODE_BASE + 0, "Mode: Time delay");
+    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichMode == PulfrichMode::NDFilter) ? MF_CHECKED : 0),
+                ID_TRAY_PULF_MODE_BASE + 1, "Mode: ND filter");
+    AppendMenuA(pulfMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichEye == 0) ? MF_CHECKED : 0),
+                ID_TRAY_PULF_EYE_BASE + 0, "Affected eye: Left");
+    AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichEye == 1) ? MF_CHECKED : 0),
+                ID_TRAY_PULF_EYE_BASE + 1, "Affected eye: Right");
+    AppendMenuA(pulfMenu, MF_SEPARATOR, 0, nullptr);
+    for (int d = 1; d <= 4; ++d)
+    {
+        char buf[32]; wsprintfA(buf, "Delay: %d frame%s", d, d == 1 ? "" : "s");
+        AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichDelay == d) ? MF_CHECKED : 0),
+                    ID_TRAY_PULF_DELAY_BASE + (UINT)(d - 1), buf);
+    }
+    AppendMenuA(pulfMenu, MF_SEPARATOR, 0, nullptr);
+    int ndCount = 0;
+    const NdLevel* nd = PulfrichNdLevels(ndCount);
+    for (int i = 0; i < ndCount; ++i)
+    {
+        char buf[48]; wsprintfA(buf, "ND: %s", nd[i].label);
+        AppendMenuA(pulfMenu, MF_STRING | ((pulfActive && s.pulfrichNd == i) ? MF_CHECKED : 0),
+                    ID_TRAY_PULF_ND_BASE + (UINT)i, buf);
+    }
+    AppendMenuA(fmtMenu, MF_POPUP | (pulfActive ? MF_CHECKED : 0),
+                reinterpret_cast<UINT_PTR>(pulfMenu), "Pulfrich (2D \xe2\x86\x92 3D)");
 
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");

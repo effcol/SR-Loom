@@ -46,8 +46,28 @@ namespace srw
         RowInterleaved,     // alternating scanlines (a.k.a. line interleaved)
         ColumnInterleaved,  // alternating columns
         Checkerboard,       // quincunx
-        FrameSequential     // alternating frames over time
+        FrameSequential,    // alternating frames over time
+        Pulfrich            // mono source -> depth via per-eye delay or ND darkening
     };
+
+    // Pulfrich: how the affected eye is treated.
+    enum class PulfrichMode { TimeDelay, NDFilter };
+
+    // Affected-eye ND transmission presets (fraction of brightness kept).
+    // ~0.30 ≈ 2 stops ≈ a ~9 ms perceived delay (15 ms per factor-of-10), a good
+    // balance of depth vs. darkness; the other eye stays full so the fused image
+    // doesn't look dim.
+    struct NdLevel { const char* label; float transmission; };
+    inline const NdLevel* PulfrichNdLevels(int& count)
+    {
+        static const NdLevel levels[] = {
+            { "Light (~1 stop)",  0.50f },
+            { "Medium (~2 stop)", 0.30f },   // default
+            { "Strong (~3 stop)", 0.15f },
+        };
+        count = (int)(sizeof(levels) / sizeof(levels[0]));
+        return levels;
+    }
 
     // Resolve a filename to an absolute path next to the executable (so the app
     // doesn't depend on the current working directory).

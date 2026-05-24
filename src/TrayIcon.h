@@ -38,6 +38,29 @@ namespace srw
     constexpr UINT ID_TRAY_ANA_MODE_BASE  = 43050;
     constexpr UINT ID_TRAY_ANA_MODE_MAX   = 43099;
 
+    // Pulfrich sub-options.
+    constexpr UINT ID_TRAY_PULF_MODE_BASE  = 43100;  // +0 time delay, +1 ND filter
+    constexpr UINT ID_TRAY_PULF_EYE_BASE   = 43110;  // +0 left, +1 right
+    constexpr UINT ID_TRAY_PULF_DELAY_BASE = 43120;  // +0..3 -> 1..4 frames
+    constexpr UINT ID_TRAY_PULF_ND_BASE    = 43130;  // +0..N ND level
+    constexpr UINT ID_TRAY_PULF_MAX        = 43199;
+
+    // State the context menu reflects (checkmarks).
+    struct MenuState
+    {
+        bool         weaving;
+        OutputMode   mode;
+        SourceKind   source;
+        StereoFormat format;
+        bool         swapEyes;
+        int          anaglyphCombo;
+        int          anaglyphMode;
+        PulfrichMode pulfrichMode;
+        int          pulfrichEye;     // 0 left, 1 right
+        int          pulfrichDelay;   // 1..4
+        int          pulfrichNd;      // index into PulfrichNdLevels
+    };
+
     class TrayIcon
     {
     public:
@@ -53,9 +76,7 @@ namespace srw
         // Build and show the right-click context menu, with current state
         // reflected as checkmarks/radio marks. Commands post as WM_COMMAND.
         // Enumerates top-level windows into the Source submenu.
-        void ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                             SourceKind source, StereoFormat format, bool swapEyes,
-                             int anaglyphCombo, int anaglyphMode);
+        void ShowContextMenu(HWND hwnd, const MenuState& s);
 
         // Resolve a window-list menu index (id - ID_TRAY_SRC_WINDOW_BASE) to its
         // HWND, captured when the menu was last shown. Null if out of range.

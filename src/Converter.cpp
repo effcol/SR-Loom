@@ -10,19 +10,24 @@ namespace
     // Fullscreen-triangle VS + a PS that samples the source per stereo layout and
     // writes the left half / right half of the SBS output.
     const char* kShaderSrc = R"HLSL(
-Texture2D    srcTex : register(t0);
-SamplerState samp   : register(s0);
+Texture2D    srcTex  : register(t0);   // current source frame
+Texture2D    srcPrev : register(t1);   // delayed source frame (Pulfrich time delay)
+SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
 {
-    int   g_format;   // 0 SBS, 1 TAB, 2 Anaglyph, 3 RowInterleaved, 4 ColInterleaved, 5 Checkerboard
+    int   g_format;   // 0 SBS,1 TAB,2 Anaglyph,3 Row,4 Col,5 Checker,6 Pulfrich,99 copy
     int   g_swap;     // swap left/right eyes
     float g_srcW;
     float g_srcH;
     int   g_anaCombo; // 0..5 colour combination
-    int   g_anaMode;  // 0 colour-filtered, 1 colour-recovered, 2 half-colour, 3 mono
-    int   g_pad0;
-    int   g_pad1;
+    int   g_anaMode;  // 0 colour-filtered, 1 half-colour, 2 mono
+    int   g_pulfMode; // 0 time-delay, 1 ND filter
+    int   g_pulfEye;  // affected eye: 0 left, 1 right
+    float g_ndTrans;  // ND transmission (affected eye brightness)
+    float g_pad0;
+    float g_pad1;
+    float g_pad2;
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -58,6 +63,8 @@ VSOut VSMain(uint id : SV_VertexID)
 
 float4 PSMain(VSOut i) : SV_Target
 {
+    if (g_format == 99) return srcTex.Sample(samp, i.uv);   // 1:1 copy (history blit)
+
     float2 uv = i.uv;                       // 0..1 across the SBS output
     bool rightPane = uv.x >= 0.5;           // which output half we're filling
     // within-pane 0..1 (from the OUTPUT pane, always valid)
@@ -98,6 +105,14 @@ float4 PSMain(VSOut i) : SV_Target
         float3 c = srcTex.Sample(samp, e).rgb;
         return float4(decodeAnaglyph(c, g_anaCombo, right ? 1 : 0, g_anaMode), 1);
     }
+    else if (g_format == 6)   // Pulfrich: mono source -> per-eye delay / ND darken
+    {
+        float3 cur = srcTex.Sample(samp, e).rgb;
+        int eyeIdx = right ? 1 : 0;
+        if (eyeIdx != g_pulfEye) return float4(cur, 1);          // unaffected eye = current
+        if (g_pulfMode == 1)    return float4(cur * g_ndTrans, 1); // ND: darken this eye
+        return float4(srcPrev.Sample(samp, e).rgb, 1);           // time delay: older frame
+    }
 
     // Default: side-by-side. left=left half, right=right half.
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, e.y);
@@ -115,6 +130,7 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::RowInterleaved:    return 3;
         case StereoFormat::ColumnInterleaved: return 4;
         case StereoFormat::Checkerboard:      return 5;
+        case StereoFormat::Pulfrich:          return 6;
         default:                              return 0;  // SBS (and unimplemented)
         }
     }
@@ -130,14 +146,15 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::HalfTAB:
         case StereoFormat::RowInterleaved:    ew = w;     eh = h / 2; break;
         case StereoFormat::ColumnInterleaved: ew = w / 2; eh = h;     break;
-        default:                              ew = w;     eh = h;     break; // anaglyph/checker
+        default:                              ew = w;     eh = h;     break; // anaglyph/checker/pulfrich
         }
         if (ew < 1) ew = 1;
         if (eh < 1) eh = 1;
     }
 
     struct CB { int format; int swap; float srcW; float srcH;
-               int anaCombo; int anaMode; int pad0; int pad1; };
+               int anaCombo; int anaMode; int pulfMode; int pulfEye;
+               float ndTrans; float pad0; float pad1; float pad2; };
 }
 
 Converter::~Converter()
@@ -190,6 +207,14 @@ void Converter::SetFormat(StereoFormat fmt, bool swapEyes, int anaCombo, int ana
     m_anaMode  = anaMode;
 }
 
+void Converter::SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmission, int delayFrames)
+{
+    m_pulfMode  = mode;
+    m_pulfEye   = affectedEye;
+    m_ndTrans   = ndTransmission;
+    m_pulfDelay = delayFrames < 1 ? 1 : (delayFrames > kHistory - 1 ? kHistory - 1 : delayFrames);
+}
+
 bool Converter::EnsureOutput(int width, int height)
 {
     if (m_outTex && width == m_outWidth && height == m_outHeight)
@@ -222,34 +247,100 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     if (!source || !m_ps || srcWidth <= 0 || srcHeight <= 0)
         return false;
 
+    const bool pulfrich = (m_fmt == StereoFormat::Pulfrich);
+    if (!pulfrich) ReleaseHistory();   // free the ring when not needed
+
     int ew = 0, eh = 0;
     PerEyeSize(m_fmt, srcWidth, srcHeight, ew, eh);
     outputResized = EnsureOutput(ew * 2, eh);
     if (!m_outRTV)
         return false;
 
+    ID3D11ShaderResourceView* delayedSRV = nullptr;
+    if (pulfrich)
+    {
+        EnsureHistory(srcWidth, srcHeight);
+        const int delayed = (m_histWrite - m_pulfDelay + kHistory) % kHistory;
+        delayedSRV = m_histSRV[delayed];
+    }
+
     CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
-           m_anaCombo, m_anaMode, 0, 0 };
+           m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
+           m_ndTrans, 0, 0, 0 };
     m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
 
-    D3D11_VIEWPORT vp{};
-    vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
-
-    m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
-    m_context->RSSetViewports(1, &vp);
+    // Shared pipeline state.
     m_context->IASetInputLayout(nullptr);
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->VSSetShader(m_vs, nullptr, 0);
     m_context->PSSetShader(m_ps, nullptr, 0);
     m_context->PSSetSamplers(0, 1, &m_sampler);
-    m_context->PSSetShaderResources(0, 1, &source);
     m_context->PSSetConstantBuffers(0, 1, &m_cbuffer);
-    m_context->Draw(3, 0);
 
-    // Unbind the source so it can be reused as a render target elsewhere.
-    ID3D11ShaderResourceView* nullSRV = nullptr;
-    m_context->PSSetShaderResources(0, 1, &nullSRV);
+    // Pass 1: convert source (and the delayed frame for Pulfrich) into the SBS output.
+    {
+        D3D11_VIEWPORT vp{};
+        vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
+        m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
+        m_context->RSSetViewports(1, &vp);
+        ID3D11ShaderResourceView* srvs[2] = { source, delayedSRV };
+        m_context->PSSetShaderResources(0, 2, srvs);
+        m_context->Draw(3, 0);
+        ID3D11ShaderResourceView* nulls[2] = { nullptr, nullptr };
+        m_context->PSSetShaderResources(0, 2, nulls);
+    }
+
+    // Pass 2 (Pulfrich): copy the current source into the history ring for later.
+    if (pulfrich && m_histRTV[m_histWrite])
+    {
+        CB copyCb = cb; copyCb.format = 99;
+        m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &copyCb, 0, 0);
+        D3D11_VIEWPORT vp{};
+        vp.Width = (FLOAT)m_histW; vp.Height = (FLOAT)m_histH; vp.MaxDepth = 1.0f;
+        m_context->OMSetRenderTargets(1, &m_histRTV[m_histWrite], nullptr);
+        m_context->RSSetViewports(1, &vp);
+        m_context->PSSetShaderResources(0, 1, &source);
+        m_context->Draw(3, 0);
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        m_context->PSSetShaderResources(0, 1, &nullSRV);
+        m_histWrite = (m_histWrite + 1) % kHistory;
+    }
     return true;
+}
+
+bool Converter::EnsureHistory(int width, int height)
+{
+    if (m_hist[0] && width == m_histW && height == m_histH)
+        return false;
+
+    ReleaseHistory();
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)width; td.Height = (UINT)height;
+    td.MipLevels = 1; td.ArraySize = 1; td.Format = m_format;
+    td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    for (int i = 0; i < kHistory; ++i)
+    {
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_hist[i]))) { ReleaseHistory(); return false; }
+        if (FAILED(m_device->CreateRenderTargetView(m_hist[i], nullptr, &m_histRTV[i]))) { ReleaseHistory(); return false; }
+        if (FAILED(m_device->CreateShaderResourceView(m_hist[i], nullptr, &m_histSRV[i]))) { ReleaseHistory(); return false; }
+    }
+    m_histW = width; m_histH = height; m_histWrite = 0;
+    return true;
+}
+
+void Converter::ReleaseHistory()
+{
+    for (int i = 0; i < kHistory; ++i)
+    {
+        SAFE_RELEASE(m_histSRV[i]);
+        SAFE_RELEASE(m_histRTV[i]);
+        SAFE_RELEASE(m_hist[i]);
+    }
+    m_histW = m_histH = 0;
+    m_histWrite = 0;
 }
 
 void Converter::ReleaseOutput()
@@ -263,6 +354,7 @@ void Converter::ReleaseOutput()
 void Converter::Shutdown()
 {
     ReleaseOutput();
+    ReleaseHistory();
     SAFE_RELEASE(m_cbuffer);
     SAFE_RELEASE(m_sampler);
     SAFE_RELEASE(m_ps);
