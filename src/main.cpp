@@ -8,6 +8,7 @@
 #include "TrayIcon.h"
 #include "Capture.h"
 #include "Converter.h"
+#include "Detector.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -22,6 +23,7 @@ namespace
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
     constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
+    constexpr int   kHotkeyDetect  = 5;   // Ctrl+Alt+D : auto-detect stereo format
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     struct AppState
@@ -32,6 +34,7 @@ namespace
         TrayIcon     tray;
         Capture      capture;
         Converter    converter;
+        Detector     detector;
         bool         weavingEnabled = true;
         OutputMode   mode           = OutputMode::Fullscreen;
         SourceKind   source         = SourceKind::TestImage;
@@ -316,6 +319,39 @@ namespace
         return r;
     }
 
+    // Resolve the current source frame (test image or capture).
+    bool ResolveSource(AppState& app, ID3D11ShaderResourceView*& srv, int& w, int& h)
+    {
+        if (app.source == SourceKind::TestImage)
+        {
+            srv = app.weaver.SourceSRV(); w = app.weaver.SourceWidth(); h = app.weaver.SourceHeight();
+        }
+        else if (app.capture.IsActive())
+        {
+            srv = app.capture.SRV(); w = app.capture.Width(); h = app.capture.Height();
+        }
+        else { srv = nullptr; w = h = 0; }
+        return srv && w > 0 && h > 0;
+    }
+
+    // Analyze the current frame and switch to the detected stereo layout.
+    void DetectFormat(AppState& app)
+    {
+        ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0;
+        if (!ResolveSource(app, srv, w, h)) return;
+        StereoFormat f;
+        if (app.detector.Detect(srv, w, h, f))
+        {
+            app.format = f;
+            app.captureRebind = true;
+            app.tray.SetTooltip("SR Weaver — detected a stereo layout");
+        }
+        else
+        {
+            app.tray.SetTooltip("SR Weaver — no stereo layout detected");
+        }
+    }
+
     void RenderFrame(AppState& app)
     {
         if (!app.weavingEnabled || !app.renderer.IsValid())
@@ -477,6 +513,7 @@ namespace
                 return 0;
             case ID_TRAY_CAPTURE_FOREGROUND: CaptureForeground(*app); return 0;
             case ID_TRAY_SWAP_EYES: app->swapEyes = !app->swapEyes; app->captureRebind = true; return 0;
+            case ID_TRAY_DETECT: DetectFormat(*app); return 0;
             case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
             case ID_TRAY_SRC_MONITOR:
                 UsePassthrough(*app);
@@ -504,6 +541,7 @@ namespace
                 if (app->weavingEnabled) ApplyMode(*app);
             }
             else if (wParam == kHotkeyCapture) CaptureForeground(*app);
+            else if (wParam == kHotkeyDetect)  DetectFormat(*app);
             return 0;
 
         case WM_SIZE:
@@ -626,6 +664,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Initialize the format-conversion stage (capture/image -> SBS for the weaver).
     if (!app.converter.Initialize(app.renderer.Device(), app.renderer.Context()))
         return 7;
+    app.detector.Initialize(app.renderer.Device(), app.renderer.Context());  // optional
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
     // Tray icon + global hotkeys.
@@ -633,6 +672,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
     RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+    RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D');
 
     // Show and weave.
     ApplyMode(app);
@@ -654,7 +694,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
+    UnregisterHotKey(app.hwnd, kHotkeyDetect);
     app.tray.Remove();
+    app.detector.Shutdown();
     app.converter.Shutdown();
     app.capture.Shutdown();
     app.weaver.Shutdown();

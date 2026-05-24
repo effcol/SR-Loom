@@ -67,12 +67,14 @@ add_executable(SRWeaver WIN32
     src/TrayIcon.cpp
     src/Capture.cpp
     src/Converter.cpp
+    src/Detector.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
     src/TrayIcon.h
     src/Capture.h
     src/Converter.h
+    src/Detector.h
     src/resource.h
     src/app.rc
 )

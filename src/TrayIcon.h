@@ -21,6 +21,7 @@ namespace srw
         ID_TRAY_SRC_TESTIMAGE,
         ID_TRAY_SRC_MONITOR,
         ID_TRAY_SWAP_EYES,
+        ID_TRAY_DETECT,
         ID_TRAY_EXIT
     };
 
