@@ -41,6 +41,8 @@ namespace srw
         void ReleaseOutput();
         bool EnsureHistory(int width, int height);
         void ReleaseHistory();
+        bool EnsureDisparity(int width, int height);
+        void ReleaseDisparity();
 
         static const int kHistory = 6;  // frame-history ring depth (delay 1..5)
 
@@ -48,8 +50,15 @@ namespace srw
         ID3D11DeviceContext*     m_context = nullptr;
         ID3D11VertexShader*      m_vs      = nullptr;
         ID3D11PixelShader*       m_ps      = nullptr;
+        ID3D11PixelShader*       m_psCoarse = nullptr;  // coarse anaglyph disparity pass
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
+
+        // Coarse L<->R disparity map for multi-scale anaglyph recovery (R16G16_FLOAT).
+        ID3D11Texture2D*          m_dispTex = nullptr;
+        ID3D11RenderTargetView*   m_dispRTV = nullptr;
+        ID3D11ShaderResourceView* m_dispSRV = nullptr;
+        int                       m_dispW = 0, m_dispH = 0;
 
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;

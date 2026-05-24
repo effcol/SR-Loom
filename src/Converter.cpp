@@ -12,6 +12,7 @@ namespace
     const char* kShaderSrc = R"HLSL(
 Texture2D    srcTex  : register(t0);   // current source frame
 Texture2D    srcPrev : register(t1);   // delayed source frame (Pulfrich time delay)
+Texture2D    dispTex : register(t2);   // coarse L<->R disparity map (UV units): .r=dLR .g=dRL
 SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
@@ -28,6 +29,10 @@ cbuffer Params : register(b0)
     float g_fpEyeFrac; // frame packing: each eye's fraction of the source height
     float g_fpGapFrac; // frame packing: blanking gap fraction
     float g_pad2;
+    float g_dispMaxUV; // anaglyph recovery: max search disparity (fraction of width)
+    float g_coarseW;   // coarse disparity-map width (px)
+    float g_coarseH;   // coarse disparity-map height (px)
+    float g_pad3;
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -79,6 +84,45 @@ VSOut VSMain(uint id : SV_VertexID)
     return o;
 }
 
+// Coarse disparity pass (red/cyan anaglyph): renders a low-resolution map of the
+// horizontal disparity between the L (red) and R (cyan = (g+b)/2) views, in both
+// directions. Low resolution makes winner-take-all matching robust and smooth.
+// Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
+float4 PSAnaDisp(VSOut i) : SV_Target
+{
+    float2 uv  = i.uv;
+    float  ctx = 1.0 / max(g_coarseW, 1.0);   // one coarse texel in UV (match window step)
+    float  maxD = g_dispMaxUV;
+    const int N = 24;                          // search steps each direction
+    float  step = maxD / (float)N;
+
+    // Reference window (this eye, at uv) sampled once: L=red, R=cyan luma.
+    float refL[3], refR[3];
+    [unroll] for (int w = 0; w < 3; ++w)
+    {
+        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 1) * ctx, 0), 0).rgb;
+        refL[w] = s.r; refR[w] = (s.g + s.b) * 0.5;
+    }
+
+    float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
+    [loop] for (int k = -N; k <= N; ++k)
+    {
+        float d = (float)k * step;
+        float bias = abs(d) / max(maxD, 1e-4) * 0.10;   // gentle small-disparity tie-break
+        float sadL = bias, sadR = bias;
+        [unroll] for (int w = 0; w < 3; ++w)
+        {
+            float3 s = srcTex.SampleLevel(samp, uv + float2(d + (float)(w - 1) * ctx, 0), 0).rgb;
+            float cL = s.r, cR = (s.g + s.b) * 0.5;
+            sadL += abs(refL[w] - cR);   // L's red  vs candidate cyan
+            sadR += abs(refR[w] - cL);   // R's cyan vs candidate red
+        }
+        if (sadL < bestL) { bestL = sadL; dL = d; }
+        if (sadR < bestR) { bestR = sadR; dR = d; }
+    }
+    return float4(dL, dR, 0, 0);
+}
+
 float4 PSMain(VSOut i) : SV_Target
 {
     if (g_format == 99) return srcTex.Sample(samp, i.uv);   // 1:1 copy (history blit)
@@ -123,48 +167,55 @@ float4 PSMain(VSOut i) : SV_Target
         int eye = right ? 1 : 0;
         float3 c = srcTex.Sample(samp, e).rgb;
 
-        // Experimental aligned recovery (red/cyan only): find the horizontal
-        // disparity between the L (red) and R (cyan) views, borrow the missing
-        // channels from the matched location -> full per-eye colour, de-fringed.
+        // Multi-scale aligned recovery (red/cyan only). Reads the coarse disparity
+        // map (PSAnaDisp), refines it at full resolution, checks left-right
+        // consistency to flag occlusions, then borrows only the disparity-aligned
+        // CHROMA (each eye keeps its own sharp luminance) -> de-fringed full colour.
         if (g_anaMode == 4 && g_anaCombo == 0)
         {
             float px = 1.0 / g_srcW;
-            const int R = 16;
-            float bestSAD = 1e9, bestD = 0.0;
-            // Horizontal block-match for the L(red)<->R(cyan) disparity. SampleLevel:
-            // Sample's implicit gradients are undefined in dynamic flow control and
-            // hang some GPUs. A tiny |d| cost breaks ties in flat regions.
-            [loop] for (int d = -R; d <= R; ++d)
+            float2 disp = dispTex.SampleLevel(samp, e, 0.0).rg;   // (dLR, dRL) in UV
+            float d0 = (eye == 0) ? disp.r : disp.g;              // this eye -> the other
+
+            // Full-res refine: small local search around the coarse estimate.
+            float bestSAD = 1e9, dRef = d0;
+            [loop] for (int r = -3; r <= 3; ++r)
             {
-                float sad = (float)abs(d) * 0.0015;
+                float d = d0 + (float)r * px;
+                float sad = 0.0;
                 [unroll] for (int w = -1; w <= 1; ++w)
                 {
                     float3 ca = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
-                    float3 cb = srcTex.SampleLevel(samp, float2(e.x + (float)(d + w) * px, e.y), 0.0).rgb;
+                    float3 cb = srcTex.SampleLevel(samp, float2(e.x + d + (float)w * px, e.y), 0.0).rgb;
                     float la = (eye == 0) ? ca.r : (ca.g + ca.b) * 0.5;
                     float lb = (eye == 0) ? (cb.g + cb.b) * 0.5 : cb.r;
                     sad += abs(la - lb);
                 }
-                if (sad < bestSAD) { bestSAD = sad; bestD = (float)d; }
+                if (sad < bestSAD) { bestSAD = sad; dRef = d; }
             }
-            // Each eye keeps its OWN sharp luminance (correct structure / depth);
-            // only the chrominance comes from the disparity-aligned location, so a
-            // wrong match merely mis-tints a pixel instead of distorting its shape.
-            float eyeY = anaEyeLuma(c, g_anaCombo, eye);
-            float3 there = srcTex.SampleLevel(samp, float2(e.x + bestD * px, e.y), 0.0).rgb;
+
+            // Left-right consistency: the reverse disparity at the matched point
+            // should cancel ours; if not, this pixel is occluded -> low confidence.
+            float2 d2  = dispTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rg;
+            float  back = (eye == 0) ? d2.g : d2.r;
+            float  consistency = saturate(1.0 - abs(dRef + back) / max(g_dispMaxUV, 1e-4) * 4.0);
+
+            float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
+            float3 there = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
                                            : float3(there.r, c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
             float3 aligned = saturate(alignedCol * (eyeY / aY));
-            // Fallback where the match is weak: shared, horizontally-blurred chroma
-            // (the mode-0 result), also recoloured to this eye's luminance.
+
+            // Occlusion / low-confidence fallback: shared, horizontally-blurred chroma.
             float3 acc = 0;
             [unroll] for (int k = -4; k <= 4; ++k)
                 acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
             float3 blurCol = acc / 9.0;
             float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
             float3 sharedCol = saturate(blurCol * (eyeY / bY));
-            float conf = saturate(1.0 - bestSAD * 1.2);
+
+            float conf = saturate(1.0 - bestSAD * 1.5) * consistency;
             return float4(lerp(sharedCol, aligned, conf), 1);
         }
 
@@ -238,7 +289,8 @@ float4 PSMain(VSOut i) : SV_Target
 
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
-               float ndTrans; float fpEyeFrac; float fpGapFrac; float pad2; };
+               float ndTrans; float fpEyeFrac; float fpGapFrac; float pad2;
+               float dispMaxUV; float coarseW; float coarseH; float pad3; };
 }
 
 Converter::~Converter()
@@ -280,6 +332,15 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps);
     SAFE_RELEASE(vsBlob); SAFE_RELEASE(psBlob);
     if (FAILED(hr)) { ShowError("Converter shader creation failed."); return false; }
+
+    // Coarse disparity pass (used only by the multi-scale anaglyph recovery mode).
+    ID3DBlob* csBlob = nullptr;
+    hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
+                    "PSAnaDisp", "ps_5_0", flags, 0, &csBlob, &err);
+    if (FAILED(hr)) { reportCompileError("PSAnaDisp", err); if (err) err->Release(); return false; }
+    hr = device->CreatePixelShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), nullptr, &m_psCoarse);
+    SAFE_RELEASE(csBlob);
+    if (FAILED(hr)) { ShowError("Converter coarse shader creation failed."); return false; }
 
     D3D11_SAMPLER_DESC sd{};
     sd.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -369,30 +430,58 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         delayedSRV = m_histSRV[delayed];
     }
 
+    // Multi-scale anaglyph recovery needs a coarse disparity map first.
+    const bool anaRecover = (m_fmt == StereoFormat::Anaglyph && m_anaMode == 4 && m_anaCombo == 0);
+    int cw = 0, ch = 0;
+    if (anaRecover)
+    {
+        cw = srcWidth  / 4; if (cw < 1) cw = 1;
+        ch = srcHeight / 4; if (ch < 1) ch = 1;
+        EnsureDisparity(cw, ch);
+    }
+    else ReleaseDisparity();
+
     CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
            m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
-           m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0 };
+           m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0,
+           0.06f /*dispMaxUV*/, (float)cw, (float)ch, 0 };
     m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
 
     // Shared pipeline state.
     m_context->IASetInputLayout(nullptr);
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->VSSetShader(m_vs, nullptr, 0);
-    m_context->PSSetShader(m_ps, nullptr, 0);
     m_context->PSSetSamplers(0, 1, &m_sampler);
     m_context->PSSetConstantBuffers(0, 1, &m_cbuffer);
 
-    // Pass 1: convert source (and the delayed frame for Pulfrich) into the SBS output.
+    // Pass 0 (anaglyph recovery): render the coarse L<->R disparity map.
+    if (anaRecover && m_dispRTV)
+    {
+        D3D11_VIEWPORT vp{};
+        vp.Width = (FLOAT)m_dispW; vp.Height = (FLOAT)m_dispH; vp.MaxDepth = 1.0f;
+        m_context->PSSetShader(m_psCoarse, nullptr, 0);
+        m_context->OMSetRenderTargets(1, &m_dispRTV, nullptr);
+        m_context->RSSetViewports(1, &vp);
+        m_context->PSSetShaderResources(0, 1, &source);
+        m_context->Draw(3, 0);
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        m_context->PSSetShaderResources(0, 1, &nullSRV);
+        m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+
+    // Pass 1: convert source (delayed frame for Pulfrich, disparity map for anaglyph
+    // recovery) into the SBS output.
     {
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
+        m_context->PSSetShader(m_ps, nullptr, 0);
         m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
         m_context->RSSetViewports(1, &vp);
-        ID3D11ShaderResourceView* srvs[2] = { source, delayedSRV };
-        m_context->PSSetShaderResources(0, 2, srvs);
+        ID3D11ShaderResourceView* srvs[3] = { source, delayedSRV, anaRecover ? m_dispSRV : nullptr };
+        m_context->PSSetShaderResources(0, 3, srvs);
         m_context->Draw(3, 0);
-        ID3D11ShaderResourceView* nulls[2] = { nullptr, nullptr };
-        m_context->PSSetShaderResources(0, 2, nulls);
+        ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
+        m_context->PSSetShaderResources(0, 3, nulls);
     }
 
     // Pass 2 (Pulfrich): copy the current source into the history ring for later.
@@ -456,12 +545,42 @@ void Converter::ReleaseOutput()
     m_outWidth = m_outHeight = 0;
 }
 
+bool Converter::EnsureDisparity(int width, int height)
+{
+    if (m_dispTex && width == m_dispW && height == m_dispH)
+        return false;
+
+    ReleaseDisparity();
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = (UINT)width; td.Height = (UINT)height;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16_FLOAT;   // signed disparities (dLR, dRL) in UV
+    td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_dispTex))) { ReleaseDisparity(); return false; }
+    if (FAILED(m_device->CreateRenderTargetView(m_dispTex, nullptr, &m_dispRTV))) { ReleaseDisparity(); return false; }
+    if (FAILED(m_device->CreateShaderResourceView(m_dispTex, nullptr, &m_dispSRV))) { ReleaseDisparity(); return false; }
+    m_dispW = width; m_dispH = height;
+    return true;
+}
+
+void Converter::ReleaseDisparity()
+{
+    SAFE_RELEASE(m_dispSRV);
+    SAFE_RELEASE(m_dispRTV);
+    SAFE_RELEASE(m_dispTex);
+    m_dispW = m_dispH = 0;
+}
+
 void Converter::Shutdown()
 {
     ReleaseOutput();
     ReleaseHistory();
+    ReleaseDisparity();
     SAFE_RELEASE(m_cbuffer);
     SAFE_RELEASE(m_sampler);
+    SAFE_RELEASE(m_psCoarse);
     SAFE_RELEASE(m_ps);
     SAFE_RELEASE(m_vs);
 }
