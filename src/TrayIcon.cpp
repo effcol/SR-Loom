@@ -103,6 +103,10 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
                 ID_TRAY_MODE_FULLSCREEN, "Fullscreen");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::Windowed ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_MODE_WINDOWED, "Windowed");
+    AppendMenuA(menu, MF_STRING | (mode == OutputMode::WindowOverlay ? MF_CHECKED : MF_UNCHECKED),
+                ID_TRAY_MODE_OVERLAY, "Overlay source window (in-place 3D)");
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
 
     // Source submenu: test image, monitor, then live window list.

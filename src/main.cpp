@@ -20,6 +20,7 @@ namespace
     constexpr char  kWindowTitle[] = "SR Weaver";
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
+    constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
 
     struct AppState
     {
@@ -31,6 +32,7 @@ namespace
         bool       weavingEnabled = true;
         OutputMode mode           = OutputMode::Fullscreen;
         SourceKind source         = SourceKind::TestImage;
+        HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
     };
@@ -58,22 +60,75 @@ namespace
         const RECT& d = app.srDisplayRect;
         const int dw = d.right - d.left;
         const int dh = d.bottom - d.top;
+        const HWND hwnd = app.hwnd;
 
-        if (app.mode == OutputMode::Fullscreen)
+        switch (app.mode)
         {
-            SetWindowLongPtr(app.hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-            SetWindowPos(app.hwnd, HWND_TOP, d.left, d.top, dw, dh,
+        case OutputMode::Fullscreen:
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, 0);
+            SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowPos(hwnd, HWND_TOP, d.left, d.top, dw, dh,
                          SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            break;
+
+        case OutputMode::WindowOverlay:
+        {
+            // Borderless, always-on-top, click-through, doesn't steal focus.
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE,
+                             WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+            SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            RECT r{ d.left, d.top, d.left + 1280, d.top + 720 };
+            if (app.sourceWindow && IsWindow(app.sourceWindow))
+                GetWindowRect(app.sourceWindow, &r);
+            SetWindowPos(hwnd, HWND_TOPMOST, r.left, r.top,
+                         r.right - r.left, r.bottom - r.top,
+                         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            break;
         }
-        else
+
+        case OutputMode::Windowed:
+        case OutputMode::LookingGlass:   // TODO: dedicated loupe; windowed for now
+        default:
         {
             const int w = 1280, h = 720;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
-            SetWindowLongPtr(app.hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
-            SetWindowPos(app.hwnd, HWND_NOTOPMOST, x, y, w, h,
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, 0);
+            SetWindowLongPtr(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, w, h,
                          SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            break;
         }
+        }
+    }
+
+    // Keep the overlay aligned with the tracked source window each frame.
+    void UpdateOverlayTracking(AppState& app)
+    {
+        if (app.mode != OutputMode::WindowOverlay)
+            return;
+
+        HWND src = app.sourceWindow;
+        if (!src || !IsWindow(src))
+            return;  // source gone; leave last frame on screen
+
+        if (IsIconic(src) || !IsWindowVisible(src))
+        {
+            if (IsWindowVisible(app.hwnd)) ShowWindow(app.hwnd, SW_HIDE);
+            return;
+        }
+
+        RECT r{}, cur{};
+        GetWindowRect(src, &r);
+        GetWindowRect(app.hwnd, &cur);
+        if (!EqualRect(&r, &cur))
+        {
+            SetWindowPos(app.hwnd, HWND_TOPMOST, r.left, r.top,
+                         r.right - r.left, r.bottom - r.top,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);  // WM_SIZE resizes the swap chain
+        }
+        if (!IsWindowVisible(app.hwnd))
+            ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
     }
 
     void SetWeaving(AppState& app, bool enable)
@@ -96,34 +151,63 @@ namespace
     void UseTestImage(AppState& app)
     {
         app.capture.Stop();
-        app.weaver.SetStereoImageFromFile(app.renderer.Device(), "test_sbs.jpg",
+        app.sourceWindow = nullptr;
+        app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_sbs.jpg").c_str(),
                                           StereoFormat::FullSBS,
                                           app.renderer.BackBufferFormat());
         app.source = SourceKind::TestImage;
+        if (app.mode == OutputMode::WindowOverlay)   // overlay only makes sense for a window
+            app.mode = OutputMode::Fullscreen;
+        if (app.weavingEnabled) ApplyMode(app);
     }
 
+    // Capture a window and present it as an in-place 3D overlay tracking that window.
     void UseWindow(AppState& app, HWND target)
     {
         if (target && app.capture.StartWindow(target))
         {
-            app.source = SourceKind::CaptureWindow;
+            app.source       = SourceKind::CaptureWindow;
+            app.sourceWindow = target;
             app.captureRebind = true;   // re-register the SRV once frames arrive
+            app.mode = OutputMode::WindowOverlay;
+            if (app.weavingEnabled) ApplyMode(app);
         }
+    }
+
+    // Grab whatever window is currently focused (Ctrl+Alt+C).
+    void CaptureForeground(AppState& app)
+    {
+        HWND fg = GetForegroundWindow();
+        Log("CaptureForeground: fg=%p app.hwnd=%p", (void*)fg, (void*)app.hwnd);
+        if (fg && fg != app.hwnd && IsWindow(fg))
+            UseWindow(app, fg);
     }
 
     void UseMonitor(AppState& app)
     {
+        app.sourceWindow = nullptr;
         HMONITOR mon = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
         if (app.capture.StartMonitor(mon))
         {
             app.source = SourceKind::CaptureMonitor;
             app.captureRebind = true;
         }
+        if (app.mode == OutputMode::WindowOverlay)
+            app.mode = OutputMode::Fullscreen;
+        if (app.weavingEnabled) ApplyMode(app);
     }
 
     void RenderFrame(AppState& app)
     {
-        if (!app.weavingEnabled || IsIconic(app.hwnd) || !app.renderer.IsValid())
+        if (!app.weavingEnabled || !app.renderer.IsValid())
+        {
+            Sleep(10);
+            return;
+        }
+
+        UpdateOverlayTracking(app);   // follow the source window in overlay mode
+
+        if (IsIconic(app.hwnd))
         {
             Sleep(10);
             return;
@@ -182,6 +266,11 @@ namespace
                 app->mode = OutputMode::Windowed;
                 if (app->weavingEnabled) ApplyMode(*app);
                 return 0;
+            case ID_TRAY_MODE_OVERLAY:
+                app->mode = OutputMode::WindowOverlay;
+                if (app->weavingEnabled) ApplyMode(*app);
+                return 0;
+            case ID_TRAY_CAPTURE_FOREGROUND: CaptureForeground(*app); return 0;
             case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
             case ID_TRAY_SRC_MONITOR:   UseMonitor(*app);   return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
@@ -198,6 +287,7 @@ namespace
                           ? OutputMode::Windowed : OutputMode::Fullscreen;
                 if (app->weavingEnabled) ApplyMode(*app);
             }
+            else if (wParam == kHotkeyCapture) CaptureForeground(*app);
             return 0;
 
         case WM_SIZE:
@@ -281,7 +371,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         return 4;
     if (!app.weaver.CreateWeaver(app.renderer.Context(), app.hwnd))
         return 5;
-    if (!app.weaver.SetStereoImageFromFile(app.renderer.Device(), "test_sbs.jpg",
+    if (!app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_sbs.jpg").c_str(),
                                            StereoFormat::FullSBS,
                                            app.renderer.BackBufferFormat()))
         return 6;
@@ -292,8 +382,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     // Tray icon + global hotkeys.
     app.tray.Add(app.hwnd, "SR Weaver — weaving");
-    RegisterHotKey(app.hwnd, kHotkeyToggle, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
-    RegisterHotKey(app.hwnd, kHotkeyMode,   MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
+    RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
+    RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
+    RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
 
     // Show and weave.
     ApplyMode(app);
@@ -314,6 +405,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
+    UnregisterHotKey(app.hwnd, kHotkeyCapture);
     app.tray.Remove();
     app.capture.Shutdown();
     app.weaver.Shutdown();

@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdarg>
+#include <string>
 
 // Release a COM pointer and null it.
 #ifndef SAFE_RELEASE
@@ -18,8 +19,10 @@ namespace srw
     // How the woven output window is presented.
     enum class OutputMode
     {
-        Fullscreen,   // borderless window covering the SR display
-        Windowed      // normal resizable window
+        Fullscreen,     // borderless window covering the SR display
+        Windowed,       // normal resizable window
+        WindowOverlay,  // borderless click-through overlay tracking a source window
+        LookingGlass    // movable see-through loupe weaving the screen beneath it
     };
 
     // What the weaver is currently weaving.
@@ -46,6 +49,19 @@ namespace srw
         FrameSequential     // alternating frames over time
     };
 
+    // Resolve a filename to an absolute path next to the executable (so the app
+    // doesn't depend on the current working directory).
+    inline std::string ExePath(const char* filename)
+    {
+        char buf[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, buf, (DWORD)ARRAYSIZE(buf));
+        char* slash = strrchr(buf, '\\');
+        if (slash) *(slash + 1) = '\0';
+        std::string path(buf);
+        path += filename;
+        return path;
+    }
+
     // Append a line to srweaver.log (next to the exe) and the debugger output.
     inline void Log(const char* fmt, ...)
     {
@@ -57,7 +73,7 @@ namespace srw
         ::OutputDebugStringA(buf);
         ::OutputDebugStringA("\n");
         FILE* f = nullptr;
-        if (fopen_s(&f, "srweaver.log", "a") == 0 && f)
+        if (fopen_s(&f, ExePath("srweaver.log").c_str(), "a") == 0 && f)
         {
             fputs(buf, f);
             fputc('\n', f);
