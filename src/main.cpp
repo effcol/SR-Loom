@@ -40,6 +40,7 @@ namespace
         bool         weavingEnabled = true;
         OutputMode   mode           = OutputMode::Fullscreen;
         SourceKind   source         = SourceKind::TestImage;
+        bool         anaTestImage   = false; // test image is the anaglyph one (vs SBS)
         StereoFormat format         = StereoFormat::FullSBS;  // source stereo layout
         bool         swapEyes       = false;
         int          anaglyphCombo  = 0;   // 0..5 colour combination
@@ -265,8 +266,27 @@ namespace
                                           StereoFormat::FullSBS,
                                           app.renderer.BackBufferFormat());
         app.source = SourceKind::TestImage;
+        app.anaTestImage = false;
         app.captureRebind = true;   // rebind the weaver to the converter output
         if (app.mode == OutputMode::WindowOverlay)   // overlay only makes sense for a window
+            app.mode = OutputMode::Fullscreen;
+        if (app.weavingEnabled) ApplyMode(app);
+    }
+
+    // Load the bundled anaglyph test image and switch to the Anaglyph format so the
+    // recovery modes can be exercised without live anaglyph content.
+    void UseAnaglyphTestImage(AppState& app)
+    {
+        app.capture.Stop();
+        app.sourceWindow = nullptr;
+        app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_anaglyph.png").c_str(),
+                                          StereoFormat::Anaglyph,
+                                          app.renderer.BackBufferFormat());
+        app.source = SourceKind::TestImage;
+        app.anaTestImage = true;
+        app.format = StereoFormat::Anaglyph;
+        app.captureRebind = true;
+        if (app.mode == OutputMode::WindowOverlay)
             app.mode = OutputMode::Fullscreen;
         if (app.weavingEnabled) ApplyMode(app);
     }
@@ -449,8 +469,8 @@ namespace
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
             {
-                MenuState ms{ app->weavingEnabled, app->mode, app->source, app->format,
-                              app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
+                MenuState ms{ app->weavingEnabled, app->mode, app->source, app->anaTestImage,
+                              app->format, app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
                               app->pulfrichMode, app->pulfrichDelay, app->pulfrichNd,
                               app->framePackMode };
                 app->tray.ShowContextMenu(hwnd, ms);
@@ -533,6 +553,7 @@ namespace
             case ID_TRAY_SWAP_EYES: app->swapEyes = !app->swapEyes; app->captureRebind = true; return 0;
             case ID_TRAY_DETECT: DetectFormat(*app); return 0;
             case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
+            case ID_TRAY_SRC_TESTIMAGE_ANA: UseAnaglyphTestImage(*app); return 0;
             case ID_TRAY_SRC_MONITOR:
                 UsePassthrough(*app);
                 if (app->mode == OutputMode::WindowOverlay) app->mode = OutputMode::Fullscreen;

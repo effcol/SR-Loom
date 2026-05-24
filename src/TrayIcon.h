@@ -19,6 +19,7 @@ namespace srw
         ID_TRAY_LOOKING_GLASS,
         ID_TRAY_CAPTURE_FOREGROUND,
         ID_TRAY_SRC_TESTIMAGE,
+        ID_TRAY_SRC_TESTIMAGE_ANA,
         ID_TRAY_SRC_MONITOR,
         ID_TRAY_SWAP_EYES,
         ID_TRAY_DETECT,
@@ -56,6 +57,7 @@ namespace srw
         bool         weaving;
         OutputMode   mode;
         SourceKind   source;
+        bool         anaglyphTestImage;   // test-image source is the anaglyph one
         StereoFormat format;
         bool         swapEyes;
         int          anaglyphCombo;

@@ -120,8 +120,11 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
 
     // Source submenu: test image, monitor, then live window list.
     HMENU srcMenu = CreatePopupMenu();
-    AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::TestImage ? MF_CHECKED : 0),
-                ID_TRAY_SRC_TESTIMAGE, "Test image");
+    const bool testImg = (source == SourceKind::TestImage);
+    AppendMenuA(srcMenu, MF_STRING | (testImg && !s.anaglyphTestImage ? MF_CHECKED : 0),
+                ID_TRAY_SRC_TESTIMAGE, "Test image (side-by-side)");
+    AppendMenuA(srcMenu, MF_STRING | (testImg && s.anaglyphTestImage ? MF_CHECKED : 0),
+                ID_TRAY_SRC_TESTIMAGE_ANA, "Test image (anaglyph)");
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
                 ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor (passthrough)");
     AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);

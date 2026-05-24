@@ -94,28 +94,41 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     float  ctx = 1.0 / max(g_coarseW, 1.0);   // one coarse texel in UV (match window step)
     float  maxD = g_dispMaxUV;
     const int N = 24;                          // search steps each direction
+    const int W = 2;                           // window half-width (5 taps)
     float  step = maxD / (float)N;
 
-    // Reference window (this eye, at uv) sampled once: L=red, R=cyan luma.
-    float refL[3], refR[3];
-    [unroll] for (int w = 0; w < 3; ++w)
+    // Reference windows (L=red, R=cyan luma) at uv, plus their means. ZERO-MEAN
+    // matching removes the per-channel brightness offset, so red can be matched
+    // against cyan by STRUCTURE even where the two views differ in colour.
+    float refL[5], refR[5], mRefL = 0, mRefR = 0;
+    [unroll] for (int w = -W; w <= W; ++w)
     {
-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 1) * ctx, 0), 0).rgb;
-        refL[w] = s.r; refR[w] = (s.g + s.b) * 0.5;
+        float3 s = srcTex.SampleLevel(samp, uv + float2((float)w * ctx, 0), 0).rgb;
+        float rcy = (s.g + s.b) * 0.5;
+        refL[w + W] = s.r; refR[w + W] = rcy;
+        mRefL += s.r; mRefR += rcy;
     }
+    mRefL *= 0.2; mRefR *= 0.2;
 
     float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
     [loop] for (int k = -N; k <= N; ++k)
     {
         float d = (float)k * step;
-        float bias = abs(d) / max(maxD, 1e-4) * 0.10;   // gentle small-disparity tie-break
-        float sadL = bias, sadR = bias;
-        [unroll] for (int w = 0; w < 3; ++w)
+        float cL[5], cR[5], mcL = 0, mcR = 0;
+        [unroll] for (int w = -W; w <= W; ++w)
         {
-            float3 s = srcTex.SampleLevel(samp, uv + float2(d + (float)(w - 1) * ctx, 0), 0).rgb;
-            float cL = s.r, cR = (s.g + s.b) * 0.5;
-            sadL += abs(refL[w] - cR);   // L's red  vs candidate cyan
-            sadR += abs(refR[w] - cL);   // R's cyan vs candidate red
+            float3 s = srcTex.SampleLevel(samp, uv + float2(d + (float)w * ctx, 0), 0).rgb;
+            float rcy = (s.g + s.b) * 0.5;
+            cL[w + W] = s.r; cR[w + W] = rcy;
+            mcL += s.r; mcR += rcy;
+        }
+        mcL *= 0.2; mcR *= 0.2;
+        float bias = abs(d) / max(maxD, 1e-4) * 0.06;   // gentle small-disparity tie-break
+        float sadL = bias, sadR = bias;
+        [unroll] for (int w = 0; w < 5; ++w)
+        {
+            sadL += abs((refL[w] - mRefL) - (cR[w] - mcR));   // L red vs candidate cyan
+            sadR += abs((refR[w] - mRefR) - (cL[w] - mcL));   // R cyan vs candidate red
         }
         if (sadL < bestL) { bestL = sadL; dL = d; }
         if (sadR < bestR) { bestR = sadR; dR = d; }
@@ -177,20 +190,32 @@ float4 PSMain(VSOut i) : SV_Target
             float2 disp = dispTex.SampleLevel(samp, e, 0.0).rg;   // (dLR, dRL) in UV
             float d0 = (eye == 0) ? disp.r : disp.g;              // this eye -> the other
 
+            // Reference window (3-tap) + mean for zero-mean matching (same cross-
+            // channel robustness as the coarse pass).
+            float refY[3], mRef = 0;
+            [unroll] for (int w = -1; w <= 1; ++w)
+            {
+                float3 cc = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
+                refY[w + 1] = (eye == 0) ? cc.r : (cc.g + cc.b) * 0.5;
+                mRef += refY[w + 1];
+            }
+            mRef /= 3.0;
+
             // Full-res refine: small local search around the coarse estimate.
             float bestSAD = 1e9, dRef = d0;
             [loop] for (int r = -3; r <= 3; ++r)
             {
                 float d = d0 + (float)r * px;
-                float sad = 0.0;
+                float cand[3], mc = 0;
                 [unroll] for (int w = -1; w <= 1; ++w)
                 {
-                    float3 ca = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
                     float3 cb = srcTex.SampleLevel(samp, float2(e.x + d + (float)w * px, e.y), 0.0).rgb;
-                    float la = (eye == 0) ? ca.r : (ca.g + ca.b) * 0.5;
-                    float lb = (eye == 0) ? (cb.g + cb.b) * 0.5 : cb.r;
-                    sad += abs(la - lb);
+                    cand[w + 1] = (eye == 0) ? (cb.g + cb.b) * 0.5 : cb.r;
+                    mc += cand[w + 1];
                 }
+                mc /= 3.0;
+                float sad = 0.0;
+                [unroll] for (int w = 0; w < 3; ++w) sad += abs((refY[w] - mRef) - (cand[w] - mc));
                 if (sad < bestSAD) { bestSAD = sad; dRef = d; }
             }
 

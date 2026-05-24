@@ -105,9 +105,12 @@ target_link_libraries(SRWeaver PRIVATE
     windowsapp    # Windows.Graphics.Capture (WinRT)
 )
 
-# Copy the bundled test stereo image next to the executable.
+# Copy the bundled test stereo images next to the executable.
 add_custom_command(TARGET SRWeaver POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/assets/test_sbs.jpg"
         "$<TARGET_FILE_DIR:SRWeaver>/test_sbs.jpg"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/assets/test_anaglyph.png"
+        "$<TARGET_FILE_DIR:SRWeaver>/test_anaglyph.png"
     VERBATIM)
