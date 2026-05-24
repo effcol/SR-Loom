@@ -131,11 +131,12 @@ float4 PSMain(VSOut i) : SV_Target
             float px = 1.0 / g_srcW;
             const int R = 16;
             float bestSAD = 1e9, bestD = 0.0;
-            // SampleLevel (explicit LOD 0): Sample's implicit gradients are
-            // undefined inside dynamic flow control and hang some GPUs.
+            // Horizontal block-match for the L(red)<->R(cyan) disparity. SampleLevel:
+            // Sample's implicit gradients are undefined in dynamic flow control and
+            // hang some GPUs. A tiny |d| cost breaks ties in flat regions.
             [loop] for (int d = -R; d <= R; ++d)
             {
-                float sad = 0.0;
+                float sad = (float)abs(d) * 0.0015;
                 [unroll] for (int w = -1; w <= 1; ++w)
                 {
                     float3 ca = srcTex.SampleLevel(samp, float2(e.x + (float)w * px, e.y), 0.0).rgb;
@@ -146,14 +147,24 @@ float4 PSMain(VSOut i) : SV_Target
                 }
                 if (sad < bestSAD) { bestSAD = sad; bestD = (float)d; }
             }
-            float3 there = srcTex.SampleLevel(samp, float2(e.x + bestD * px, e.y), 0.0).rgb;
-            float3 aligned = (eye == 0) ? float3(c.r, there.g, there.b)
-                                        : float3(there.r, c.g, c.b);
-            // Fall back to shared chroma where the match is weak (avoids artifacts).
+            // Each eye keeps its OWN sharp luminance (correct structure / depth);
+            // only the chrominance comes from the disparity-aligned location, so a
+            // wrong match merely mis-tints a pixel instead of distorting its shape.
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);
-            float anaY = max(dot(c, float3(0.299, 0.587, 0.114)), 1e-3);
-            float3 sharedCol = saturate(c * (eyeY / anaY));
-            float conf = saturate(1.0 - (bestSAD / 3.0) * 6.0);
+            float3 there = srcTex.SampleLevel(samp, float2(e.x + bestD * px, e.y), 0.0).rgb;
+            float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
+                                           : float3(there.r, c.g, c.b);
+            float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
+            float3 aligned = saturate(alignedCol * (eyeY / aY));
+            // Fallback where the match is weak: shared, horizontally-blurred chroma
+            // (the mode-0 result), also recoloured to this eye's luminance.
+            float3 acc = 0;
+            [unroll] for (int k = -4; k <= 4; ++k)
+                acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
+            float3 blurCol = acc / 9.0;
+            float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
+            float3 sharedCol = saturate(blurCol * (eyeY / bY));
+            float conf = saturate(1.0 - bestSAD * 1.2);
             return float4(lerp(sharedCol, aligned, conf), 1);
         }
 
