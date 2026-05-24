@@ -21,7 +21,6 @@ namespace
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
     constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
-    constexpr int   kHotkeyLoupe   = 4;   // Ctrl+Alt+G : loupe move/passthrough toggle
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     struct AppState
@@ -108,8 +107,10 @@ namespace
             const int w = 960, h = 600;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
+            // Click-through by default (layered+transparent). Hold Ctrl+Alt to
+            // grab the frame and drag/resize; releasing restores click-through.
             style   = WS_OVERLAPPEDWINDOW;
-            exStyle = WS_EX_TOPMOST | (ct ? (WS_EX_LAYERED | WS_EX_TRANSPARENT) : 0);
+            exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
             zorder  = HWND_TOPMOST;
             rect    = { x, y, x + w, y + h };
             break;
@@ -139,20 +140,23 @@ namespace
                      rect.right - rect.left, rect.bottom - rect.top, flags);
     }
 
-    // Toggle the looking glass between draggable and click-through, in place.
-    void ToggleLoupeInteractive(AppState& app)
+    // The looking glass is click-through by default. While Ctrl+Alt is held it
+    // becomes grabbable so the frame can be dragged/resized; releasing restores
+    // click-through. This keeps passthrough "always on" except while moving it.
+    void UpdateLoupeInteractivity(AppState& app)
     {
         if (app.mode != OutputMode::LookingGlass) return;
-        app.loupeInteractive = !app.loupeInteractive;
-        const HWND hwnd = app.hwnd;
-        LONG_PTR ex = WS_EX_TOPMOST | (app.loupeInteractive ? 0 : (WS_EX_LAYERED | WS_EX_TRANSPARENT));
-        SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex);
-        if (ex & WS_EX_LAYERED)
-            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+
+        const bool grab = (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                          (GetAsyncKeyState(VK_MENU)    & 0x8000);
+        if (grab == app.loupeInteractive) return;   // loupeInteractive == "grabbable now"
+        app.loupeInteractive = grab;
+
+        LONG_PTR ex = WS_EX_TOPMOST | WS_EX_LAYERED | (grab ? 0 : WS_EX_TRANSPARENT);
+        SetWindowLongPtr(app.hwnd, GWL_EXSTYLE, ex);
+        SetLayeredWindowAttributes(app.hwnd, 0, 255, LWA_ALPHA);
+        SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
-        app.tray.SetTooltip(app.loupeInteractive ? "SR Weaver — loupe: move mode"
-                                                 : "SR Weaver — loupe: passthrough");
     }
 
     // Keep the overlay aligned with the tracked source window each frame.
@@ -288,7 +292,8 @@ namespace
             return;
         }
 
-        UpdateOverlayTracking(app);   // follow the source window in overlay mode
+        UpdateOverlayTracking(app);     // follow the source window in overlay mode
+        UpdateLoupeInteractivity(app);  // Ctrl+Alt to grab/move the looking glass
 
         if (IsIconic(app.hwnd))
         {
@@ -330,8 +335,7 @@ namespace
         {
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
-                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source,
-                                          app->loupeInteractive);
+                app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source);
             return 0;
 
         case WM_COMMAND:
@@ -371,10 +375,9 @@ namespace
             case ID_TRAY_LOOKING_GLASS:
                 UsePassthrough(*app);
                 app->mode = OutputMode::LookingGlass;
-                app->loupeInteractive = true;   // start draggable so you can place it
+                app->loupeInteractive = false;  // click-through by default; Ctrl+Alt to move
                 if (app->weavingEnabled) ApplyMode(*app);
                 return 0;
-            case ID_TRAY_TOGGLE_LOUPE: ToggleLoupeInteractive(*app); return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
             }
             break;
@@ -390,7 +393,6 @@ namespace
                 if (app->weavingEnabled) ApplyMode(*app);
             }
             else if (wParam == kHotkeyCapture) CaptureForeground(*app);
-            else if (wParam == kHotkeyLoupe)   ToggleLoupeInteractive(*app);
             return 0;
 
         case WM_SIZE:
@@ -419,6 +421,7 @@ namespace
             mmi->ptMinTrackSize.y = 200;
             return 0;
         }
+
 
 
         case WM_CLOSE:
@@ -507,7 +510,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
     RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
-    RegisterHotKey(app.hwnd, kHotkeyLoupe,   MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G');
 
     // Show and weave.
     ApplyMode(app);
@@ -529,7 +531,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
-    UnregisterHotKey(app.hwnd, kHotkeyLoupe);
     app.tray.Remove();
     app.capture.Shutdown();
     app.weaver.Shutdown();
