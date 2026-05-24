@@ -86,47 +86,60 @@ VSOut VSMain(uint id : SV_VertexID)
 )HLSL"
 R"HLSL(
 // Gradient descriptor for anaglyph matching (SIRA, Kunze 2020, re-implemented):
-// match the DIFFERENCE between adjacent pixels, not raw intensity, so the red and
-// cyan views match by STRUCTURE despite their photometric (colour) mismatch. We
-// match red against the GREEN channel only (green carries most luminance; mixing
-// in blue adds noise). 5-tap window -> 4 adjacent differences per channel.
-void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
+// match the DIFFERENCE between adjacent pixels along a direction, not raw intensity,
+// so the red and cyan views match by STRUCTURE despite their photometric mismatch.
+// Red is matched against the GREEN channel only (green carries most luminance).
+// 5-tap line along `dir` -> 4 adjacent differences for red (gR) and green (gG).
+void gradDir(float2 uv, float2 dir, out float gR[4], out float gG[4])
 {
     float rr[5], gg[5];
     [unroll] for (int w = 0; w < 5; ++w)
     {
-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
+        float3 s = srcTex.SampleLevel(samp, uv + dir * (float)(w - 2), 0).rgb;
         rr[w] = s.r; gg[w] = s.g;
     }
     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
 }
 
-// Coarse disparity pass (red/cyan anaglyph): low-resolution map of the HORIZONTAL
-// disparity between the L (red) and R (green) views, both directions, via gradient
-// matching (anaglyph displacement is purely horizontal, so we match horizontally).
+float sad4(float a[4], float b[4])
+{
+    float s = 0; [unroll] for (int k = 0; k < 4; ++k) s += abs(a[k] - b[k]); return s;
+}
+
+// Coarse disparity pass (red/cyan anaglyph): low-resolution disparity between the
+// L (red) and R (green) views, both directions. Matches mostly HORIZONTAL (the only
+// direction anaglyph disparity actually moves) but adds two DIAGONAL checks at half
+// weight to disambiguate horizontal edges. Plain weighted sum -- NO per-angle
+// normalization (that amplified flat directions and caused wrong matches).
 // Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
+#define ANA_DIRS(uv2, hR,hG, aR,aG, bR,bG) \
+    gradDir(uv2, float2(ctx, 0),   hR, hG); \
+    gradDir(uv2, float2(ctx, cty), aR, aG); \
+    gradDir(uv2, float2(ctx,-cty), bR, bG);
+#define ANA_COST(refH,refA,refB, cH,cA,cB) \
+    (sad4(refH, cH) + 0.5 * sad4(refA, cA) + 0.5 * sad4(refB, cB))
+
 float4 PSAnaDisp(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
     float  ctx = 1.0 / max(g_coarseW, 1.0);
+    float  cty = 1.0 / max(g_coarseH, 1.0);
     float  maxD = g_dispMaxUV;
     const int N = 24;
     float  step = maxD / (float)N;
 
-    float rgR[4], rgG[4]; gradWindow(uv, ctx, rgR, rgG);   // reference gradients at uv
+    float hR[4],hG[4], aR[4],aG[4], bR[4],bG[4];
+    ANA_DIRS(uv, hR,hG, aR,aG, bR,bG)   // reference descriptors at uv
 
     float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
     [loop] for (int k = -N; k <= N; ++k)
     {
         float d = (float)k * step;
-        float cgR[4], cgG[4]; gradWindow(uv + float2(d, 0), ctx, cgR, cgG);
+        float chR[4],chG[4], caR[4],caG[4], cbR[4],cbG[4];
+        ANA_DIRS(uv + float2(d, 0), chR,chG, caR,caG, cbR,cbG)
         float bias = abs(d) / max(maxD, 1e-4) * 0.06;
-        float sadL = bias, sadR = bias;
-        [unroll] for (int k2 = 0; k2 < 4; ++k2)
-        {
-            sadL += abs(rgR[k2] - cgG[k2]);   // dLR: ref red-grad vs candidate green-grad
-            sadR += abs(rgG[k2] - cgR[k2]);   // dRL: ref green-grad vs candidate red-grad
-        }
+        float sadL = bias + ANA_COST(hR,aR,bR, chG,caG,cbG);   // dLR: red ref vs green cand
+        float sadR = bias + ANA_COST(hG,aG,bG, chR,caR,cbR);   // dRL: green ref vs red cand
         if (sadL < bestL) { bestL = sadL; dL = d; }
         if (sadR < bestR) { bestR = sadR; dR = d; }
     }
@@ -134,29 +147,29 @@ float4 PSAnaDisp(VSOut i) : SV_Target
 }
 
 // Pyramid refine: start from a coarser level (dispTex = prior) and do a local
-// horizontal gradient search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
+// horizontal+diagonal gradient search to sharpen the disparity. (dLR, dRL, 0, 0).
 float4 PSAnaRefine(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
     float  ctx = 1.0 / max(g_coarseW, 1.0);
+    float  cty = 1.0 / max(g_coarseH, 1.0);
     float2 prior = dispTex.SampleLevel(samp, uv, 0.0).rg;
     const int M = 6;
 
-    float rgR[4], rgG[4]; gradWindow(uv, ctx, rgR, rgG);   // reference gradients at uv
+    float hR[4],hG[4], aR[4],aG[4], bR[4],bG[4];
+    ANA_DIRS(uv, hR,hG, aR,aG, bR,bG)
 
     float bestL = 1e9, dL = prior.r, bestR = 1e9, dR = prior.g;
     [loop] for (int k = -M; k <= M; ++k)
     {
-        float ddL = prior.r + (float)k * ctx;   // candidate for dLR (match green)
-        float ddR = prior.g + (float)k * ctx;   // candidate for dRL (match red)
-        float lR[4], lG[4]; gradWindow(uv + float2(ddL, 0), ctx, lR, lG);
-        float rR[4], rG[4]; gradWindow(uv + float2(ddR, 0), ctx, rR, rG);
-        float sadL = 0, sadR = 0;
-        [unroll] for (int k2 = 0; k2 < 4; ++k2)
-        {
-            sadL += abs(rgR[k2] - lG[k2]);   // ref red-grad vs candidate green-grad
-            sadR += abs(rgG[k2] - rR[k2]);   // ref green-grad vs candidate red-grad
-        }
+        float ddL = prior.r + (float)k * ctx;
+        float ddR = prior.g + (float)k * ctx;
+        float lhR[4],lhG[4], laR[4],laG[4], lbR[4],lbG[4];
+        ANA_DIRS(uv + float2(ddL, 0), lhR,lhG, laR,laG, lbR,lbG)
+        float rhR[4],rhG[4], raR[4],raG[4], rbR[4],rbG[4];
+        ANA_DIRS(uv + float2(ddR, 0), rhR,rhG, raR,raG, rbR,rbG)
+        float sadL = ANA_COST(hR,aR,bR, lhG,laG,lbG);   // ref red vs candidate green
+        float sadR = ANA_COST(hG,aG,bG, rhR,raR,rbR);   // ref green vs candidate red
         if (sadL < bestL) { bestL = sadL; dL = ddL; }
         if (sadR < bestR) { bestR = sadR; dR = ddR; }
     }
@@ -180,22 +193,27 @@ float4 PSAnaFill(VSOut i) : SV_Target
     float conf  = saturate(1.0 - cons * inv * 4.0);
     if (conf > 0.5) return float4(d, conf, 0);
 
+    // Among consistent neighbours, prefer the one whose GREEN (the trusted, shared
+    // luminance channel) best matches ours -- colour-aware like SIRA but matched on
+    // green only, so it never biases toward the red/blue (left-eye) channels and
+    // can't pull spurious red into the gap. Small spatial penalty breaks ties.
+    float myG = srcTex.SampleLevel(samp, uv, 0.0).g;
+    float best = 1e9; float2 bestD = d; bool found = false;
     [loop] for (int s = 1; s <= 20; ++s)
     {
-        float2 ur = float2(uv.x + (float)s * ctx, uv.y);
-        float2 dr = dispTex.SampleLevel(samp, ur, 0.0).rg;
-        float  cr = saturate(1.0 - abs(dr.r + dispTex.SampleLevel(samp, float2(ur.x + dr.r, ur.y), 0.0).g) * inv * 4.0);
-        float2 ul = float2(uv.x - (float)s * ctx, uv.y);
-        float2 dl = dispTex.SampleLevel(samp, ul, 0.0).rg;
-        float  cl = saturate(1.0 - abs(dl.r + dispTex.SampleLevel(samp, float2(ul.x + dl.r, ul.y), 0.0).g) * inv * 4.0);
-        if (cr > 0.5 || cl > 0.5)
+        [unroll] for (int sgn = 0; sgn < 2; ++sgn)
         {
-            float2 pick = (cr > 0.5 && cl > 0.5) ? (abs(dr.r) < abs(dl.r) ? dr : dl)
-                                                 : (cr > 0.5 ? dr : dl);
-            return float4(pick, 0.4, 0);   // filled -> moderate confidence
+            float2 nuv = float2(uv.x + (sgn == 0 ? (float)s : -(float)s) * ctx, uv.y);
+            float2 nd  = dispTex.SampleLevel(samp, nuv, 0.0).rg;
+            float  nc  = saturate(1.0 - abs(nd.r + dispTex.SampleLevel(samp, float2(nuv.x + nd.r, nuv.y), 0.0).g) * inv * 4.0);
+            if (nc > 0.5)
+            {
+                float gd = abs(myG - srcTex.SampleLevel(samp, nuv, 0.0).g) + (float)s * 0.02;
+                if (gd < best) { best = gd; bestD = nd; found = true; }
+            }
         }
     }
-    return float4(d, 0.25, 0);   // no consistent neighbour found
+    return float4(bestD, found ? 0.4 : 0.2, 0);
 }
 
 // Edge-aware disparity smoothing (shader-feasible stand-in for SIRA's superpixel
@@ -285,15 +303,15 @@ float4 PSMain(VSOut i) : SV_Target
             float baseConf = dC.b;                               // from the fill pass
 
             // Reference gradient descriptor at e (red for the left eye, green for the
-            // right) for the full-res gradient-matching refine.
-            float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
+            // right) for the full-res horizontal gradient-matching refine.
+            float rgR[4], rgG[4]; gradDir(e, float2(px, 0), rgR, rgG);
 
             // Full-res refine (±3 px) with sub-pixel parabola fit on the cost curve.
             float sads[7];
             [unroll] for (int r = 0; r < 7; ++r)
             {
                 float d = d0 + (float)(r - 3) * px;
-                float cR[4], cG[4]; gradWindow(float2(e.x + d, e.y), px, cR, cG);
+                float cR[4], cG[4]; gradDir(float2(e.x + d, e.y), float2(px, 0), cR, cG);
                 float sd = 0.0;
                 [unroll] for (int k2 = 0; k2 < 4; ++k2)
                     sd += (eye == 0) ? abs(rgR[k2] - cG[k2])    // left: red ref vs green cand
@@ -333,7 +351,15 @@ float4 PSMain(VSOut i) : SV_Target
             float3 sharedCol = saturate(blurCol * (eyeY / bY));
 
             float conf = baseConf * saturate(1.0 - bs * 1.5);
-            return float4(lerp(sharedCol, aligned, conf), 1);
+            float3 col = lerp(sharedCol, aligned, conf);
+
+            // Saturation gate: weak chroma is almost always residual red/cyan fringe
+            // (or a monochrome region), so pull it to grey; genuine colour (high
+            // saturation) is kept. Cleans fringing in mono / mostly-mono content.
+            float lum = dot(col, float3(0.299, 0.587, 0.114));
+            float sat = length(col - lum);
+            col = lerp(float3(lum, lum, lum), col, smoothstep(0.03, 0.10, sat));
+            return float4(col, 1);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
