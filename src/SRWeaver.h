@@ -32,6 +32,11 @@ namespace srw
         // finalize the SR context. Call after the D3D device exists.
         bool CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window);
 
+        // Start/stop the SR session (context + weaver). Stopping releases the SR
+        // display's lens and eye-tracking; the loaded image texture is kept.
+        bool StartSR(ID3D11DeviceContext* immediateContext, HWND window);
+        void StopSR();
+
         // Register the texture the weaver should sample as its SBS input. The
         // weaver re-samples this view live each weave(), so callers that update
         // the underlying texture in place only need to call this on size change.

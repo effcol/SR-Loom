@@ -103,7 +103,8 @@ bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
                                       StereoFormat fmt,
                                       DXGI_FORMAT texFormat)
 {
-    if (!device || !m_weaver)
+    // Loads the image into a texture; the weaver is not required here.
+    if (!device)
         return false;
 
     int w = 0, h = 0, channels = 0;
@@ -161,6 +162,31 @@ void SRWeaver::SetInputView(ID3D11ShaderResourceView* srv, int perEyeWidth,
 {
     if (m_weaver && srv)
         m_weaver->setInputViewTexture(srv, perEyeWidth, height, format);
+}
+
+bool SRWeaver::StartSR(ID3D11DeviceContext* immediateContext, HWND window)
+{
+    if (!m_context && !CreateContext(10.0))
+        return false;
+    if (!m_weaver)
+        return CreateWeaver(immediateContext, window);
+    return true;
+}
+
+void SRWeaver::StopSR()
+{
+    // Releasing the weaver and context lets the SR platform power down the
+    // lenticular lens and eye-tracking camera. The image texture is preserved.
+    if (m_weaver)
+    {
+        m_weaver->destroy();
+        m_weaver = nullptr;
+    }
+    if (m_context)
+    {
+        SR::SRContext::deleteSRContext(m_context);
+        m_context = nullptr;
+    }
 }
 
 void SRWeaver::Weave()

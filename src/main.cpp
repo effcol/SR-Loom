@@ -227,14 +227,20 @@ namespace
         app.weavingEnabled = enable;
         if (enable)
         {
+            // Start the SR session (lens + eye-tracking) and show the output.
+            if (!app.weaver.HasWeaver())
+                app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+            app.captureRebind = true;   // re-register the converter output
             ApplyMode(app);
             ShowWindow(app.hwnd, SW_SHOW);
         }
         else
         {
+            // Hide and fully release SR so the lens and camera turn off.
             ShowWindow(app.hwnd, SW_HIDE);
+            app.weaver.StopSR();
         }
-        app.tray.SetTooltip(enable ? "SR Weaver — weaving" : "SR Weaver — paused");
+        app.tray.SetTooltip(enable ? "SR Weaver — weaving" : "SR Weaver — paused (SR off)");
     }
 
     // --- Source selection -------------------------------------------------
@@ -541,7 +547,7 @@ namespace
                 if (app->weavingEnabled) ApplyMode(*app);
             }
             else if (wParam == kHotkeyCapture) CaptureForeground(*app);
-            else if (wParam == kHotkeyDetect)  DetectFormat(*app);
+            // else if (wParam == kHotkeyDetect)  DetectFormat(*app); // auto-detect disabled
             return 0;
 
         case WM_SIZE:
@@ -647,11 +653,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (excludeFromCapture)
         SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
 
-    // Set up Direct3D + the weaver + the static SBS test image.
+    // Set up Direct3D and load the static SBS test image (the default source).
+    // The weaver/SR session is started on demand when weaving is enabled.
     if (!app.renderer.Initialize(app.hwnd))
         return 4;
-    if (!app.weaver.CreateWeaver(app.renderer.Context(), app.hwnd))
-        return 5;
     if (!app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_sbs.jpg").c_str(),
                                            StereoFormat::FullSBS,
                                            app.renderer.BackBufferFormat()))
@@ -668,14 +673,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
     // Tray icon + global hotkeys.
-    app.tray.Add(app.hwnd, "SR Weaver — weaving");
+    app.tray.Add(app.hwnd, "SR Weaver — paused (SR off)");
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
     RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
-    RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D');
+    // RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D'); // auto-detect disabled
 
-    // Show and weave.
-    ApplyMode(app);
+    // Start idle: release the SR session used to query the display rect so the
+    // lens and camera stay off until the user enables weaving (Ctrl+Alt+W).
+    app.weavingEnabled = false;
+    app.weaver.StopSR();
 
     bool running = true;
     while (running)
@@ -694,7 +701,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
-    UnregisterHotKey(app.hwnd, kHotkeyDetect);
+    // UnregisterHotKey(app.hwnd, kHotkeyDetect); // auto-detect disabled
     app.tray.Remove();
     app.detector.Shutdown();
     app.converter.Shutdown();

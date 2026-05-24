@@ -153,8 +153,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
         return (format == a || format == b) ? (UINT)MF_CHECKED : 0u;
     };
 
-    AppendMenuA(fmtMenu, MF_STRING, ID_TRAY_DETECT, "Auto-detect\tCtrl+Alt+D");
-    AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
+    // Auto-detect disabled for now (kept in code for later):
+    // AppendMenuA(fmtMenu, MF_STRING, ID_TRAY_DETECT, "Auto-detect\tCtrl+Alt+D");
+    // AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU sbsMenu = CreatePopupMenu();
     addFmt(sbsMenu, StereoFormat::FullSBS, "Full");
