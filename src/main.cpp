@@ -376,6 +376,16 @@ namespace
             return 0;
         }
 
+        // In looking-glass mode, let clicks fall through the glass (client area)
+        // to the content beneath, while the frame stays draggable/resizable.
+        case WM_NCHITTEST:
+            if (app && app->mode == OutputMode::LookingGlass)
+            {
+                LRESULT hit = DefWindowProc(hwnd, msg, wParam, lParam);
+                return (hit == HTCLIENT) ? HTTRANSPARENT : hit;
+            }
+            break;
+
         case WM_CLOSE:
             // Closing the window just pauses weaving and hides to the tray.
             if (app) SetWeaving(*app, false);

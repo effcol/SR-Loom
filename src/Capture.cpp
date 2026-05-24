@@ -188,6 +188,15 @@ bool Capture::Update(bool& sizeChanged)
         if (!frame)
             return false;
 
+        // Drain any queued frames and weave only the newest — minimizes latency.
+        for (;;)
+        {
+            auto next = m_impl->framePool.TryGetNextFrame();
+            if (!next) break;
+            frame.Close();
+            frame = next;
+        }
+
         auto contentSize = frame.ContentSize();
         auto frameTex = GetDXGIInterface<ID3D11Texture2D>(frame.Surface());
 

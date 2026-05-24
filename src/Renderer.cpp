@@ -37,6 +37,16 @@ bool Renderer::Initialize(HWND hwnd)
         return false;
     }
 
+    // Keep at most one frame queued on the GPU to reduce display latency.
+    {
+        IDXGIDevice1* dxgiDevice1 = nullptr;
+        if (SUCCEEDED(m_device->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgiDevice1)))
+        {
+            dxgiDevice1->SetMaximumFrameLatency(1);
+            dxgiDevice1->Release();
+        }
+    }
+
     // Obtain the DXGI factory associated with our device.
     IDXGIDevice*  dxgiDevice  = nullptr;
     IDXGIAdapter* dxgiAdapter = nullptr;
