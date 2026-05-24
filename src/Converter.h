@@ -16,7 +16,8 @@ namespace srw
         bool Initialize(ID3D11Device* device, ID3D11DeviceContext* context);
         void Shutdown();
 
-        void SetFormat(StereoFormat fmt, bool swapEyes);
+        // anaCombo: 0..5 (see AnaglyphComboList); anaMode: 0..3 (AnaglyphModeList).
+        void SetFormat(StereoFormat fmt, bool swapEyes, int anaCombo, int anaMode);
 
         // Convert the source view into the internal SBS texture. Sets
         // outputResized=true when the SBS texture was (re)created (the caller
@@ -48,6 +49,8 @@ namespace srw
 
         StereoFormat m_fmt  = StereoFormat::FullSBS;
         bool         m_swap = false;
+        int          m_anaCombo = 0;
+        int          m_anaMode  = 0;
         DXGI_FORMAT  m_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };
 }

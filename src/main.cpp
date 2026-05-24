@@ -37,6 +37,8 @@ namespace
         SourceKind   source         = SourceKind::TestImage;
         StereoFormat format         = StereoFormat::FullSBS;  // source stereo layout
         bool         swapEyes       = false;
+        int          anaglyphCombo  = 0;   // 0..5 colour combination
+        int          anaglyphMode   = 0;   // 0..3 decode mode (colour by default)
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
@@ -354,7 +356,7 @@ namespace
         // Convert the source into a side-by-side texture and feed it to the weaver.
         if (srcSRV && srcW > 0 && srcH > 0)
         {
-            app.converter.SetFormat(app.format, app.swapEyes);
+            app.converter.SetFormat(app.format, app.swapEyes, app.anaglyphCombo, app.anaglyphMode);
             bool resized = false;
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
@@ -378,7 +380,8 @@ namespace
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
                 app->tray.ShowContextMenu(hwnd, app->weavingEnabled, app->mode, app->source,
-                                          app->format, app->swapEyes);
+                                          app->format, app->swapEyes,
+                                          app->anaglyphCombo, app->anaglyphMode);
             return 0;
 
         case WM_COMMAND:
@@ -399,6 +402,21 @@ namespace
                 const StereoFormatEntry* fmts = StereoFormatList(n);
                 const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
                 if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; }
+                return 0;
+            }
+            // Anaglyph colour combo / decode mode (also selects the Anaglyph format).
+            if (cmd >= ID_TRAY_ANA_COMBO_BASE && cmd <= ID_TRAY_ANA_COMBO_MAX)
+            {
+                app->anaglyphCombo = (int)(cmd - ID_TRAY_ANA_COMBO_BASE);
+                app->format = StereoFormat::Anaglyph;
+                app->captureRebind = true;
+                return 0;
+            }
+            if (cmd >= ID_TRAY_ANA_MODE_BASE && cmd <= ID_TRAY_ANA_MODE_MAX)
+            {
+                app->anaglyphMode = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
+                app->format = StereoFormat::Anaglyph;
+                app->captureRebind = true;
                 return 0;
             }
 

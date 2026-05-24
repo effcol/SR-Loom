@@ -19,7 +19,39 @@ cbuffer Params : register(b0)
     int   g_swap;     // swap left/right eyes
     float g_srcW;
     float g_srcH;
+    int   g_anaCombo; // 0..5 colour combination
+    int   g_anaMode;  // 0 colour-filtered, 1 colour-recovered, 2 half-colour, 3 mono
+    int   g_pad0;
+    int   g_pad1;
 };
+
+// Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
+float3 anaFilter(float3 c, int combo, int e)
+{
+    if (combo == 0) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, c.g, c.b); // Red/Cyan
+    if (combo == 1) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, c.g, 0);   // Red/Green
+    if (combo == 2) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, 0, c.b);   // Red/Blue
+    if (combo == 3) return (e == 0) ? float3(0, c.g, 0)   : float3(c.r, 0, c.b); // Green/Magenta
+    if (combo == 4) return (e == 0) ? float3(c.r, c.g, 0) : float3(0, 0, c.b);   // Amber/Blue
+    return                (e == 0) ? float3(c.r, 0, c.b) : float3(0, c.g, c.b);  // Magenta/Cyan
+}
+
+// Fuller-colour recovery: each eye keeps its channels and borrows a fraction of
+// the rest to fill in colour (mild crosstalk / retinal rivalry).
+float3 anaRecover(float3 c, int combo, int e)
+{
+    float3 f = anaFilter(c, combo, e);
+    return saturate(f + (c - f) * 0.35);
+}
+
+float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
+{
+    float3 col = (mode == 1) ? anaRecover(c, combo, e) : anaFilter(c, combo, e);
+    float  g   = dot(col, float3(0.299, 0.587, 0.114));
+    if (mode == 2) return lerp(col, g.xxx, 0.5);   // half colour
+    if (mode == 3) return g.xxx;                   // mono
+    return col;                                    // colour (filtered / recovered)
+}
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -66,12 +98,10 @@ float4 PSMain(VSOut i) : SV_Target
         float4 b = srcTex.Sample(samp, (float2(p.x - 1, p.y) + 0.5) / sz);
         return 0.5 * (a + b);
     }
-    else if (g_format == 2)   // Anaglyph (red/cyan), approximate decode
+    else if (g_format == 2)   // Anaglyph: decode per combo + mode
     {
-        float4 c = srcTex.Sample(samp, e);
-        if (!right) return float4(c.r, c.r, c.r, 1);          // left eye from red
-        float gray = (c.g + c.b) * 0.5;
-        return float4(gray, gray, gray, 1);                   // right eye from cyan
+        float3 c = srcTex.Sample(samp, e).rgb;
+        return float4(decodeAnaglyph(c, g_anaCombo, right ? 1 : 0, g_anaMode), 1);
     }
 
     // Default: side-by-side. left=left half, right=right half.
@@ -111,7 +141,8 @@ float4 PSMain(VSOut i) : SV_Target
         if (eh < 1) eh = 1;
     }
 
-    struct CB { int format; int swap; float srcW; float srcH; };
+    struct CB { int format; int swap; float srcW; float srcH;
+               int anaCombo; int anaMode; int pad0; int pad1; };
 }
 
 Converter::~Converter()
@@ -156,10 +187,12 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     return m_vs && m_ps && m_sampler && m_cbuffer;
 }
 
-void Converter::SetFormat(StereoFormat fmt, bool swapEyes)
+void Converter::SetFormat(StereoFormat fmt, bool swapEyes, int anaCombo, int anaMode)
 {
-    m_fmt  = fmt;
-    m_swap = swapEyes;
+    m_fmt      = fmt;
+    m_swap     = swapEyes;
+    m_anaCombo = anaCombo;
+    m_anaMode  = anaMode;
 }
 
 bool Converter::EnsureOutput(int width, int height)
@@ -200,7 +233,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     if (!m_outRTV)
         return false;
 
-    CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight };
+    CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
+           m_anaCombo, m_anaMode, 0, 0 };
     m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
 
     D3D11_VIEWPORT vp{};

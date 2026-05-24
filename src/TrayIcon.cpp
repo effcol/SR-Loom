@@ -91,7 +91,8 @@ HWND TrayIcon::WindowAt(size_t index) const
 }
 
 void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                               SourceKind source, StereoFormat format, bool swapEyes)
+                               SourceKind source, StereoFormat format, bool swapEyes,
+                               int anaglyphCombo, int anaglyphMode)
 {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -139,6 +140,23 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
     for (int i = 0; i < fmtCount; ++i)
         AppendMenuA(fmtMenu, MF_STRING | (fmts[i].fmt == format ? MF_CHECKED : 0),
                     ID_TRAY_FMT_BASE + (UINT)i, fmts[i].label);
+
+    // Anaglyph submenu: colour combinations + decode mode.
+    HMENU anaMenu = CreatePopupMenu();
+    int comboCount = 0, modeCount = 0;
+    const char* const* combos = AnaglyphComboList(comboCount);
+    const char* const* modes  = AnaglyphModeList(modeCount);
+    const bool anaActive = (format == StereoFormat::Anaglyph);
+    for (int i = 0; i < comboCount; ++i)
+        AppendMenuA(anaMenu, MF_STRING | ((anaActive && i == anaglyphCombo) ? MF_CHECKED : 0),
+                    ID_TRAY_ANA_COMBO_BASE + (UINT)i, combos[i]);
+    AppendMenuA(anaMenu, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < modeCount; ++i)
+        AppendMenuA(anaMenu, MF_STRING | ((anaActive && i == anaglyphMode) ? MF_CHECKED : 0),
+                    ID_TRAY_ANA_MODE_BASE + (UINT)i, modes[i]);
+    AppendMenuA(fmtMenu, MF_POPUP | (anaActive ? MF_CHECKED : 0),
+                reinterpret_cast<UINT_PTR>(anaMenu), "Anaglyph");
+
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");
     AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fmtMenu), "3D format");

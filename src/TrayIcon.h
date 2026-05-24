@@ -32,6 +32,12 @@ namespace srw
     constexpr UINT ID_TRAY_FMT_BASE = 42000;
     constexpr UINT ID_TRAY_FMT_MAX  = 42099;
 
+    // Anaglyph colour-combo and decode-mode items.
+    constexpr UINT ID_TRAY_ANA_COMBO_BASE = 43000;
+    constexpr UINT ID_TRAY_ANA_COMBO_MAX  = 43049;
+    constexpr UINT ID_TRAY_ANA_MODE_BASE  = 43050;
+    constexpr UINT ID_TRAY_ANA_MODE_MAX   = 43099;
+
     class TrayIcon
     {
     public:
@@ -48,7 +54,8 @@ namespace srw
         // reflected as checkmarks/radio marks. Commands post as WM_COMMAND.
         // Enumerates top-level windows into the Source submenu.
         void ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
-                             SourceKind source, StereoFormat format, bool swapEyes);
+                             SourceKind source, StereoFormat format, bool swapEyes,
+                             int anaglyphCombo, int anaglyphMode);
 
         // Resolve a window-list menu index (id - ID_TRAY_SRC_WINDOW_BASE) to its
         // HWND, captured when the menu was last shown. Null if out of range.

@@ -82,7 +82,7 @@ namespace srw
     }
 
     // The selectable source stereo layouts, shared by the tray menu and command
-    // handling so their order stays in sync.
+    // handling so their order stays in sync. (Anaglyph has its own submenu.)
     struct StereoFormatEntry { StereoFormat fmt; const char* label; };
     inline const StereoFormatEntry* StereoFormatList(int& count)
     {
@@ -91,13 +91,36 @@ namespace srw
             { StereoFormat::HalfSBS,           "Side-by-Side (half)" },
             { StereoFormat::FullTAB,           "Top-and-Bottom (full)" },
             { StereoFormat::HalfTAB,           "Top-and-Bottom (half)" },
-            { StereoFormat::Anaglyph,          "Anaglyph (red/cyan)" },
             { StereoFormat::RowInterleaved,    "Row interleaved" },
             { StereoFormat::ColumnInterleaved, "Column interleaved" },
             { StereoFormat::Checkerboard,      "Checkerboard" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));
         return list;
+    }
+
+    // Anaglyph colour combinations (which channels carry left vs right).
+    inline const char* const* AnaglyphComboList(int& count)
+    {
+        static const char* const combos[] = {
+            "Red / Cyan", "Red / Green", "Red / Blue",
+            "Green / Magenta", "Amber / Blue", "Magenta / Cyan",
+        };
+        count = (int)(sizeof(combos) / sizeof(combos[0]));
+        return combos;
+    }
+
+    // How each eye is reconstructed from the anaglyph. Colour by default.
+    inline const char* const* AnaglyphModeList(int& count)
+    {
+        static const char* const modes[] = {
+            "Colour (filtered)",       // each eye keeps its own channels
+            "Colour (recovered)",      // fuller colour, mild crosstalk (Dubois-style)
+            "Half colour",             // blend toward grey
+            "Mono (black & white)",
+        };
+        count = (int)(sizeof(modes) / sizeof(modes[0]));
+        return modes;
     }
 
     // Show a modal error box (used for unrecoverable startup failures).
