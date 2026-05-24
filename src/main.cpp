@@ -432,7 +432,13 @@ namespace
         }
 
         // Convert the source into a side-by-side texture and feed it to the weaver.
-        if (srcSRV && srcW > 0 && srcH > 0)
+        // Re-run the (potentially heavy) conversion ONLY when its output can change:
+        // live capture changes every frame, Pulfrich is temporal, and any setting
+        // change sets captureRebind. A static test image converts once, then we just
+        // keep re-weaving the cached SBS (the weave still tracks the head each frame).
+        const bool liveSource = (app.source != SourceKind::TestImage);
+        const bool temporalFmt = (app.format == StereoFormat::Pulfrich);
+        if (srcSRV && srcW > 0 && srcH > 0 && (liveSource || temporalFmt || app.captureRebind))
         {
             app.converter.SetFormat(app.format, app.swapEyes, app.anaglyphCombo, app.anaglyphMode);
             {
