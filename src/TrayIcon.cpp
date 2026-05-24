@@ -106,7 +106,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, bool weavingEnabled, OutputMode mode,
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::WindowOverlay ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_MODE_OVERLAY, "Overlay source window (in-place 3D)");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::LookingGlass ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_LOOKING_GLASS, "Looking glass (passthrough; hold Ctrl+Alt to move)");
+                ID_TRAY_LOOKING_GLASS, "Looking glass (hold Ctrl+Alt: drag to move, wheel to resize)");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);

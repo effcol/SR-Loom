@@ -107,9 +107,10 @@ namespace
             const int w = 960, h = 600;
             const int x = d.left + (dw - w) / 2;
             const int y = d.top  + (dh - h) / 2;
-            // Click-through by default (layered+transparent). Hold Ctrl+Alt to
-            // grab the frame and drag/resize; releasing restores click-through.
-            style   = WS_OVERLAPPEDWINDOW;
+            // Borderless, click-through by default (layered+transparent). Hold
+            // Ctrl+Alt to drag (anywhere) and mouse-wheel to resize; releasing
+            // restores click-through.
+            style   = WS_POPUP;
             exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
             zorder  = HWND_TOPMOST;
             rect    = { x, y, x + w, y + h };
@@ -421,6 +422,34 @@ namespace
             mmi->ptMinTrackSize.y = 200;
             return 0;
         }
+
+        // While the looking glass is grabbable (Ctrl+Alt held), drag it from
+        // anywhere and resize it with the mouse wheel.
+        case WM_LBUTTONDOWN:
+            if (app && app->mode == OutputMode::LookingGlass && app->loupeInteractive)
+            {
+                ReleaseCapture();
+                SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEWHEEL:
+            if (app && app->mode == OutputMode::LookingGlass && app->loupeInteractive)
+            {
+                RECT r{};
+                GetWindowRect(hwnd, &r);
+                const int w = r.right - r.left, h = r.bottom - r.top;
+                const int step = (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? 1 : -1;
+                int nw = w + step * w / 10; if (nw < 200) nw = 200;
+                int nh = h + step * h / 10; if (nh < 150) nh = 150;
+                // Resize about the center.
+                const int nx = r.left + (w - nw) / 2;
+                const int ny = r.top  + (h - nh) / 2;
+                SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, nw, nh, SWP_NOACTIVATE);
+                return 0;
+            }
+            break;
 
 
 
