@@ -59,18 +59,20 @@ float anaEyeLuma(float3 c, int combo, int e)
 
 float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
 {
+    // Per-eye luminance at FULL brightness (e.g. red/cyan left = c.r, right = (g+b)/2).
+    // All modes key off this so Mono / Half match the colour modes' brightness.
+    float eyeY = anaEyeLuma(c, combo, e);
     if (mode == 0)   // Shared colour: per-eye luminance, shared anaglyph chrominance.
     {
         float anaY = max(dot(c, float3(0.299, 0.587, 0.114)), 1e-3);
-        float eyeY = anaEyeLuma(c, combo, e);
         return saturate(c * (eyeY / anaY));   // same hue both eyes, eye-specific brightness
     }
 
     float3 col = anaFilter(c, combo, e);
-    float  g   = dot(col, float3(0.299, 0.587, 0.114));
-    if (mode == 2) return lerp(col, g.xxx, 0.5);   // half colour
-    if (mode == 3) return g.xxx;                   // mono
-    return col;                                    // mode 1: colour (filtered)
+    if (mode == 2) return lerp(col, eyeY.xxx, 0.5);   // half colour (blend toward per-eye grey)
+    if (mode == 3) return eyeY.xxx;                   // mono: per-eye luminance (not the dim
+                                                      // single-channel-weighted grey, which was ~3x dark)
+    return col;                                       // mode 1: colour (filtered)
 }
 
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
