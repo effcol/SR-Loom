@@ -63,8 +63,9 @@ namespace srw
         ID3D11PixelShader*       m_psCoarse = nullptr;  // full-search disparity (coarsest level)
         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
-        ID3D11PixelShader*       m_psSmooth = nullptr;  // edge-aware disparity smoothing
-        ID3D11PixelShader*       m_psProp   = nullptr;  // edge-aware colour propagation
+        ID3D11PixelShader*       m_psSmooth  = nullptr;  // edge-aware disparity smoothing
+        ID3D11PixelShader*       m_psSplit   = nullptr;  // SBS half -> premultiplied per-eye pyramid
+        ID3D11PixelShader*       m_psCompose = nullptr;  // push-pull colorize -> final SBS
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -80,10 +81,16 @@ namespace srw
         int                       m_outWidth  = 0;     // full SBS width
         int                       m_outHeight = 0;
 
-        // Ping-pong twin of m_outTex for the colour-propagation passes.
-        ID3D11Texture2D*          m_outTex2 = nullptr;
-        ID3D11RenderTargetView*   m_outRTV2 = nullptr;
-        ID3D11ShaderResourceView* m_outSRV2 = nullptr;
+        // Per-eye colour pyramids (mip-chained, RGBA16F, premultiplied) for the
+        // push-pull colorization of anaglyph recovery. GenerateMips on premultiplied
+        // colour gives a confidence-weighted average at each level.
+        ID3D11Texture2D*          m_ppLeftTex  = nullptr;
+        ID3D11RenderTargetView*   m_ppLeftRTV  = nullptr;   // mip 0
+        ID3D11ShaderResourceView* m_ppLeftSRV  = nullptr;   // full chain
+        ID3D11Texture2D*          m_ppRightTex = nullptr;
+        ID3D11RenderTargetView*   m_ppRightRTV = nullptr;
+        ID3D11ShaderResourceView* m_ppRightSRV = nullptr;
+        int                       m_ppMips = 0;
 
         // Frame-history ring (for Pulfrich time delay), source-sized, sRGB.
         ID3D11Texture2D*          m_hist[kHistory]    = {};
