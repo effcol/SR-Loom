@@ -274,7 +274,11 @@ float4 PSAnaSplit(VSOut i) : SV_Target
 {
     float2 uv = float2(g_propStride + i.uv.x * 0.5, i.uv.y);   // left half or right half
     float4 s = srcTex.SampleLevel(samp, uv, 0.0);              // recovered SBS; .a = confidence
-    return float4(s.rgb * s.a, s.a);                          // premultiplied for conf-weighted mips
+    // Floor the weight so a zero-confidence pixel's colour isn't multiplied away to
+    // black; un-premultiply (rgb*w)/w still recovers its colour, and valid pixels
+    // (weight ~1) still dominate the confidence-weighted mip averages (~50x).
+    float w = max(s.a, 0.02);
+    return float4(s.rgb * w, w);
 }
 
 // COMPOSE: rebuild the SBS. For each pixel walk the eye's mip pyramid from finest to
