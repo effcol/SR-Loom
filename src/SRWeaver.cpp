@@ -13,6 +13,7 @@
 
 #include <thread>
 #include <chrono>
+#include <exception>
 
 using namespace srw;
 
@@ -89,12 +90,14 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     WeaverErrorCode result = SR::CreateDX11Weaver(m_context, immediateContext, window, &m_weaver);
     if (result != WeaverErrorCode::WeaverSuccess || m_weaver == nullptr)
     {
+        Log("CreateWeaver FAILED: WeaverErrorCode=%d weaver=%p", (int)result, (void*)m_weaver);
         ShowError("Failed to create the DirectX 11 weaver.");
         return false;
     }
 
     // Finalize the SR context now that the weaver is registered.
     m_context->initialize();
+    Log("CreateWeaver OK (weaver=%p); SR context initialized", (void*)m_weaver);
     return true;
 }
 
@@ -191,8 +194,24 @@ void SRWeaver::StopSR()
 
 void SRWeaver::Weave()
 {
-    if (m_weaver)
+    if (!m_weaver)
+        return;
+    // The SR weaver can throw (e.g. lost SR service / tracking). Log the first such
+    // failure instead of letting it bubble up, so a transient drop is diagnosable.
+    try
+    {
         m_weaver->weave();
+    }
+    catch (std::exception& e)
+    {
+        static bool logged = false;
+        if (!logged) { Log("SRWeaver::Weave exception: %s", e.what()); logged = true; }
+    }
+    catch (...)
+    {
+        static bool logged = false;
+        if (!logged) { Log("SRWeaver::Weave unknown exception"); logged = true; }
+    }
 }
 
 void SRWeaver::ReleaseViewTexture()
