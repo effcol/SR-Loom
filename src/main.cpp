@@ -121,9 +121,13 @@ namespace
             break;
 
         case OutputMode::WindowOverlay:
+            // NOT topmost: the overlay sits directly above its SOURCE window in the
+            // z-order, so another window moved above the source also occludes the
+            // weave (how people expect a windowed overlay to behave). Fullscreen and
+            // looking-glass stay topmost.
             style   = WS_POPUP;
-            exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-            zorder  = HWND_TOPMOST;
+            exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            zorder  = (app.sourceWindow && IsWindow(app.sourceWindow)) ? app.sourceWindow : HWND_TOP;
             rect    = { d.left, d.top, d.left + 1280, d.top + 720 };
             if (app.sourceWindow && IsWindow(app.sourceWindow))
                 rect = VisibleWindowRect(app.sourceWindow);
@@ -226,9 +230,13 @@ namespace
 
         RECT r = VisibleWindowRect(src), cur{};
         GetWindowRect(app.hwnd, &cur);
-        if (!EqualRect(&r, &cur))
+        // Keep the overlay glued DIRECTLY above the source in z-order (insertAfter =
+        // src), not global-topmost -- so a window moved above the source occludes the
+        // weave too. Restack when the rect moved OR the overlay drifted off the source.
+        const bool gluedAboveSrc = (GetWindow(app.hwnd, GW_HWNDNEXT) == src);
+        if (!EqualRect(&r, &cur) || !gluedAboveSrc)
         {
-            SetWindowPos(app.hwnd, HWND_TOPMOST, r.left, r.top,
+            SetWindowPos(app.hwnd, src, r.left, r.top,
                          r.right - r.left, r.bottom - r.top,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);  // WM_SIZE resizes the swap chain
         }
