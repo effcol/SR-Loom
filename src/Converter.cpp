@@ -69,7 +69,12 @@ float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
     }
 
     float3 col = anaFilter(c, combo, e);
-    if (mode == 2) return lerp(col, eyeY.xxx, 0.5);   // half colour (blend toward per-eye grey)
+    if (mode == 2)   // half colour: half saturation but FULL per-eye brightness (re-normalize
+    {                // to eyeY so it isn't darker than the colour/mono modes).
+        float3 h = lerp(col, eyeY.xxx, 0.5);
+        float  hY = max(dot(h, float3(0.299, 0.587, 0.114)), 1e-3);
+        return saturate(h * (eyeY / hY));
+    }
     if (mode == 3) return eyeY.xxx;                   // mono: per-eye luminance (not the dim
                                                       // single-channel-weighted grey, which was ~3x dark)
     return col;                                       // mode 1: colour (filtered)

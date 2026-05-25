@@ -161,6 +161,10 @@ bool Capture::StartCaptureInternalActive()
     m_impl->framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
     m_impl->session = m_impl->framePool.CreateCaptureSession(m_impl->item);
+    // Don't capture the OS mouse cursor: otherwise the woven output shows a second,
+    // trailing cursor on top of the real one. (Property added in Windows 10 2004;
+    // guarded so older builds still work.)
+    try { m_impl->session.IsCursorCaptureEnabled(false); } catch (...) {}
     m_impl->session.StartCapture();
     m_active = true;
     return true;

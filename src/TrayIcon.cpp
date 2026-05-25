@@ -186,15 +186,15 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     HMENU anaMenu = CreatePopupMenu();
     int comboCount = 0, modeCount = 0;
     const char* const* combos = AnaglyphComboList(comboCount);
-    const char* const* modes  = AnaglyphModeList(modeCount);
+    const AnaglyphModeEntry* modes = AnaglyphModeList(modeCount);
     const bool anaActive = (format == StereoFormat::Anaglyph);
     for (int i = 0; i < comboCount; ++i)
         AppendMenuA(anaMenu, MF_STRING | ((anaActive && i == anaglyphCombo) ? MF_CHECKED : 0),
                     ID_TRAY_ANA_COMBO_BASE + (UINT)i, combos[i]);
     AppendMenuA(anaMenu, MF_SEPARATOR, 0, nullptr);
-    for (int i = 0; i < modeCount; ++i)
-        AppendMenuA(anaMenu, MF_STRING | ((anaActive && i == anaglyphMode) ? MF_CHECKED : 0),
-                    ID_TRAY_ANA_MODE_BASE + (UINT)i, modes[i]);
+    for (int i = 0; i < modeCount; ++i)   // menu index i -> shader mode value modes[i].value
+        AppendMenuA(anaMenu, MF_STRING | ((anaActive && modes[i].value == anaglyphMode) ? MF_CHECKED : 0),
+                    ID_TRAY_ANA_MODE_BASE + (UINT)i, modes[i].label);
     AppendMenuA(fmtMenu, MF_POPUP | (anaActive ? MF_CHECKED : 0),
                 reinterpret_cast<UINT_PTR>(anaMenu), "Anaglyph");
 

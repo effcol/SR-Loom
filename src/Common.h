@@ -145,15 +145,18 @@ namespace srw
         return combos;
     }
 
-    // How each eye is reconstructed from the anaglyph. Colour by default.
-    inline const char* const* AnaglyphModeList(int& count)
+    // How each eye is reconstructed from the anaglyph. Listed in DISPLAY order, but
+    // each carries its shader mode VALUE so the menu order is decoupled from the
+    // shader's g_anaMode numbering (0 shared, 1 filtered, 2 half, 3 mono, 4 recovery).
+    struct AnaglyphModeEntry { const char* label; int value; };
+    inline const AnaglyphModeEntry* AnaglyphModeList(int& count)
     {
-        static const char* const modes[] = {
-            "DeAnaglyph",                    // per-eye luminance + shared, de-fringed chroma (default)
-            "Colour (filtered)",             // each eye keeps only its own channels
-            "Half colour",                   // blend toward grey
-            "Mono (black & white)",
-            "Recovered colour",              // multi-scale disparity-aligned colour recovery (red/cyan)
+        static const AnaglyphModeEntry modes[] = {
+            { "Recovered colour",     4 },   // multi-scale disparity recovery (default, top)
+            { "DeAnaglyph",           0 },   // per-eye luminance + shared anaglyph chroma
+            { "Colour (filtered)",    1 },   // each eye keeps only its own channels
+            { "Half colour",          2 },   // half saturation, full per-eye brightness
+            { "Mono (black & white)", 3 },
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
         return modes;

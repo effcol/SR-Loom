@@ -44,7 +44,7 @@ namespace
         StereoFormat format         = StereoFormat::FullSBS;  // source stereo layout
         bool         swapEyes       = false;
         int          anaglyphCombo  = 0;   // 0..5 colour combination
-        int          anaglyphMode   = 0;   // 0..3 decode mode (colour by default)
+        int          anaglyphMode   = 4;   // shader mode value (4 = Recovered colour, the default)
         PulfrichMode pulfrichMode   = PulfrichMode::TimeDelay;
         int          pulfrichDelay  = 1;   // delay frames (time-delay mode)
         int          pulfrichNd     = 1;   // ND level index (default Medium)
@@ -548,7 +548,9 @@ namespace
             }
             if (cmd >= ID_TRAY_ANA_MODE_BASE && cmd <= ID_TRAY_ANA_MODE_MAX)
             {
-                app->anaglyphMode = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
+                int n = 0; const AnaglyphModeEntry* modes = AnaglyphModeList(n);
+                const int idx = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
+                if (idx < n) app->anaglyphMode = modes[idx].value;   // menu index -> shader mode value
                 app->format = StereoFormat::Anaglyph;
                 app->captureRebind = true;
                 EnsureWeaving(*app);
