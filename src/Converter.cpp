@@ -342,16 +342,18 @@ float4 PSMain(VSOut i) : SV_Target
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
             float3 aligned = saturate(alignedCol * (eyeY / aY));
 
-            // Low-confidence fallback: shared, horizontally-blurred chroma.
-            float3 acc = 0;
-            [unroll] for (int k = -4; k <= 4; ++k)
-                acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
-            float3 blurCol = acc / 9.0;
-            float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            float3 sharedCol = saturate(blurCol * (eyeY / bY));
+            // Confidence = fill confidence x match quality x reference STRUCTURE.
+            // A flat reference channel (e.g. green in a saturated-red area) makes the
+            // match meaningless and lets the right eye borrow red from an arbitrary
+            // location -> spurious red. Low gradient energy -> low confidence.
+            float refEnergy = 0;
+            [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
+            float conf = baseConf * saturate(1.0 - bs * 1.5) * saturate(refEnergy * 8.0);
 
-            float conf = baseConf * saturate(1.0 - bs * 1.5);
-            float3 col = lerp(sharedCol, aligned, conf);
+            // Low-confidence fallback is GREY (this eye's own luminance) -- NOT the
+            // anaglyph's own chroma, which mixes both eyes and bleeds the other eye's
+            // colour (e.g. left's red) into this one.
+            float3 col = lerp(float3(eyeY, eyeY, eyeY), aligned, conf);
 
             // Saturation gate: weak chroma is almost always residual red/cyan fringe
             // (or a monochrome region), so pull it to grey; genuine colour (high
