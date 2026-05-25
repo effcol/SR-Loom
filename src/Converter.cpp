@@ -197,10 +197,10 @@ float4 PSAnaRefine(VSOut i) : SV_Target
 }
 
 // Occlusion fill: flag pixels failing the left-right consistency check, then fill
-// their disparity from the consistent neighbour whose GREEN best matches (SIRA
-// colorization-by-nearest-colour, but matched on GREEN ONLY -- the trusted shared
-// channel -- so it never biases toward the red/blue left-eye channel and can't pull
-// spurious red into the gap). Small spatial penalty. Output adds .b = confidence.
+// their disparity from the consistent neighbour whose SOURCE COLOUR best matches
+// (SIRA colorization-by-nearest-colour, full RGB, as in the paper), with a small
+// spatial penalty. Any wrong borrow this introduces is caught downstream by the
+// borrow-trust gate. dispTex holds the refined (dLR, dRL). Output adds .b = conf.
 float4 PSAnaFill(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
@@ -214,8 +214,8 @@ float4 PSAnaFill(VSOut i) : SV_Target
     float conf  = saturate(1.0 - cons * inv * 4.0);
     if (conf > 0.5) return float4(d, conf, 0);
 
-    float myG = srcTex.SampleLevel(samp, uv, 0.0).g;
-    float best = 1e9; float2 bestD = d; bool found = false;
+    float3 myCol = srcTex.SampleLevel(samp, uv, 0.0).rgb;
+    float  best  = 1e9; float2 bestD = d; bool found = false;
     [loop] for (int s = 1; s <= 24; ++s)
     {
         [unroll] for (int sgn = 0; sgn < 2; ++sgn)
@@ -226,8 +226,9 @@ float4 PSAnaFill(VSOut i) : SV_Target
             float  nc  = saturate(1.0 - abs(nd.r + dispTex.SampleLevel(samp, float2(nuv.x + nd.r, nuv.y), 0.0).g) * inv * 4.0);
             if (nc > 0.5)
             {
-                float gd = abs(myG - srcTex.SampleLevel(samp, nuv, 0.0).g) + (float)s * 0.02;
-                if (gd < best) { best = gd; bestD = nd; found = true; }
+                float3 ncol = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
+                float  cd = distance(myCol, ncol) + (float)s * 0.02;   // colour dist + slight spatial bias
+                if (cd < best) { best = cd; bestD = nd; found = true; }
             }
         }
     }
