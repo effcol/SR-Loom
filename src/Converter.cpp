@@ -86,60 +86,83 @@ VSOut VSMain(uint id : SV_VertexID)
 )HLSL"
 R"HLSL(
 // Gradient descriptor for anaglyph matching (SIRA, Kunze 2020, re-implemented):
-// match the DIFFERENCE between adjacent pixels along a direction, not raw intensity,
-// so the red and cyan views match by STRUCTURE despite their photometric mismatch.
-// Red is matched against the GREEN channel only (green carries most luminance).
-// 5-tap line along `dir` -> 4 adjacent differences for red (gR) and green (gG).
-void gradDir(float2 uv, float2 dir, out float gR[4], out float gG[4])
+// match the DIFFERENCE between adjacent pixels, not raw intensity, so the red and
+// cyan views match by STRUCTURE despite their photometric (colour) mismatch. We
+// match red against the GREEN channel only (green carries most luminance; mixing
+// in blue adds noise). 5-tap window -> 4 adjacent differences per channel.
+void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
 {
     float rr[5], gg[5];
     [unroll] for (int w = 0; w < 5; ++w)
     {
-        float3 s = srcTex.SampleLevel(samp, uv + dir * (float)(w - 2), 0).rgb;
+        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
         rr[w] = s.r; gg[w] = s.g;
     }
     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
 }
 
-float sad4(float a[4], float b[4])
+// Four-angle gradient descriptors (SIRA: 0/45/90/135 deg around a pixel) for red &
+// green at uv. Each angle = a 5-tap line -> 4 adjacent differences. Packed as
+// [angle*4 + diff], 16 entries per channel. Multiple angles capture 2D structure,
+// making the match far more discriminative than a single horizontal line.
+void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn[16])
 {
-    float s = 0; [unroll] for (int k = 0; k < 4; ++k) s += abs(a[k] - b[k]); return s;
+    float2 dirs[4] = { float2(tx, 0), float2(0, ty), float2(tx, ty), float2(-tx, ty) };
+    [unroll] for (int a = 0; a < 4; ++a)
+    {
+        float rr[5], gg[5];
+        [unroll] for (int i = 0; i < 5; ++i)
+        {
+            float3 s = srcTex.SampleLevel(samp, uv + dirs[a] * (float)(i - 2), 0).rgb;
+            rr[i] = s.r; gg[i] = s.g;
+        }
+        [unroll] for (int k = 0; k < 4; ++k)
+        { gRed[a * 4 + k] = rr[k + 1] - rr[k]; gGrn[a * 4 + k] = gg[k + 1] - gg[k]; }
+    }
 }
 
-// Coarse disparity pass (red/cyan anaglyph): low-resolution disparity between the
-// L (red) and R (green) views, both directions. Matches mostly HORIZONTAL (the only
-// direction anaglyph disparity actually moves) but adds two DIAGONAL checks at half
-// weight to disambiguate horizontal edges. Plain weighted sum -- NO per-angle
-// normalization (that amplified flat directions and caused wrong matches).
-// Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
-#define ANA_DIRS(uv2, hR,hG, aR,aG, bR,bG) \
-    gradDir(uv2, float2(ctx, 0),   hR, hG); \
-    gradDir(uv2, float2(ctx, cty), aR, aG); \
-    gradDir(uv2, float2(ctx,-cty), bR, bG);
-#define ANA_COST(refH,refA,refB, cH,cA,cB) \
-    (sad4(refH, cH) + 0.5 * sad4(refA, cA) + 0.5 * sad4(refB, cB))
+// Per-angle NORMALIZED gradient distance between two descriptors (channels already
+// picked). Dividing each angle by its own gradient energy stops a high-contrast
+// angle from dominating (SIRA min-max normalization intent), so all angles count.
+float descCost(float a16[16], float b16[16])
+{
+    float total = 0;
+    [unroll] for (int a = 0; a < 4; ++a)
+    {
+        float sad = 0, en = 1e-3;
+        [unroll] for (int k = 0; k < 4; ++k)
+        {
+            float ga = a16[a * 4 + k], gb = b16[a * 4 + k];
+            sad += abs(ga - gb); en += abs(ga) + abs(gb);
+        }
+        total += sad / en;
+    }
+    return total;
+}
 
+// Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal
+// disparity between the L (red) and R (green) views, both directions, via 4-angle
+// gradient matching. Low resolution makes winner-take-all robust and smooth.
+// Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
 float4 PSAnaDisp(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
-    float  ctx = 1.0 / max(g_coarseW, 1.0);
-    float  cty = 1.0 / max(g_coarseH, 1.0);
+    float  tx = 1.0 / max(g_coarseW, 1.0);
+    float  ty = 1.0 / max(g_coarseH, 1.0);
     float  maxD = g_dispMaxUV;
     const int N = 24;
     float  step = maxD / (float)N;
 
-    float hR[4],hG[4], aR[4],aG[4], bR[4],bG[4];
-    ANA_DIRS(uv, hR,hG, aR,aG, bR,bG)   // reference descriptors at uv
+    float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
 
     float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
     [loop] for (int k = -N; k <= N; ++k)
     {
         float d = (float)k * step;
-        float chR[4],chG[4], caR[4],caG[4], cbR[4],cbG[4];
-        ANA_DIRS(uv + float2(d, 0), chR,chG, caR,caG, cbR,cbG)
+        float cRed[16], cGrn[16]; buildDesc(uv + float2(d, 0), tx, ty, cRed, cGrn);
         float bias = abs(d) / max(maxD, 1e-4) * 0.06;
-        float sadL = bias + ANA_COST(hR,aR,bR, chG,caG,cbG);   // dLR: red ref vs green cand
-        float sadR = bias + ANA_COST(hG,aG,bG, chR,caR,cbR);   // dRL: green ref vs red cand
+        float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
+        float sadR = descCost(refGrn, cRed) + bias;   // dRL: green ref vs red candidate
         if (sadL < bestL) { bestL = sadL; dL = d; }
         if (sadR < bestR) { bestR = sadR; dR = d; }
     }
@@ -147,39 +170,37 @@ float4 PSAnaDisp(VSOut i) : SV_Target
 }
 
 // Pyramid refine: start from a coarser level (dispTex = prior) and do a local
-// horizontal+diagonal gradient search to sharpen the disparity. (dLR, dRL, 0, 0).
+// 4-angle gradient search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
 float4 PSAnaRefine(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
-    float  ctx = 1.0 / max(g_coarseW, 1.0);
-    float  cty = 1.0 / max(g_coarseH, 1.0);
+    float  tx = 1.0 / max(g_coarseW, 1.0);
+    float  ty = 1.0 / max(g_coarseH, 1.0);
     float2 prior = dispTex.SampleLevel(samp, uv, 0.0).rg;
     const int M = 6;
 
-    float hR[4],hG[4], aR[4],aG[4], bR[4],bG[4];
-    ANA_DIRS(uv, hR,hG, aR,aG, bR,bG)
+    float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
 
     float bestL = 1e9, dL = prior.r, bestR = 1e9, dR = prior.g;
     [loop] for (int k = -M; k <= M; ++k)
     {
-        float ddL = prior.r + (float)k * ctx;
-        float ddR = prior.g + (float)k * ctx;
-        float lhR[4],lhG[4], laR[4],laG[4], lbR[4],lbG[4];
-        ANA_DIRS(uv + float2(ddL, 0), lhR,lhG, laR,laG, lbR,lbG)
-        float rhR[4],rhG[4], raR[4],raG[4], rbR[4],rbG[4];
-        ANA_DIRS(uv + float2(ddR, 0), rhR,rhG, raR,raG, rbR,rbG)
-        float sadL = ANA_COST(hR,aR,bR, lhG,laG,lbG);   // ref red vs candidate green
-        float sadR = ANA_COST(hG,aG,bG, rhR,raR,rbR);   // ref green vs candidate red
+        float ddL = prior.r + (float)k * tx;   // candidate for dLR (match green)
+        float ddR = prior.g + (float)k * tx;   // candidate for dRL (match red)
+        float lRed[16], lGrn[16]; buildDesc(uv + float2(ddL, 0), tx, ty, lRed, lGrn);
+        float rRed[16], rGrn[16]; buildDesc(uv + float2(ddR, 0), tx, ty, rRed, rGrn);
+        float sadL = descCost(refRed, lGrn);   // ref red vs candidate green
+        float sadR = descCost(refGrn, rRed);   // ref green vs candidate red
         if (sadL < bestL) { bestL = sadL; dL = ddL; }
         if (sadR < bestR) { bestR = sadR; dR = ddR; }
     }
     return float4(dL, dR, 0, 0);
 }
 
-// Occlusion fill: flag pixels failing the left-right consistency check and fill
-// their disparity from the NEAREST consistent neighbour (preferring the smaller =
-// background disparity). Filling by spatial proximity (not source colour) avoids
-// pulling in the wrong-coloured region. dispTex holds (dLR, dRL); adds .b = conf.
+// Occlusion fill: flag pixels failing the left-right consistency check, then fill
+// their disparity from the consistent neighbour whose GREEN best matches (SIRA
+// colorization-by-nearest-colour, but matched on GREEN ONLY -- the trusted shared
+// channel -- so it never biases toward the red/blue left-eye channel and can't pull
+// spurious red into the gap). Small spatial penalty. Output adds .b = confidence.
 float4 PSAnaFill(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
@@ -193,17 +214,14 @@ float4 PSAnaFill(VSOut i) : SV_Target
     float conf  = saturate(1.0 - cons * inv * 4.0);
     if (conf > 0.5) return float4(d, conf, 0);
 
-    // Among consistent neighbours, prefer the one whose GREEN (the trusted, shared
-    // luminance channel) best matches ours -- colour-aware like SIRA but matched on
-    // green only, so it never biases toward the red/blue (left-eye) channels and
-    // can't pull spurious red into the gap. Small spatial penalty breaks ties.
     float myG = srcTex.SampleLevel(samp, uv, 0.0).g;
     float best = 1e9; float2 bestD = d; bool found = false;
-    [loop] for (int s = 1; s <= 20; ++s)
+    [loop] for (int s = 1; s <= 24; ++s)
     {
         [unroll] for (int sgn = 0; sgn < 2; ++sgn)
         {
-            float2 nuv = float2(uv.x + (sgn == 0 ? (float)s : -(float)s) * ctx, uv.y);
+            float  off = (sgn == 0) ? (float)s : -(float)s;
+            float2 nuv = float2(uv.x + off * ctx, uv.y);
             float2 nd  = dispTex.SampleLevel(samp, nuv, 0.0).rg;
             float  nc  = saturate(1.0 - abs(nd.r + dispTex.SampleLevel(samp, float2(nuv.x + nd.r, nuv.y), 0.0).g) * inv * 4.0);
             if (nc > 0.5)
@@ -303,15 +321,15 @@ float4 PSMain(VSOut i) : SV_Target
             float baseConf = dC.b;                               // from the fill pass
 
             // Reference gradient descriptor at e (red for the left eye, green for the
-            // right) for the full-res horizontal gradient-matching refine.
-            float rgR[4], rgG[4]; gradDir(e, float2(px, 0), rgR, rgG);
+            // right) for the full-res gradient-matching refine.
+            float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
 
             // Full-res refine (±3 px) with sub-pixel parabola fit on the cost curve.
             float sads[7];
             [unroll] for (int r = 0; r < 7; ++r)
             {
                 float d = d0 + (float)(r - 3) * px;
-                float cR[4], cG[4]; gradDir(float2(e.x + d, e.y), float2(px, 0), cR, cG);
+                float cR[4], cG[4]; gradWindow(float2(e.x + d, e.y), px, cR, cG);
                 float sd = 0.0;
                 [unroll] for (int k2 = 0; k2 < 4; ++k2)
                     sd += (eye == 0) ? abs(rgR[k2] - cG[k2])    // left: red ref vs green cand
@@ -342,24 +360,16 @@ float4 PSMain(VSOut i) : SV_Target
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
             float3 aligned = saturate(alignedCol * (eyeY / aY));
 
-            // EDGE-AWARE confidence + GREY fallback. In FLAT regions, trust the match
-            // (uniform colour is correct even when the exact disparity is ambiguous)
-            // so colour is preserved -- this is what v9's flat-penalizing structure
-            // gate got wrong. At luminance EDGES (where fringe and the spurious-red
-            // borrow live) require strict left-right consistency; where it fails, fall
-            // back to GREY -- never the anaglyph's mixed chroma, so no red/cyan fringe
-            // and no other-eye colour bleeds in.
-            float refEnergy = 0;
-            [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float edgeFactor = saturate(refEnergy * 12.0);
-            float conf = saturate(1.0 - bs * 1.5) * lerp(1.0, baseConf, edgeFactor);
-            float3 col = lerp(float3(eyeY, eyeY, eyeY), aligned, conf);
+            // Low-confidence fallback: shared, horizontally-blurred chroma.
+            float3 acc = 0;
+            [unroll] for (int k = -4; k <= 4; ++k)
+                acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
+            float3 blurCol = acc / 9.0;
+            float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
+            float3 sharedCol = saturate(blurCol * (eyeY / bY));
 
-            // Saturation gate: pull only the faintest residual chroma to grey.
-            float lum = dot(col, float3(0.299, 0.587, 0.114));
-            float sat = length(col - lum);
-            col = lerp(float3(lum, lum, lum), col, smoothstep(0.02, 0.08, sat));
-            return float4(col, 1);
+            float conf = baseConf * saturate(1.0 - bs * 1.5);
+            return float4(lerp(sharedCol, aligned, conf), 1);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
