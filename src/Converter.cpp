@@ -422,7 +422,13 @@ float4 PSMain(VSOut i) : SV_Target
             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
                                            : float3(there.r, c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
+            float3 aligned = saturate(alignedCol * (eyeY / aY));
+
+            // Seed low-confidence pixels toward NEUTRAL grey (own luminance), not the
+            // raw borrow, so an isolated low-confidence region resolves to grey rather
+            // than a spurious red/blue splotch. Propagation then fills it from
+            // confident neighbours wherever any are within reach.
+            return float4(lerp(float3(eyeY, eyeY, eyeY), aligned, conf), conf);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
@@ -736,8 +742,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
         m_context->RSSetViewports(1, &vp);
         m_context->PSSetShader(m_psProp, nullptr, 0);
-        const float strides[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
-        for (int pass = 0; pass < 4; ++pass)
+        const float strides[6] = { 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f };
+        for (int pass = 0; pass < 6; ++pass)
         {
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
                     0, 0, 0, 0, dispMaxUV, 0, 0, strides[pass] };
