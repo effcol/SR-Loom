@@ -311,8 +311,18 @@ float4 PSAnaCompose(VSOut i) : SV_Target
     [loop] for (int L = 0; L <= maxLod; ++L)
     {
         if (w >= 0.99) break;
-        float4 s = right ? srcPrev.SampleLevel(samp, euv, (float)L)
-                         : srcTex.SampleLevel(samp, euv, (float)L);
+        float4 s;
+        if (L == 0)
+            // Finest level: this eye's OWN recovered colour, so confident pixels keep
+            // their per-eye detail.
+            s = right ? srcPrev.SampleLevel(samp, euv, 0.0)
+                      : srcTex.SampleLevel(samp, euv, 0.0);
+        else
+            // Coarser levels: average of BOTH eyes (premultiplied sum -> confidence-
+            // weighted). CROSS-EYE: an eye that lost a colour (conf ~0, contributes
+            // nothing) inherits it from the eye that still has it -- e.g. the left
+            // eye's red-less green sign borrows the green the right eye still holds.
+            s = srcTex.SampleLevel(samp, euv, (float)L) + srcPrev.SampleLevel(samp, euv, (float)L);
         float a = saturate(s.a);
         float3 col = s.rgb / max(s.a, 1e-4);     // un-premultiply -> conf-weighted colour
         float contrib = a * (1.0 - w);
@@ -376,11 +386,11 @@ float4 PSMain(VSOut i) : SV_Target
             float py = 1.0 / g_srcH;
             float4 dC = dispTex.SampleLevel(samp, e, 0.0);       // (dLR, dRL, confL, confR)
             float d0 = (eye == 0) ? dC.r : dC.g;                 // this eye -> the other
-            // COUPLE the eyes: a region unreliable in EITHER eye is treated unreliable
-            // in BOTH (min), so it's inpainted symmetrically -> no one-eye-clean /
-            // other-eye-splotch rivalry. (Both pyramids are regional averages of the
-            // same scene, so they fill to near-identical colour.)
-            float baseConf = min(dC.b, dC.a);                    // consistency x uniqueness, coupled
+            // Per-eye confidence: where THIS eye is confident it keeps its own colour;
+            // where it isn't, the compose's cross-eye shared fill (coarse pyramid of
+            // BOTH eyes) supplies a consistent colour -> no one-eye-splotch rivalry,
+            // without forcing the confident eye to lose detail.
+            float baseConf = (eye == 0) ? dC.b : dC.a;           // consistency x uniqueness, per eye
 
             // Reference gradient descriptor at e (red for the left eye, green for the
             // right) for the full-res gradient-matching refine.
