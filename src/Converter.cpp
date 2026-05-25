@@ -348,6 +348,18 @@ float4 PSMain(VSOut i) : SV_Target
             }
 
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
+
+            // Borrow trust: the disparity match relies on the REFERENCE channel (red
+            // for the left eye, green for the right). Where that channel is flat the
+            // match is meaningless and the borrow lands anywhere -> spurious cross-eye
+            // colour (the high-contrast red). Gate ONLY the borrowed channel(s) by the
+            // reference's gradient energy, blending them toward this eye's luminance
+            // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
+            // colour is preserved (this is NOT a global desaturation).
+            float refEnergy = 0;
+            [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
+            float borrowTrust = saturate(refEnergy * 8.0);
+
             // Block processing (SIRA): borrow the aligned colour as a small patch
             // average, not a single pixel, to smooth residual fringing.
             float3 there = 0;
@@ -355,8 +367,9 @@ float4 PSMain(VSOut i) : SV_Target
             [unroll] for (int bx = -1; bx <= 1; ++bx)
                 there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
             there /= 9.0;
-            float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
-                                           : float3(there.r, c.g, c.b);
+            float3 alignedCol = (eye == 0)
+                ? float3(c.r, lerp(eyeY, there.g, borrowTrust), lerp(eyeY, there.b, borrowTrust))
+                : float3(lerp(eyeY, there.r, borrowTrust), c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
             float3 aligned = saturate(alignedCol * (eyeY / aY));
 
