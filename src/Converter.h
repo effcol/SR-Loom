@@ -64,6 +64,7 @@ namespace srw
         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
         ID3D11PixelShader*       m_psSmooth = nullptr;  // edge-aware disparity smoothing
+        ID3D11PixelShader*       m_psProp   = nullptr;  // edge-aware colour propagation
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -78,6 +79,11 @@ namespace srw
         ID3D11ShaderResourceView* m_outSRV = nullptr;
         int                       m_outWidth  = 0;     // full SBS width
         int                       m_outHeight = 0;
+
+        // Ping-pong twin of m_outTex for the colour-propagation passes.
+        ID3D11Texture2D*          m_outTex2 = nullptr;
+        ID3D11RenderTargetView*   m_outRTV2 = nullptr;
+        ID3D11ShaderResourceView* m_outSRV2 = nullptr;
 
         // Frame-history ring (for Pulfrich time delay), source-sized, sRGB.
         ID3D11Texture2D*          m_hist[kHistory]    = {};

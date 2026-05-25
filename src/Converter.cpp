@@ -32,7 +32,7 @@ cbuffer Params : register(b0)
     float g_dispMaxUV; // anaglyph recovery: max search disparity (fraction of width)
     float g_coarseW;   // coarse disparity-map width (px)
     float g_coarseH;   // coarse disparity-map height (px)
-    float g_pad3;
+    float g_propStride; // colour-propagation pass: neighbour sample stride (texels)
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -265,6 +265,44 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
 }
 )HLSL"
 R"HLSL(
+// Colour propagation (SIRA-style colorization, re-implemented as edge-aware diffusion,
+// no neural net). Operates on the recovered SBS (srcTex here = the SBS being filtered;
+// .rgb = per-eye colour, .a = borrow confidence). Each pass diffuses CHROMA from
+// confident pixels into unconfident ones at a given stride (run with strides 1,2,4,8
+// for wide a-trous coverage), weighted by neighbour confidence and luminance similarity
+// (edge-aware -> stays within a region, like a superpixel). Each pixel keeps its OWN
+// luminance; only the colour (chroma) is filled -> no desaturation, no eye-mixing.
+// Confined to the pixel's SBS half so the two eyes never cross.
+float4 PSAnaProp(VSOut i) : SV_Target
+{
+    float2 uv = i.uv;
+    float2 texel = float2(1.0 / (2.0 * g_srcW), 1.0 / g_srcH);
+    float  st = g_propStride;
+    float  paneMin = (uv.x >= 0.5) ? 0.5 : 0.0;
+    float  paneMax = (uv.x >= 0.5) ? 1.0 : 0.5;
+
+    float4 me = srcTex.SampleLevel(samp, uv, 0.0);
+    float  myLum = max(dot(me.rgb, float3(0.299, 0.587, 0.114)), 1e-3);
+    float3 myChroma = me.rgb / myLum;
+
+    float3 accC = myChroma * me.a; float wsum = me.a + 1e-4; float accConf = me.a;
+    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    [unroll] for (int dx = -1; dx <= 1; ++dx)
+    {
+        if (dx == 0 && dy == 0) continue;
+        float2 nuv = uv + float2((float)dx * st * texel.x, (float)dy * st * texel.y);
+        nuv.x = clamp(nuv.x, paneMin + texel.x, paneMax - texel.x);   // stay in this eye's half
+        float4 n = srcTex.SampleLevel(samp, nuv, 0.0);
+        float  nLum = max(dot(n.rgb, float3(0.299, 0.587, 0.114)), 1e-3);
+        float  wl = exp(-abs(myLum - nLum) * 10.0);   // edge-aware (region boundary)
+        float  w = n.a * wl;
+        accC += (n.rgb / nLum) * w; wsum += w; accConf = max(accConf, n.a * wl);
+    }
+    float3 chroma = lerp(accC / wsum, myChroma, me.a);   // confident pixels keep their own
+    return float4(saturate(chroma * myLum), saturate(accConf));
+}
+)HLSL"
+R"HLSL(
 float4 PSMain(VSOut i) : SV_Target
 {
     if (g_format == 99) return srcTex.Sample(samp, i.uv);   // 1:1 copy (history blit)
@@ -357,30 +395,29 @@ float4 PSMain(VSOut i) : SV_Target
             // reference's gradient energy, blending them toward this eye's luminance
             // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
             // colour is preserved (this is NOT a global desaturation).
-            // FLOORED so flat regions still keep some borrowed colour (less
-            // desaturation) while structure ramps it to full. The floor lets a little
-            // colour through where the match is weak -- the cost of not desaturating.
+            // Confidence of this pixel's cross-eye borrow = reference-channel
+            // structure x match quality. Written to ALPHA; the colour-propagation
+            // pass keeps confident pixels and OVERWRITES low-confidence ones (flat
+            // regions, occlusions, spurious-red borrows) with colour diffused from
+            // reliable same-region neighbours -- SIRA-style colorization without
+            // desaturation (real colour) or eye-mixing (no bleed).
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float borrowTrust = saturate(0.3 + saturate(refEnergy * 8.0) * 0.7);
+            float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2);
 
             // Block processing (SIRA): borrow the aligned colour as a small patch
-            // average, not a single pixel, to smooth residual fringing.
+            // average. FULL borrow here; propagation cleans up the low-confidence ones.
             float3 there = 0;
             [unroll] for (int by = -1; by <= 1; ++by)
             [unroll] for (int bx = -1; bx <= 1; ++bx)
                 there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
             there /= 9.0;
 
-            // PER-EYE result: each eye keeps its OWN channel(s) and takes only the
-            // missing channel(s) from the disparity-aligned borrow (faded to neutral
-            // by borrowTrust). No shared-chroma fallback -> the anaglyph's two eyes are
-            // never mixed, so no red/cyan colour bleed and no muddiness.
-            float3 alignedCol = (eye == 0)
-                ? float3(c.r, lerp(eyeY, there.g, borrowTrust), lerp(eyeY, there.b, borrowTrust))
-                : float3(lerp(eyeY, there.r, borrowTrust), c.g, c.b);
+            // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
+            float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
+                                           : float3(there.r, c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            return float4(saturate(alignedCol * (eyeY / aY)), 1);
+            return float4(saturate(alignedCol * (eyeY / aY)), conf);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
@@ -454,7 +491,7 @@ float4 PSMain(VSOut i) : SV_Target
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
                float ndTrans; float fpEyeFrac; float fpGapFrac; float pad2;
-               float dispMaxUV; float coarseW; float coarseH; float pad3; };
+               float dispMaxUV; float coarseW; float coarseH; float propStride; };
 }
 
 Converter::~Converter()
@@ -503,6 +540,7 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         { "PSAnaRefine", &m_psRefine },
         { "PSAnaFill",   &m_psFill   },
         { "PSAnaSmooth", &m_psSmooth },
+        { "PSAnaProp",   &m_psProp   },
     };
     for (auto& p : passes)
     {
@@ -570,6 +608,11 @@ bool Converter::EnsureOutput(int width, int height)
     if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_outTex))) return false;
     if (FAILED(m_device->CreateRenderTargetView(m_outTex, nullptr, &m_outRTV))) { ReleaseOutput(); return false; }
     if (FAILED(m_device->CreateShaderResourceView(m_outTex, nullptr, &m_outSRV))) { ReleaseOutput(); return false; }
+
+    // Ping-pong twin for colour-propagation passes.
+    if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_outTex2))) { ReleaseOutput(); return false; }
+    if (FAILED(m_device->CreateRenderTargetView(m_outTex2, nullptr, &m_outRTV2))) { ReleaseOutput(); return false; }
+    if (FAILED(m_device->CreateShaderResourceView(m_outTex2, nullptr, &m_outSRV2))) { ReleaseOutput(); return false; }
 
     m_outWidth  = width;
     m_outHeight = height;
@@ -678,6 +721,32 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(0, 3, nulls);
     }
 
+    // Colour-propagation passes (anaglyph recovery): a-trous edge-aware chroma
+    // diffusion spreading confident recovered colour into low-confidence pixels.
+    // Ping-pong m_outTex <-> m_outTex2 with increasing stride; an even number of
+    // passes leaves the result back in m_outTex (= OutputSRV).
+    if (anaRecover && m_outTex2)
+    {
+        D3D11_VIEWPORT vp{};
+        vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
+        m_context->RSSetViewports(1, &vp);
+        m_context->PSSetShader(m_psProp, nullptr, 0);
+        const float strides[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
+        for (int pass = 0; pass < 4; ++pass)
+        {
+            CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
+                    0, 0, 0, 0, dispMaxUV, 0, 0, strides[pass] };
+            m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &pcb, 0, 0);
+            ID3D11ShaderResourceView* in  = (pass % 2 == 0) ? m_outSRV : m_outSRV2;
+            ID3D11RenderTargetView*   out = (pass % 2 == 0) ? m_outRTV2 : m_outRTV;
+            m_context->OMSetRenderTargets(1, &out, nullptr);
+            m_context->PSSetShaderResources(0, 1, &in);
+            m_context->Draw(3, 0);
+            ID3D11ShaderResourceView* nullSRV = nullptr;
+            m_context->PSSetShaderResources(0, 1, &nullSRV);
+        }
+    }
+
     // Pass 2 (Pulfrich): copy the current source into the history ring for later.
     if (pulfrich && m_histRTV[m_histWrite])
     {
@@ -739,6 +808,9 @@ void Converter::ReleaseOutput()
     SAFE_RELEASE(m_outSRV);
     SAFE_RELEASE(m_outRTV);
     SAFE_RELEASE(m_outTex);
+    SAFE_RELEASE(m_outSRV2);
+    SAFE_RELEASE(m_outRTV2);
+    SAFE_RELEASE(m_outTex2);
     m_outWidth = m_outHeight = 0;
 }
 
@@ -785,6 +857,7 @@ void Converter::Shutdown()
     ReleaseDisparity();
     SAFE_RELEASE(m_cbuffer);
     SAFE_RELEASE(m_sampler);
+    SAFE_RELEASE(m_psProp);
     SAFE_RELEASE(m_psSmooth);
     SAFE_RELEASE(m_psFill);
     SAFE_RELEASE(m_psRefine);
