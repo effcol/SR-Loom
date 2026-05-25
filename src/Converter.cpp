@@ -393,30 +393,34 @@ float4 PSMain(VSOut i) : SV_Target
 
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
 
-            // Borrow trust = reference-channel structure (red for the left eye, green
-            // for the right). Where that channel is flat the match is meaningless and
-            // the borrow lands anywhere -> spurious colour blob. Confidence (for the
-            // propagation pass, written to ALPHA) also folds in match quality.
+            // Borrow trust: the disparity match relies on the REFERENCE channel (red
+            // for the left eye, green for the right). Where that channel is flat the
+            // match is meaningless and the borrow lands anywhere -> spurious cross-eye
+            // colour (the high-contrast red). Gate ONLY the borrowed channel(s) by the
+            // reference's gradient energy, blending them toward this eye's luminance
+            // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
+            // colour is preserved (this is NOT a global desaturation).
+            // Confidence of this pixel's cross-eye borrow = reference-channel
+            // structure x match quality. Written to ALPHA; the colour-propagation
+            // pass keeps confident pixels and OVERWRITES low-confidence ones (flat
+            // regions, occlusions, spurious-red borrows) with colour diffused from
+            // reliable same-region neighbours -- SIRA-style colorization without
+            // desaturation (real colour) or eye-mixing (no bleed).
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float borrowTrust = saturate(refEnergy * 8.0);
-            float conf = borrowTrust * saturate(1.0 - bs * 1.2);
+            float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2);
 
-            // Block processing (SIRA): borrow the aligned colour as a small patch avg.
+            // Block processing (SIRA): borrow the aligned colour as a small patch
+            // average. FULL borrow here; propagation cleans up the low-confidence ones.
             float3 there = 0;
             [unroll] for (int by = -1; by <= 1; ++by)
             [unroll] for (int bx = -1; bx <= 1; ++bx)
                 there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
             there /= 9.0;
 
-            // Each eye's OWN channel(s) are ALWAYS kept at full colour (no global
-            // desaturation); only the BORROWED channel(s) fade toward this eye's
-            // luminance where the match is unreliable -> a wrong borrow can't paint a
-            // spurious colour blob. Propagation then fills the borrowed colour from
-            // confident neighbours on top of this clean base.
-            float3 alignedCol = (eye == 0)
-                ? float3(c.r, lerp(eyeY, there.g, borrowTrust), lerp(eyeY, there.b, borrowTrust))
-                : float3(lerp(eyeY, there.r, borrowTrust), c.g, c.b);
+            // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
+            float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
+                                           : float3(there.r, c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
             return float4(saturate(alignedCol * (eyeY / aY)), conf);
         }
@@ -732,8 +736,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
         m_context->RSSetViewports(1, &vp);
         m_context->PSSetShader(m_psProp, nullptr, 0);
-        const float strides[6] = { 1.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f };
-        for (int pass = 0; pass < 6; ++pass)
+        const float strides[4] = { 1.0f, 2.0f, 4.0f, 8.0f };
+        for (int pass = 0; pass < 4; ++pass)
         {
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
                     0, 0, 0, 0, dispMaxUV, 0, 0, strides[pass] };
