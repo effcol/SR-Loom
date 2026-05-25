@@ -426,24 +426,29 @@ float4 PSMain(VSOut i) : SV_Target
             // desaturation (real colour) or eye-mixing (no bleed).
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            // x baseConf folds in the disparity map's left-right consistency AND match
-            // uniqueness, so a confidently-WRONG borrow (e.g. ambiguous text strokes,
-            // high contrast but a rival match) is now low-confidence and gets filled.
+            // baseConf folds in left-right consistency + match uniqueness; with the
+            // reference structure and match quality this is how much we trust the
+            // disparity-corrected BORROW vs the local colour prior below.
             float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
 
-            // Block processing (SIRA): borrow the aligned colour as a small patch
-            // average. FULL borrow here; propagation cleans up the low-confidence ones.
+            // Block processing (SIRA): the disparity-aligned borrow as a small patch avg.
             float3 there = 0;
             [unroll] for (int by = -1; by <= 1; ++by)
             [unroll] for (int bx = -1; bx <= 1; ++bx)
                 there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
             there /= 9.0;
 
-            // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
-            float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
-                                           : float3(there.r, c.g, c.b);
+            // LOCAL COLOUR PRIOR (Williem et al. 2015): the borrowed channel falls back
+            // to this pixel's OWN local channel (the anaglyph's same channel, which is
+            // the same view content just not disparity-shifted) where the match is
+            // unreliable. So a confident match de-fringes via the borrow, but a bad one
+            // can NEVER invent colour the pixel didn't locally have -> a neutral/grey
+            // area stays neutral instead of getting a spurious red/cyan splotch.
+            float3 alignedCol = (eye == 0)
+                ? float3(c.r, lerp(c.g, there.g, conf), lerp(c.b, there.b, conf))
+                : float3(lerp(c.r, there.r, conf), c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
+            return float4(saturate(alignedCol * (eyeY / aY)), 1.0);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
@@ -761,10 +766,11 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(0, 3, nulls);
     }
 
-    // Push-pull colorization (anaglyph recovery): split the recovered SBS into two
-    // premultiplied per-eye pyramids, GenerateMips (= confidence-weighted averages),
-    // then re-compose, filling low-confidence pixels from the coarsest valid colour.
-    if (anaRecover && m_ppLeftRTV && m_ppRightRTV)
+    // Push-pull colorization is DISABLED: the compose's local-colour-prior fallback
+    // handles low-confidence pixels safely (never inventing colour), whereas the
+    // pyramid's regional averaging could itself shift colour. Kept for reference /
+    // possible re-enable.
+    if (false && anaRecover && m_ppLeftRTV && m_ppRightRTV)
     {
         auto cbProp = [&](float v) {
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
