@@ -285,7 +285,12 @@ float4 PSAnaProp(VSOut i) : SV_Target
     float  myLum = max(dot(me.rgb, float3(0.299, 0.587, 0.114)), 1e-3);
     float3 myChroma = me.rgb / myLum;
 
-    float3 accC = myChroma * me.a; float wsum = me.a + 1e-4; float accConf = me.a;
+    // Minimum self-weight: where a whole region is low-confidence there are no
+    // confident neighbours to diffuse from, so without an anchor the weighted sum
+    // collapses to 0 -> chroma 0 -> BLACK. The anchor keeps the pixel's own colour
+    // (luminance preserved); confident neighbours still dominate when present.
+    float anchor = max(me.a, 0.05);
+    float3 accC = myChroma * anchor; float wsum = anchor; float accConf = me.a;
     [unroll] for (int dy = -1; dy <= 1; ++dy)
     [unroll] for (int dx = -1; dx <= 1; ++dx)
     {
