@@ -357,9 +357,12 @@ float4 PSMain(VSOut i) : SV_Target
             // reference's gradient energy, blending them toward this eye's luminance
             // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
             // colour is preserved (this is NOT a global desaturation).
+            // FLOORED so flat regions still keep some borrowed colour (less
+            // desaturation) while structure ramps it to full. The floor lets a little
+            // colour through where the match is weak -- the cost of not desaturating.
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float borrowTrust = saturate(refEnergy * 8.0);
+            float borrowTrust = saturate(0.3 + saturate(refEnergy * 8.0) * 0.7);
 
             // Block processing (SIRA): borrow the aligned colour as a small patch
             // average, not a single pixel, to smooth residual fringing.
@@ -368,22 +371,16 @@ float4 PSMain(VSOut i) : SV_Target
             [unroll] for (int bx = -1; bx <= 1; ++bx)
                 there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
             there /= 9.0;
+
+            // PER-EYE result: each eye keeps its OWN channel(s) and takes only the
+            // missing channel(s) from the disparity-aligned borrow (faded to neutral
+            // by borrowTrust). No shared-chroma fallback -> the anaglyph's two eyes are
+            // never mixed, so no red/cyan colour bleed and no muddiness.
             float3 alignedCol = (eye == 0)
                 ? float3(c.r, lerp(eyeY, there.g, borrowTrust), lerp(eyeY, there.b, borrowTrust))
                 : float3(lerp(eyeY, there.r, borrowTrust), c.g, c.b);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            float3 aligned = saturate(alignedCol * (eyeY / aY));
-
-            // Low-confidence fallback: shared, horizontally-blurred chroma.
-            float3 acc = 0;
-            [unroll] for (int k = -4; k <= 4; ++k)
-                acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
-            float3 blurCol = acc / 9.0;
-            float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            float3 sharedCol = saturate(blurCol * (eyeY / bY));
-
-            float conf = baseConf * saturate(1.0 - bs * 1.5);
-            return float4(lerp(sharedCol, aligned, conf), 1);
+            return float4(saturate(alignedCol * (eyeY / aY)), 1);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
