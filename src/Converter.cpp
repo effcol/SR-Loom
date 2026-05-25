@@ -170,8 +170,8 @@ float4 PSAnaDisp(VSOut i) : SV_Target
         if (sadR < bestR) { if (abs(k - bkR) > 2) secondR = bestR; bestR = sadR; dR = d; bkR = k; }
         else if (sadR < secondR && abs(k - bkR) > 2) secondR = sadR;
     }
-    float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 3.0);
-    float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 3.0);
+    float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 5.0);
+    float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 5.0);
     return float4(dL, dR, uniqL, uniqR);
 }
 
@@ -376,7 +376,11 @@ float4 PSMain(VSOut i) : SV_Target
             float py = 1.0 / g_srcH;
             float4 dC = dispTex.SampleLevel(samp, e, 0.0);       // (dLR, dRL, confL, confR)
             float d0 = (eye == 0) ? dC.r : dC.g;                 // this eye -> the other
-            float baseConf = (eye == 0) ? dC.b : dC.a;           // consistency x uniqueness, per eye
+            // COUPLE the eyes: a region unreliable in EITHER eye is treated unreliable
+            // in BOTH (min), so it's inpainted symmetrically -> no one-eye-clean /
+            // other-eye-splotch rivalry. (Both pyramids are regional averages of the
+            // same scene, so they fill to near-identical colour.)
+            float baseConf = min(dC.b, dC.a);                    // consistency x uniqueness, coupled
 
             // Reference gradient descriptor at e (red for the left eye, green for the
             // right) for the full-res gradient-matching refine.
