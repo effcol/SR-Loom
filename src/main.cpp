@@ -50,6 +50,7 @@ namespace
         int          pulfrichNd     = 1;   // ND level index (default Medium)
         int          framePackMode  = 0;   // FramePackPresets index (0 = 1080p)
         HWND       sourceWindow   = nullptr; // tracked window in WindowOverlay mode
+        HWND       lastForeground = nullptr; // last real foreground window (for "make active window 3D")
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
         bool       captureRebind  = false;   // re-register SRV on next frame
@@ -256,6 +257,30 @@ namespace
         app.tray.SetTooltip(enable ? "SR Weaver — weaving" : "SR Weaver — paused (SR off)");
     }
 
+    // Selecting a source or format turns weaving ON if it isn't already (so the 3D
+    // comes on automatically); if it already is, just re-apply the current mode.
+    void EnsureWeaving(AppState& app)
+    {
+        if (app.weavingEnabled) ApplyMode(app);
+        else                    SetWeaving(app, true);
+    }
+
+    // Record the most recent "real" foreground window (not ours, the shell, or a
+    // menu), so "Make active window 3D" can target it even though clicking the tray
+    // menu changes the foreground. Called each loop iteration.
+    void UpdateLastForeground(AppState& app)
+    {
+        HWND fg = GetForegroundWindow();
+        if (!fg || fg == app.hwnd || !IsWindowVisible(fg))
+            return;
+        char cls[64] = {};
+        GetClassNameA(fg, cls, (int)sizeof(cls));
+        if (strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "Shell_TrayWnd") == 0 ||
+            strcmp(cls, "#32768") == 0)   // popup menu class
+            return;
+        app.lastForeground = fg;
+    }
+
     // --- Source selection -------------------------------------------------
 
     void UseTestImage(AppState& app)
@@ -270,7 +295,7 @@ namespace
         app.captureRebind = true;   // rebind the weaver to the converter output
         if (app.mode == OutputMode::WindowOverlay)   // overlay only makes sense for a window
             app.mode = OutputMode::Fullscreen;
-        if (app.weavingEnabled) ApplyMode(app);
+        EnsureWeaving(app);
     }
 
     // Load the bundled anaglyph test image and switch to the Anaglyph format so the
@@ -288,7 +313,7 @@ namespace
         app.captureRebind = true;
         if (app.mode == OutputMode::WindowOverlay)
             app.mode = OutputMode::Fullscreen;
-        if (app.weavingEnabled) ApplyMode(app);
+        EnsureWeaving(app);
     }
 
     // Capture a window and present it as an in-place 3D overlay tracking that window.
@@ -300,15 +325,24 @@ namespace
             app.sourceWindow = target;
             app.captureRebind = true;   // re-register the SRV once frames arrive
             app.mode = OutputMode::WindowOverlay;
-            if (app.weavingEnabled) ApplyMode(app);
+            EnsureWeaving(app);
         }
     }
 
-    // Grab whatever window is currently focused (Ctrl+Alt+C).
+    // Make the active window 3D (tray item / Ctrl+Alt+C). GetForegroundWindow() works
+    // for the hotkey, but the tray menu steals focus, so fall back to the last real
+    // foreground window we tracked -> targets the user's window, not the test image.
     void CaptureForeground(AppState& app)
     {
         HWND fg = GetForegroundWindow();
-        Log("CaptureForeground: fg=%p app.hwnd=%p", (void*)fg, (void*)app.hwnd);
+        char cls[64] = {};
+        if (fg) GetClassNameA(fg, cls, (int)sizeof(cls));
+        const bool ours = !fg || fg == app.hwnd || !IsWindow(fg) ||
+                          strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "Shell_TrayWnd") == 0 ||
+                          strcmp(cls, "#32768") == 0;
+        if (ours)
+            fg = app.lastForeground;   // menu had focus; use the window active before it
+        Log("CaptureForeground: target=%p app.hwnd=%p", (void*)fg, (void*)app.hwnd);
         if (fg && fg != app.hwnd && IsWindow(fg))
             UseWindow(app, fg);
     }
@@ -500,7 +534,7 @@ namespace
                 int n = 0;
                 const StereoFormatEntry* fmts = StereoFormatList(n);
                 const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
-                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; }
+                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; EnsureWeaving(*app); }
                 return 0;
             }
             // Anaglyph colour combo / decode mode (also selects the Anaglyph format).
@@ -509,6 +543,7 @@ namespace
                 app->anaglyphCombo = (int)(cmd - ID_TRAY_ANA_COMBO_BASE);
                 app->format = StereoFormat::Anaglyph;
                 app->captureRebind = true;
+                EnsureWeaving(*app);
                 return 0;
             }
             if (cmd >= ID_TRAY_ANA_MODE_BASE && cmd <= ID_TRAY_ANA_MODE_MAX)
@@ -516,6 +551,7 @@ namespace
                 app->anaglyphMode = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
                 app->format = StereoFormat::Anaglyph;
                 app->captureRebind = true;
+                EnsureWeaving(*app);
                 return 0;
             }
             // Pulfrich sub-options (each also selects the Pulfrich format).
@@ -530,6 +566,7 @@ namespace
                                                                         : PulfrichMode::NDFilter;
                 app->format = StereoFormat::Pulfrich;
                 app->captureRebind = true;
+                EnsureWeaving(*app);
                 return 0;
             }
             if (cmd >= ID_TRAY_FP_BASE && cmd <= ID_TRAY_FP_MAX)
@@ -537,6 +574,7 @@ namespace
                 app->framePackMode = (int)(cmd - ID_TRAY_FP_BASE);
                 app->format = StereoFormat::FramePacking;
                 app->captureRebind = true;
+                EnsureWeaving(*app);
                 return 0;
             }
 
@@ -563,13 +601,13 @@ namespace
             case ID_TRAY_SRC_MONITOR:
                 UsePassthrough(*app);
                 if (app->mode == OutputMode::WindowOverlay) app->mode = OutputMode::Fullscreen;
-                if (app->weavingEnabled) ApplyMode(*app);
+                EnsureWeaving(*app);
                 return 0;
             case ID_TRAY_LOOKING_GLASS:
                 UsePassthrough(*app);
                 app->mode = OutputMode::LookingGlass;
                 app->loupeInteractive = false;  // click-through by default; Ctrl+Alt to move
-                if (app->weavingEnabled) ApplyMode(*app);
+                EnsureWeaving(*app);
                 return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
             }
@@ -734,7 +772,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             DispatchMessage(&msg);
         }
         if (running)
+        {
+            UpdateLastForeground(app);   // remember the user's active window for "make 3D"
             RenderFrame(app);
+        }
     }
 
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
