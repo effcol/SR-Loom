@@ -152,7 +152,12 @@ float4 PSAnaDisp(VSOut i) : SV_Target
 
     float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
 
-    float bestL = 1e9, dL = 0.0, bestR = 1e9, dR = 0.0;
+    // Track the best match AND the best RIVAL (lowest cost at least 3 steps away from
+    // the best) per direction. A unique match has its rival much higher; a repetitive
+    // / ambiguous one (e.g. thin text strokes) has a near-equal rival -> low
+    // uniqueness, which later flags the (confidently-wrong) borrow as low-confidence.
+    float bestL = 1e9, dL = 0.0, secondL = 1e9; int bkL = -999;
+    float bestR = 1e9, dR = 0.0, secondR = 1e9; int bkR = -999;
     [loop] for (int k = -N; k <= N; ++k)
     {
         float d = (float)k * step;
@@ -160,10 +165,14 @@ float4 PSAnaDisp(VSOut i) : SV_Target
         float bias = abs(d) / max(maxD, 1e-4) * 0.06;
         float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
         float sadR = descCost(refGrn, cRed) + bias;   // dRL: green ref vs red candidate
-        if (sadL < bestL) { bestL = sadL; dL = d; }
-        if (sadR < bestR) { bestR = sadR; dR = d; }
+        if (sadL < bestL) { if (abs(k - bkL) > 2) secondL = bestL; bestL = sadL; dL = d; bkL = k; }
+        else if (sadL < secondL && abs(k - bkL) > 2) secondL = sadL;
+        if (sadR < bestR) { if (abs(k - bkR) > 2) secondR = bestR; bestR = sadR; dR = d; bkR = k; }
+        else if (sadR < secondR && abs(k - bkR) > 2) secondR = sadR;
     }
-    return float4(dL, dR, 0, 0);
+    float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 3.0);
+    float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 3.0);
+    return float4(dL, dR, uniqL, uniqR);
 }
 
 // Pyramid refine: start from a coarser level (dispTex = prior) and do a local
@@ -173,7 +182,8 @@ float4 PSAnaRefine(VSOut i) : SV_Target
     float2 uv  = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     float  ty = 1.0 / max(g_coarseH, 1.0);
-    float2 prior = dispTex.SampleLevel(samp, uv, 0.0).rg;
+    float4 priorAll = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .ba uniqueness
+    float2 prior = priorAll.rg;
     const int M = 6;
 
     float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
@@ -190,7 +200,7 @@ float4 PSAnaRefine(VSOut i) : SV_Target
         if (sadL < bestL) { bestL = sadL; dL = ddL; }
         if (sadR < bestR) { bestR = sadR; dR = ddR; }
     }
-    return float4(dL, dR, 0, 0);
+    return float4(dL, dR, priorAll.b, priorAll.a);   // carry uniqueness through
 }
 
 // Occlusion fill: flag pixels failing the left-right consistency check, then fill
@@ -203,13 +213,16 @@ float4 PSAnaFill(VSOut i) : SV_Target
     float2 uv  = i.uv;
     float  ctx = 1.0 / max(g_coarseW, 1.0);
     float  inv = 1.0 / max(g_dispMaxUV, 1e-4);
-    float2 d = dispTex.SampleLevel(samp, uv, 0.0).rg;
+    float4 dd = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .b uniqL, .a uniqR
+    float2 d = dd.rg;
 
     float backR = dispTex.SampleLevel(samp, float2(uv.x + d.r, uv.y), 0.0).g;
     float backL = dispTex.SampleLevel(samp, float2(uv.x + d.g, uv.y), 0.0).r;
     float cons  = max(abs(d.r + backR), abs(d.g + backL));
     float conf  = saturate(1.0 - cons * inv * 4.0);
-    if (conf > 0.5) return float4(d, conf, 0);
+    // Final per-eye confidence = left-right consistency x match uniqueness. Output
+    // confL in .b (drives the left eye), confR in .a (right eye).
+    if (conf > 0.5) return float4(d, dd.b * conf, dd.a * conf);
 
     float3 myCol = srcTex.SampleLevel(samp, uv, 0.0).rgb;
     float  best  = 1e9; float2 bestD = d; bool found = false;
@@ -229,7 +242,8 @@ float4 PSAnaFill(VSOut i) : SV_Target
             }
         }
     }
-    return float4(bestD, found ? 0.4 : 0.2, 0);
+    float fc = found ? 0.4 : 0.2;   // occluded -> low confidence (push-pull will fill)
+    return float4(bestD, fc, fc);
 }
 
 // Edge-aware disparity smoothing (shader-feasible stand-in for SIRA's superpixel
@@ -243,7 +257,7 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
     float  ty = 1.0 / max(g_coarseH, 1.0);
     float3 c0 = srcTex.SampleLevel(samp, uv, 0.0).rgb;
     float  y0 = c0.r + c0.g;                       // red+green luminance proxy
-    float  myConf = dispTex.SampleLevel(samp, uv, 0.0).b;
+    float2 myConf = dispTex.SampleLevel(samp, uv, 0.0).ba;   // per-eye confidence (.b left, .a right)
 
     float2 acc = 0; float wsum = 0;
     const int R = 2;
@@ -255,10 +269,10 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
         float3 nc  = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
         float  ws  = exp(-(float)(dx * dx + dy * dy) / 8.0);   // spatial
         float  wl  = exp(-abs(y0 - (nc.r + nc.g)) * 6.0);      // luminance (edge-aware)
-        float  w   = ws * wl * (0.2 + nd.b);                   // trust confident neighbours
+        float  w   = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
         acc += nd.rg * w; wsum += w;
     }
-    return float4(acc / max(wsum, 1e-4), myConf, 0);
+    return float4(acc / max(wsum, 1e-4), myConf.x, myConf.y);
 }
 )HLSL"
 R"HLSL(
@@ -360,9 +374,9 @@ float4 PSMain(VSOut i) : SV_Target
         {
             float px = 1.0 / g_srcW;
             float py = 1.0 / g_srcH;
-            float3 dC = dispTex.SampleLevel(samp, e, 0.0).rgb;   // (dLR, dRL, confidence)
+            float4 dC = dispTex.SampleLevel(samp, e, 0.0);       // (dLR, dRL, confL, confR)
             float d0 = (eye == 0) ? dC.r : dC.g;                 // this eye -> the other
-            float baseConf = dC.b;                               // from the fill pass
+            float baseConf = (eye == 0) ? dC.b : dC.a;           // consistency x uniqueness, per eye
 
             // Reference gradient descriptor at e (red for the left eye, green for the
             // right) for the full-res gradient-matching refine.
@@ -408,7 +422,10 @@ float4 PSMain(VSOut i) : SV_Target
             // desaturation (real colour) or eye-mixing (no bleed).
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2);
+            // x baseConf folds in the disparity map's left-right consistency AND match
+            // uniqueness, so a confidently-WRONG borrow (e.g. ambiguous text strokes,
+            // high contrast but a rival match) is now low-confidence and gets filled.
+            float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
 
             // Block processing (SIRA): borrow the aligned colour as a small patch
             // average. FULL borrow here; propagation cleans up the low-confidence ones.
