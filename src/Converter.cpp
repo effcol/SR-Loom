@@ -344,23 +344,29 @@ float4 PSMain(VSOut i) : SV_Target
 
             // Confidence = fill confidence x match quality x reference STRUCTURE.
             // A flat reference channel (e.g. green in a saturated-red area) makes the
-            // match meaningless and lets the right eye borrow red from an arbitrary
-            // location -> spurious red. Low gradient energy -> low confidence.
+            // match unreliable and lets the right eye borrow red from an arbitrary
+            // location. The structure term is GENTLE and FLOORED (>=0.25) so it only
+            // nudges flat regions toward shared chroma -- it must NOT desaturate the
+            // (many) smooth-but-correctly-coloured regions.
             float refEnergy = 0;
             [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            float conf = baseConf * saturate(1.0 - bs * 1.5) * saturate(refEnergy * 8.0);
+            float conf = baseConf * saturate(1.0 - bs * 1.5) * saturate(0.25 + refEnergy * 6.0);
 
-            // Low-confidence fallback is GREY (this eye's own luminance) -- NOT the
-            // anaglyph's own chroma, which mixes both eyes and bleeds the other eye's
-            // colour (e.g. left's red) into this one.
-            float3 col = lerp(float3(eyeY, eyeY, eyeY), aligned, conf);
+            // Low-confidence fallback: shared, horizontally-blurred chroma -- keeps the
+            // region's colour (rivalry-free) instead of the aligned borrow.
+            float3 acc = 0;
+            [unroll] for (int k = -4; k <= 4; ++k)
+                acc += srcTex.SampleLevel(samp, float2(e.x + (float)k * px, e.y), 0.0).rgb;
+            float3 blurCol = acc / 9.0;
+            float bY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
+            float3 sharedCol = saturate(blurCol * (eyeY / bY));
+            float3 col = lerp(sharedCol, aligned, conf);
 
-            // Saturation gate: weak chroma is almost always residual red/cyan fringe
-            // (or a monochrome region), so pull it to grey; genuine colour (high
-            // saturation) is kept. Cleans fringing in mono / mostly-mono content.
+            // Saturation gate: ONLY the very faintest chroma (residual red/cyan fringe
+            // / near-monochrome) is pulled to grey; genuine colour is left alone.
             float lum = dot(col, float3(0.299, 0.587, 0.114));
             float sat = length(col - lum);
-            col = lerp(float3(lum, lum, lum), col, smoothstep(0.03, 0.10, sat));
+            col = lerp(float3(lum, lum, lum), col, smoothstep(0.02, 0.07, sat));
             return float4(col, 1);
         }
 
