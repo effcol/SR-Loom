@@ -129,6 +129,9 @@ namespace srw
             { StereoFormat::RowInterleaved,    "Row interleaved" },
             { StereoFormat::ColumnInterleaved, "Column interleaved" },
             { StereoFormat::Checkerboard,      "Checkerboard" },
+            { StereoFormat::FrameSequential,   "Frame sequential" },
+            { StereoFormat::Pulfrich,          "Pulfrich" },
+            { StereoFormat::FramePacking,      "Frame packing" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));
         return list;
@@ -152,11 +155,11 @@ namespace srw
     inline const AnaglyphModeEntry* AnaglyphModeList(int& count)
     {
         static const AnaglyphModeEntry modes[] = {
-            { "Recovered colour",     4 },   // multi-scale disparity recovery (default, top)
-            { "DeAnaglyph",           0 },   // per-eye luminance + shared anaglyph chroma
-            { "Colour (filtered)",    1 },   // each eye keeps only its own channels
-            { "Half colour",          2 },   // half saturation, full per-eye brightness
-            { "Mono (black & white)", 3 },
+            { "Recovered Colour",          4 },   // multi-scale disparity recovery (default, top)
+            { "DeAnaglyph",                0 },   // per-eye luminance + shared anaglyph chroma
+            { "Filtered Colour",           1 },   // each eye keeps only its own channels
+            { "Half Colour",               2 },   // half saturation, full per-eye brightness
+            { "Monochrome (Black & White)", 3 },
         };
         count = (int)(sizeof(modes) / sizeof(modes[0]));
         return modes;
@@ -173,7 +176,7 @@ namespace srw
     // Show a modal error box (used for unrecoverable startup failures).
     inline void ShowError(const char* msg)
     {
-        ::MessageBoxA(nullptr, msg, "SR Weaver", MB_ICONERROR | MB_OK);
+        ::MessageBoxA(nullptr, msg, "SR Loom", MB_ICONERROR | MB_OK);
 #ifdef _DEBUG
         ::OutputDebugStringA(msg);
         ::OutputDebugStringA("\n");

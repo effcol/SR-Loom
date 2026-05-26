@@ -1,65 +1,82 @@
-# SR Weaver
+# SR Loom
 
-A Windows system-tray app that weaves stereo 3D onto **Simulated Reality**
+A lightweight Windows tray app that weaves stereo 3D onto **Simulated Reality**
 displays (Samsung Odyssey 3D, Acer SpatialLabs, and other LeiaSR / Dimenco
-panels). It takes a stereo source — eventually captured from any window or the
-whole screen — converts it to the side-by-side form the SR weaver consumes, and
-weaves it with head-tracked depth, in either a window or fullscreen.
+panels). Point it at your screen, a window, or a floating "looking glass," pick
+the stereo format your content is in, and it converts and weaves it with
+head-tracked depth — no glasses.
 
-> Status: **Milestone 2** — live capture (Windows.Graphics.Capture) of a chosen
-> window or the primary monitor, woven as full SBS, selectable from the tray.
-> The format-conversion stage (TAB / anaglyph / interleaved / etc. → SBS) is
-> next.
+> **v1.0** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
+> display and the SR Platform runtime installed.
 
-## How it works
+## What it does
 
-The LeiaSR weaver always takes a **full side-by-side (SBS)** texture and produces
-the lenticular, eye-tracked output for the SR display. So the pipeline is:
+The LeiaSR weaver always takes a **full side-by-side (SBS)** texture and
+produces the lenticular, eye-tracked output. SR Loom captures your source,
+converts whatever stereo layout it's in to SBS with a GPU shader, then weaves:
 
 ```
-capture source  ->  convert any stereo format to SBS  ->  weaver.weave()  ->  present
-   (later)              (later: shaders)                  (SR SDK)         (window/fullscreen)
+capture (screen / window)  ->  convert any stereo format to SBS  ->  weave  ->  present
 ```
 
-Milestone 1 skips capture/convert and feeds a built-in SBS image directly to the
-weaver to validate the SDK, window, and tray plumbing.
+### Stereo input formats
+- **Side-by-Side** (Full / Half)
+- **Top-and-Bottom** (Full / Half)
+- **Interleaved** (Row / Column)
+- **Checkerboard**
+- **Anaglyph** — with colour-recovery decode modes (recovered / filtered / half / mono)
+- **Frame Sequential** (temporal)
+- **Pulfrich Effect** (time-delay or ND-filter)
+- **Frame Packing**
 
-## Building
-
-Requires Visual Studio 2022/2026 (Desktop C++), CMake ≥ 3.21, and the installed
-**SR Platform runtime** (the SR Service must be running).
-
-> The `lib/` folder (SR SDKs and helper repos) is **not** tracked in git. Place
-> the LeiaSR SDKs there locally:
-> `lib/Simulated Reality/LeiaSR-SDK-1.36.2-win64` (x64) and
-> `lib/Simulated Reality/simulatedreality-1.34.10-win32-Release` (x86).
-
-```powershell
-# 32-bit (matches the installed 32-bit runtime; verified path)
-cmake -B build/x86 -A Win32
-cmake --build build/x86 --config Release
-
-# 64-bit (requires the 64-bit SR runtime DLLs to be present at run time)
-cmake -B build/x64 -A x64
-cmake --build build/x64 --config Release
-```
-
-The 32-bit build links the SDK in `lib/Simulated Reality/simulatedreality-1.34.10-win32-Release`;
-the 64-bit build links `lib/Simulated Reality/LeiaSR-SDK-1.36.2-win64`. Both use
-the modern `IDX11Weaver1` / `CreateDX11Weaver` API (windowed + fullscreen).
+### Display modes
+- **Monitor** — fullscreen passthrough weave of the whole SR display.
+- **Window** — pick a window; the weave overlays and tracks it.
+- **Make active window 3D** — weave whatever window you're using (Ctrl+Alt+C).
+- **Looking Glass** — a floating, draggable/resizable 3D viewport.
 
 ## Controls
 
-- **Tray right-click**: toggle weaving; choose Fullscreen / Windowed; pick a
-  **Source** (Test image, Capture primary monitor, or any open window); Exit.
-- **Ctrl+Alt+W**: enable/disable weaving.
-- **Ctrl+Alt+F**: toggle fullscreen / windowed.
+Left-click the tray icon for the control panel; right-click for a quick menu.
 
-Captured sources are currently treated as **full SBS**; point it at a window or
-screen already showing side-by-side stereo. Other layouts arrive with the
-conversion stage.
+- **Ctrl+Alt+W** — toggle weaving on/off
+- **Ctrl+Alt+F** — switch Fullscreen ⇄ Looking Glass
+- **Ctrl+Alt+C** — make the active window 3D (press again to turn it off)
+
+The panel has a compact mode (just the on/off switch + a status line) and an
+expanded mode with the display, stereo-input, and depth (convergence) controls,
+plus a light/dark theme toggle.
+
+## Requirements
+
+- 64-bit Windows 10/11
+- A Simulated Reality display + the **SR Platform runtime** installed (the SR
+  Service must be running — it provides the `SimulatedReality*.dll`s and the
+  eye-tracking)
+
+## Releasing / running
+
+The build is a **single self-contained `SRLoom.exe`** — the UI fonts are embedded
+and the MSVC runtime is statically linked, so there's nothing to ship beside it.
+The only external dependency is the SR Platform runtime, which the user already
+has installed to use the display.
+
+## Building
+
+Requires Visual Studio 2022/2026 (Desktop C++) and CMake ≥ 3.21. The build is
+**x64 only** (the SR Platform runtime only installs on 64-bit Windows).
+
+> The `lib/` folder (the proprietary SR SDK) is **not** tracked in git. Place the
+> LeiaSR SDK locally at `lib/Simulated Reality/LeiaSR-SDK-1.36.2-win64`.
+
+```powershell
+cmake -B build/x64 -A x64
+cmake --build build/x64 --config Release
+# -> build/x64/Release/SRLoom.exe
+```
 
 ## License
 
-MIT (see `LICENSE`). Links against the proprietary SR SDK, which keeps its own
-license and must be installed separately.
+MIT (see `LICENSE`). Bundles the **Inter** font (SIL Open Font License). Links
+against the proprietary **SR SDK**, which keeps its own license and must be
+installed separately.

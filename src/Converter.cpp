@@ -28,7 +28,7 @@ cbuffer Params : register(b0)
     float g_ndTrans;  // ND transmission (affected eye brightness)
     float g_fpEyeFrac; // frame packing: each eye's fraction of the source height
     float g_fpGapFrac; // frame packing: blanking gap fraction
-    float g_pad2;
+    float g_convergence; // convergence: per-eye horizontal shift (moves the zero plane)
     float g_dispMaxUV; // anaglyph recovery: max search disparity (fraction of width)
     float g_coarseW;   // coarse disparity-map width (px)
     float g_coarseH;   // coarse disparity-map height (px)
@@ -341,6 +341,10 @@ float4 PSMain(VSOut i) : SV_Target
     bool right = rightPane;
     if (g_swap) right = !right;
 
+    // Convergence: shift each eye's sampled content horizontally in opposite
+    // directions, moving the zero-disparity plane in/out of the screen.
+    e.x += (right ? -g_convergence : g_convergence);
+
     if (g_format == 1)        // Top-and-bottom: top=left, bottom=right
     {
         float2 s = float2(e.x, right ? 0.5 + e.y * 0.5 : e.y * 0.5);
@@ -481,6 +485,15 @@ float4 PSMain(VSOut i) : SV_Target
                         : (e.y * g_fpEyeFrac);
         return srcTex.Sample(samp, float2(e.x, v));
     }
+    else if (g_format == 8)   // Frame sequential: alternating L/R frames over time
+    {
+        // Each eye is a FULL frame. One eye shows the current frame, the other the
+        // previous frame (= the other eye in genuinely frame-sequential content).
+        // e.x is the within-pane 0..1, mapping to the full source. Swap eyes flips
+        // which eye is current vs previous if the parity is wrong.
+        if (right) return float4(srcTex.Sample(samp, e).rgb, 1);
+        return float4(srcPrev.Sample(samp, e).rgb, 1);
+    }
 
     // Default: side-by-side. left=left half, right=right half.
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, e.y);
@@ -500,6 +513,7 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::Checkerboard:      return 5;
         case StereoFormat::Pulfrich:          return 6;
         case StereoFormat::FramePacking:      return 7;
+        case StereoFormat::FrameSequential:   return 8;
         default:                              return 0;  // SBS (and unimplemented)
         }
     }
@@ -523,7 +537,7 @@ float4 PSMain(VSOut i) : SV_Target
 
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
-               float ndTrans; float fpEyeFrac; float fpGapFrac; float pad2;
+               float ndTrans; float fpEyeFrac; float fpGapFrac; float convergence;
                float dispMaxUV; float coarseW; float coarseH; float propStride; };
 }
 
@@ -673,8 +687,11 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     if (!source || !m_ps || srcWidth <= 0 || srcHeight <= 0)
         return false;
 
+    // Temporal formats need the frame-history ring: Pulfrich (delayed/ND eye) and
+    // Frame-sequential (the previous frame IS the other eye).
     const bool pulfrich = (m_fmt == StereoFormat::Pulfrich);
-    if (!pulfrich) ReleaseHistory();   // free the ring when not needed
+    const bool temporal = pulfrich || (m_fmt == StereoFormat::FrameSequential);
+    if (!temporal) ReleaseHistory();   // free the ring when not needed
 
     int ew = 0, eh = 0;
     PerEyeSize(m_fmt, srcWidth, srcHeight, ew, eh);
@@ -686,10 +703,12 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         return false;
 
     ID3D11ShaderResourceView* delayedSRV = nullptr;
-    if (pulfrich)
+    if (temporal)
     {
         EnsureHistory(srcWidth, srcHeight);
-        const int delayed = (m_histWrite - m_pulfDelay + kHistory) % kHistory;
+        // Frame-sequential pairs the current frame with the immediately previous one.
+        const int delay = (m_fmt == StereoFormat::FrameSequential) ? 1 : m_pulfDelay;
+        const int delayed = (m_histWrite - delay + kHistory) % kHistory;
         delayedSRV = m_histSRV[delayed];
     }
 
@@ -714,7 +733,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     {
         CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
                m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
-               m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0,
+               m_ndTrans, m_fpEyeFrac, m_fpGapFrac, m_convergence,
                dispMaxUV, coarseW, coarseH, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
@@ -810,8 +829,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(0, 2, nulls2);
     }
 
-    // Pass 2 (Pulfrich): copy the current source into the history ring for later.
-    if (pulfrich && m_histRTV[m_histWrite])
+    // Pass 2 (temporal): copy the current source into the history ring for later.
+    if (temporal && m_histRTV[m_histWrite])
     {
         CB copyCb{ 99, m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
                    m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,

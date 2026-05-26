@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 SR Weaver contributors
+Copyright (c) 2026 SR Loom contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -27,9 +27,14 @@ which is distributed under its own license (see the SDK's "Notices, Terms &
 Conditions"). The SR runtime must be installed separately; the SDK is not
 redistributed under the MIT terms above.
 
-Bundled third-party source:
-  - third_party/stb_image.h : public domain / MIT (Sean Barrett), used to load
-    the test stereo image.
+Bundled third-party components (all permissive / MIT-compatible):
+  - Dear ImGui (third_party/imgui) : MIT License (Omar Cornut). The control
+    panel is built with it; see third_party/imgui/LICENSE.txt.
+  - Inter font (assets/fonts, embedded into the executable as a resource) :
+    SIL Open Font License 1.1 (The Inter Project Authors); see
+    assets/fonts/Inter-OFL.txt.
+  - third_party/stb_image.h : public domain / MIT (Sean Barrett), used for
+    image loading.
 
 Attribution:
   - The HDMI 1.4 frame-packing decode in src/Converter.cpp was informed by

@@ -9,6 +9,9 @@ namespace srw
     // Window message the tray icon posts to the main window for mouse events.
     constexpr UINT WM_APP_TRAY = WM_APP + 1;
 
+    // GUI -> main window: capture the window whose HWND is in lParam (window picker).
+    constexpr UINT WM_APP_GUI_CAPTURE_WINDOW = WM_APP + 2;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {
@@ -57,7 +60,6 @@ namespace srw
         bool         weaving;
         OutputMode   mode;
         SourceKind   source;
-        bool         anaglyphTestImage;   // test-image source is the anaglyph one
         StereoFormat format;
         bool         swapEyes;
         int          anaglyphCombo;

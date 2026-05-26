@@ -1,5 +1,9 @@
 #include "Renderer.h"
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>   // IDXGISwapChain2, FRAME_LATENCY_WAITABLE_OBJECT
+#include <dxgi1_5.h>   // IDXGIFactory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING
+#include <dwmapi.h>    // DwmFlush (pace layered/bit-blt presents to the compositor)
+#pragma comment(lib, "dwmapi.lib")
 
 using namespace srw;
 
@@ -47,45 +51,97 @@ bool Renderer::Initialize(HWND hwnd)
         }
     }
 
-    // Obtain the DXGI factory associated with our device.
+    // Obtain the DXGI factory associated with our device (kept for swap-chain
+    // recreation when the window's layered state changes).
     IDXGIDevice*  dxgiDevice  = nullptr;
     IDXGIAdapter* dxgiAdapter = nullptr;
-    IDXGIFactory2* factory    = nullptr;
     hr = m_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
     if (SUCCEEDED(hr)) hr = dxgiDevice->GetAdapter(&dxgiAdapter);
-    if (SUCCEEDED(hr)) hr = dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)&factory);
+    if (SUCCEEDED(hr)) hr = dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), (void**)&m_factory);
+    SAFE_RELEASE(dxgiAdapter);
+    SAFE_RELEASE(dxgiDevice);
     if (FAILED(hr))
     {
-        SAFE_RELEASE(dxgiAdapter);
-        SAFE_RELEASE(dxgiDevice);
         ShowError("Failed to obtain DXGI factory.");
         return false;
     }
 
-    DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width            = m_width;
-    sd.Height           = m_height;
-    sd.Format           = m_format;
-    sd.SampleDesc.Count = 1;
-    sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount      = 2;
-    sd.SwapEffect       = DXGI_SWAP_EFFECT_DISCARD;  // bit-blt: works with layered windows
-
-    hr = factory->CreateSwapChainForHwnd(m_device, hwnd, &sd, nullptr, nullptr, &m_swapChain);
+    // Does the GPU/OS support tearing (needed for true no-vsync / VRR presents)?
+    {
+        IDXGIFactory5* f5 = nullptr;
+        if (SUCCEEDED(m_factory->QueryInterface(__uuidof(IDXGIFactory5), (void**)&f5)))
+        {
+            BOOL allow = FALSE;
+            if (SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))))
+                m_allowTearing = (allow == TRUE);
+            f5->Release();
+        }
+    }
 
     // Block Alt+Enter; we manage fullscreen ourselves as a borderless window.
-    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    m_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
 
-    SAFE_RELEASE(factory);
-    SAFE_RELEASE(dxgiAdapter);
-    SAFE_RELEASE(dxgiDevice);
-
-    if (FAILED(hr))
+    // The window starts non-layered, so begin with the low-latency flip model.
+    if (!CreateSwapChain(true))
     {
         ShowError("Failed to create swap chain.");
         return false;
     }
+    return true;
+}
 
+// (Re)create the swap chain in the requested model. flip = low-latency flip model
+// (non-layered windows), else bit-blt (works on layered click-through windows).
+bool Renderer::CreateSwapChain(bool flip)
+{
+    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_swapChain);
+    m_waitable = nullptr;   // owned by the swap chain; invalidated on release
+
+    m_flip       = flip;
+    m_swapFormat = flip ? DXGI_FORMAT_R8G8B8A8_UNORM        // flip can't use an _SRGB buffer
+                        : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;  // bit-blt uses sRGB directly
+
+    // Flip model: low latency + a waitable object for pacing, plus tearing for VRR
+    // no-vsync where supported. Bit-blt (layered windows): no special flags.
+    UINT flipFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    if (m_allowTearing) flipFlags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width            = m_width;
+    sd.Height           = m_height;
+    sd.Format           = m_swapFormat;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount      = 2;
+    sd.SwapEffect       = flip ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_DISCARD;
+
+    // Try the preferred flags, then progressively simpler ones, so an unusual
+    // driver can't leave us with no swap chain at all.
+    const UINT attempts[] = { flip ? flipFlags : 0u,
+                              flip ? (UINT)DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0u,
+                              0u };
+    HRESULT hr = E_FAIL;
+    for (UINT f : attempts)
+    {
+        sd.Flags = f;
+        hr = m_factory->CreateSwapChainForHwnd(m_device, m_hwnd, &sd, nullptr, nullptr, &m_swapChain);
+        if (SUCCEEDED(hr)) { m_swapFlags = f; break; }
+    }
+    if (FAILED(hr))
+        return false;
+
+    // Grab the waitable object (if we got one) and keep at most one frame queued.
+    if (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+    {
+        IDXGISwapChain2* sc2 = nullptr;
+        if (SUCCEEDED(m_swapChain->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)))
+        {
+            sc2->SetMaximumFrameLatency(1);
+            m_waitable = sc2->GetFrameLatencyWaitableObject();
+            sc2->Release();
+        }
+    }
     return CreateBackBufferView();
 }
 
@@ -101,7 +157,12 @@ bool Renderer::CreateBackBufferView()
         return false;
     }
 
-    hr = m_device->CreateRenderTargetView(backBuffer, nullptr, &m_rtv);
+    // Explicit _SRGB view: required for the flip path (UNORM buffer + sRGB view);
+    // identical to the default for the bit-blt sRGB buffer.
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format        = m_rtvFormat;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    hr = m_device->CreateRenderTargetView(backBuffer, &rd, &m_rtv);
     SAFE_RELEASE(backBuffer);
     if (FAILED(hr))
     {
@@ -109,6 +170,17 @@ bool Renderer::CreateBackBufferView()
         return false;
     }
     return true;
+}
+
+void Renderer::SetLayered(bool layered)
+{
+    if (!m_device) return;
+    const bool wantFlip = !layered;
+    m_layered = layered;
+    if (wantFlip == m_flip && m_swapChain)
+        return;   // model already correct
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    CreateSwapChain(wantFlip);
 }
 
 bool Renderer::Resize(UINT width, UINT height)
@@ -121,7 +193,7 @@ bool Renderer::Resize(UINT width, UINT height)
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
     SAFE_RELEASE(m_rtv);
 
-    HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, m_swapFlags);
     if (FAILED(hr))
     {
         ShowError("Failed to resize swap chain buffers.");
@@ -149,16 +221,38 @@ void Renderer::BindAndClearBackBuffer()
     m_context->RSSetViewports(1, &vp);
 }
 
+void Renderer::WaitForFrame()
+{
+    if (m_waitable)
+        WaitForSingleObjectEx(m_waitable, 1000, TRUE);
+}
+
 void Renderer::Present(bool vsync)
 {
-    if (m_swapChain)
-        m_swapChain->Present(vsync ? 1 : 0, 0);
+    if (!m_swapChain) return;
+    if (!m_flip)
+    {
+        // Bit-blt (layered overlay / looking glass): present immediately, then block
+        // on the DWM compositor that actually displays a layered window. This paces
+        // the loop AND aligns it with composition — lower latency and much less
+        // jitter than waiting on the swap chain's own vsync (which beats against the
+        // compositor's). DwmFlush returns at the next composition (~refresh).
+        m_swapChain->Present(0, 0);
+        DwmFlush();
+        return;
+    }
+    // Flip: no-vsync presents immediately with tearing allowed (VRR drives the
+    // refresh → minimum latency); the waitable object paces the loop.
+    UINT flags = (!vsync && (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))
+               ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    m_swapChain->Present(vsync ? 1 : 0, flags);
 }
 
 void Renderer::Shutdown()
 {
     SAFE_RELEASE(m_rtv);
     SAFE_RELEASE(m_swapChain);
+    SAFE_RELEASE(m_factory);
     SAFE_RELEASE(m_context);
     SAFE_RELEASE(m_device);
 }

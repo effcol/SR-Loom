@@ -2,3 +2,8 @@
 
 // Tray / application icon: the white Dimenco logo mark on transparency.
 IDI_TRAY ICON "../assets/sr_weaver.ico"
+
+// UI fonts embedded into the exe (Inter, SIL Open Font License) — loaded from these
+// resources at runtime so no font files need to ship beside the executable.
+IDR_FONT_REGULAR  RCDATA "../assets/fonts/Inter-Regular.ttf"
+IDR_FONT_SEMIBOLD RCDATA "../assets/fonts/Inter-SemiBold.ttf"

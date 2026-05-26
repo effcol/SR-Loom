@@ -9,6 +9,7 @@
 #include "Capture.h"
 #include "Converter.h"
 #include "Detector.h"
+#include "Gui.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -21,7 +22,7 @@ using namespace srw;
 namespace
 {
     constexpr char  kWindowClass[] = "SRWeaverWindow";
-    constexpr char  kWindowTitle[] = "SR Weaver";
+    constexpr char  kWindowTitle[] = "SR Loom";
     constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
     constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
     constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
@@ -37,11 +38,12 @@ namespace
         Capture      capture;
         Converter    converter;
         Detector     detector;
+        Gui          gui;
+        float        convergence    = 0.0f;   // GUI convergence slider (-1..1)
         bool         weavingEnabled = true;
         OutputMode   mode           = OutputMode::Fullscreen;
-        SourceKind   source         = SourceKind::TestImage;
-        bool         anaTestImage   = false; // test image is the anaglyph one (vs SBS)
-        StereoFormat format         = StereoFormat::FullSBS;  // source stereo layout
+        SourceKind   source         = SourceKind::CaptureMonitor;  // default: weave the screen (fullscreen SBS)
+        StereoFormat format         = StereoFormat::HalfSBS;  // default: most on-screen SBS content is half-width
         bool         swapEyes       = false;
         int          anaglyphCombo  = 0;   // 0..5 colour combination
         int          anaglyphMode   = 4;   // shader mode value (4 = Recovered colour, the default)
@@ -53,6 +55,7 @@ namespace
         HWND       lastForeground = nullptr; // last real foreground window (for "make active window 3D")
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
+        bool       loupeActive    = false;   // looking glass shown (keep its position across re-applies)
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
     };
@@ -101,6 +104,9 @@ namespace
 
     void ApplyMode(AppState& app)
     {
+        if (app.mode != OutputMode::LookingGlass)
+            app.loupeActive = false;   // reset so the loupe re-centres next time it's entered
+
         const RECT& d = app.srDisplayRect;
         const int dw = d.right - d.left;
         const int dh = d.bottom - d.top;
@@ -131,18 +137,28 @@ namespace
 
         case OutputMode::LookingGlass:
         {
-            // Visible frame for dragging/resizing; click-through (locked) toggles
-            // layered+transparent without changing the frame (Ctrl+Alt+G).
-            const int w = 960, h = 600;
-            const int x = d.left + (dw - w) / 2;
-            const int y = d.top  + (dh - h) / 2;
-            // Normal window chrome (title bar + resize edges). Click-through on
-            // the glass by default; UpdateLoupeInteractivity makes it grabbable
-            // while the cursor is over the chrome or during a move/resize.
+            // Normal window chrome (title bar + resize edges). Click-through on the
+            // glass by default; UpdateLoupeInteractivity makes it grabbable while the
+            // cursor is over the chrome or during a move/resize.
             style   = WS_OVERLAPPEDWINDOW;
             exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
             zorder  = HWND_TOPMOST;
-            rect    = { x, y, x + w, y + h };
+            // Keep the position/size the user has set when already in loupe mode
+            // (e.g. re-applying on a format change); only centre on first entry.
+            // Use the FULL window rect (GetWindowRect) — VisibleWindowRect's DWM
+            // extended bounds exclude the invisible resize borders, so feeding it back
+            // in shrinks the loupe by those borders on every re-apply.
+            if (app.loupeActive)
+            {
+                GetWindowRect(hwnd, &rect);
+            }
+            else
+            {
+                const int w = 960, h = 600;
+                rect = { d.left + (dw - w) / 2, d.top + (dh - h) / 2,
+                         d.left + (dw - w) / 2 + w, d.top + (dh - h) / 2 + h };
+                app.loupeActive = true;
+            }
             break;
         }
 
@@ -168,12 +184,16 @@ namespace
         if (exStyle & WS_EX_NOACTIVATE) flags |= SWP_NOACTIVATE;
         SetWindowPos(hwnd, zorder, rect.left, rect.top,
                      rect.right - rect.left, rect.bottom - rect.top, flags);
+
+        // Match the swap-chain model to the window: flip (low-latency) when not
+        // click-through, bit-blt when layered (flip can't render on layered windows).
+        app.renderer.SetLayered(ct);
     }
 
-    // The looking glass passes clicks through the glass, but becomes grabbable
-    // when the cursor is over its chrome (title bar / resize edges) or while a
-    // move/resize is in progress — then returns to click-through. The cursor is
-    // polled directly so this works even while the window is click-through.
+    // The looking glass passes clicks through the glass, but becomes grabbable when
+    // the cursor is over its chrome (title bar / resize edges) or during a move/
+    // resize — then returns to click-through. The cursor is polled directly so this
+    // works even while the window is click-through.
     void UpdateLoupeInteractivity(AppState& app)
     {
         if (app.mode != OutputMode::LookingGlass) return;
@@ -236,6 +256,8 @@ namespace
             ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
     }
 
+    void UsePassthrough(AppState& app);   // fwd decl: default weave is screen passthrough
+
     void SetWeaving(AppState& app, bool enable)
     {
         app.weavingEnabled = enable;
@@ -244,6 +266,10 @@ namespace
             // Start the SR session (lens + eye-tracking) and show the output.
             if (!app.weaver.HasWeaver())
                 app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+            // Default action: weave the screen (fullscreen SBS passthrough). If the
+            // chosen source is the monitor but capture isn't running yet, start it.
+            if (app.source == SourceKind::CaptureMonitor && !app.capture.IsActive())
+                UsePassthrough(app);
             app.captureRebind = true;   // re-register the converter output
             ApplyMode(app);
             ShowWindow(app.hwnd, SW_SHOW);
@@ -254,7 +280,7 @@ namespace
             ShowWindow(app.hwnd, SW_HIDE);
             app.weaver.StopSR();
         }
-        app.tray.SetTooltip(enable ? "SR Weaver — weaving" : "SR Weaver — paused (SR off)");
+        app.tray.SetTooltip(enable ? "SR Loom — weaving" : "SR Loom — paused (SR off)");
     }
 
     // Selecting a source or format turns weaving ON if it isn't already (so the 3D
@@ -263,6 +289,16 @@ namespace
     {
         if (app.weavingEnabled) ApplyMode(app);
         else                    SetWeaving(app, true);
+    }
+
+    // Like EnsureWeaving, but for a stereo-format / decode-option change: it must NOT
+    // re-apply the window mode. ApplyMode resizes + re-styles the window and toggles the
+    // swap-chain model — in Looking Glass that shrinks the loupe and stalls the weave on
+    // every format change. The new format is picked up via captureRebind in RenderFrame,
+    // so we only need to switch weaving on if it was off.
+    void EnsureWeavingFormatOnly(AppState& app)
+    {
+        if (!app.weavingEnabled) SetWeaving(app, true);
     }
 
     // Record the most recent "real" foreground window (not ours, the shell, or a
@@ -275,46 +311,13 @@ namespace
             return;
         char cls[64] = {};
         GetClassNameA(fg, cls, (int)sizeof(cls));
-        if (strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "Shell_TrayWnd") == 0 ||
-            strcmp(cls, "#32768") == 0)   // popup menu class
+        if (strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "SRWeaverGuiWindow") == 0 ||
+            strcmp(cls, "Shell_TrayWnd") == 0 || strcmp(cls, "#32768") == 0)   // ours / shell / popup menu
             return;
         app.lastForeground = fg;
     }
 
     // --- Source selection -------------------------------------------------
-
-    void UseTestImage(AppState& app)
-    {
-        app.capture.Stop();
-        app.sourceWindow = nullptr;
-        app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_sbs.jpg").c_str(),
-                                          StereoFormat::FullSBS,
-                                          app.renderer.BackBufferFormat());
-        app.source = SourceKind::TestImage;
-        app.anaTestImage = false;
-        app.captureRebind = true;   // rebind the weaver to the converter output
-        if (app.mode == OutputMode::WindowOverlay)   // overlay only makes sense for a window
-            app.mode = OutputMode::Fullscreen;
-        EnsureWeaving(app);
-    }
-
-    // Load the bundled anaglyph test image and switch to the Anaglyph format so the
-    // recovery modes can be exercised without live anaglyph content.
-    void UseAnaglyphTestImage(AppState& app)
-    {
-        app.capture.Stop();
-        app.sourceWindow = nullptr;
-        app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_anaglyph.png").c_str(),
-                                          StereoFormat::Anaglyph,
-                                          app.renderer.BackBufferFormat());
-        app.source = SourceKind::TestImage;
-        app.anaTestImage = true;
-        app.format = StereoFormat::Anaglyph;
-        app.captureRebind = true;
-        if (app.mode == OutputMode::WindowOverlay)
-            app.mode = OutputMode::Fullscreen;
-        EnsureWeaving(app);
-    }
 
     // Capture a window and present it as an in-place 3D overlay tracking that window.
     void UseWindow(AppState& app, HWND target)
@@ -338,10 +341,10 @@ namespace
         char cls[64] = {};
         if (fg) GetClassNameA(fg, cls, (int)sizeof(cls));
         const bool ours = !fg || fg == app.hwnd || !IsWindow(fg) ||
-                          strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "Shell_TrayWnd") == 0 ||
-                          strcmp(cls, "#32768") == 0;
+                          strcmp(cls, "SRWeaverWindow") == 0 || strcmp(cls, "SRWeaverGuiWindow") == 0 ||
+                          strcmp(cls, "Shell_TrayWnd") == 0 || strcmp(cls, "#32768") == 0;
         if (ours)
-            fg = app.lastForeground;   // menu had focus; use the window active before it
+            fg = app.lastForeground;   // we (GUI/menu) had focus; use the window active before us
         Log("CaptureForeground: target=%p app.hwnd=%p", (void*)fg, (void*)app.hwnd);
         if (fg && fg != app.hwnd && IsWindow(fg))
             UseWindow(app, fg);
@@ -363,13 +366,13 @@ namespace
         }
     }
 
-    // Map our window's client area to a rectangle in the captured frame's pixels.
-    RECT PassthroughRegion(AppState& app)
+    // Map a window's client area to a rectangle in the captured frame's pixels.
+    RECT PassthroughRegion(AppState& app, HWND hwnd)
     {
         const double fw = app.capture.FrameWidth();
         const double fh = app.capture.FrameHeight();
 
-        HMONITOR mon = MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST);
+        HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{ sizeof(mi) };
         GetMonitorInfo(mon, &mi);
         const RECT m = mi.rcMonitor;
@@ -378,10 +381,10 @@ namespace
 
         // Client area in screen coordinates.
         RECT c{};
-        GetClientRect(app.hwnd, &c);
+        GetClientRect(hwnd, &c);
         POINT tl{ c.left, c.top }, br{ c.right, c.bottom };
-        ClientToScreen(app.hwnd, &tl);
-        ClientToScreen(app.hwnd, &br);
+        ClientToScreen(hwnd, &tl);
+        ClientToScreen(hwnd, &br);
 
         RECT r;
         r.left   = (LONG)((tl.x - m.left) * sx);
@@ -416,11 +419,11 @@ namespace
         {
             app.format = f;
             app.captureRebind = true;
-            app.tray.SetTooltip("SR Weaver — detected a stereo layout");
+            app.tray.SetTooltip("SR Loom — detected a stereo layout");
         }
         else
         {
-            app.tray.SetTooltip("SR Weaver — no stereo layout detected");
+            app.tray.SetTooltip("SR Loom — no stereo layout detected");
         }
     }
 
@@ -433,7 +436,7 @@ namespace
         }
 
         UpdateOverlayTracking(app);     // follow the source window in overlay mode
-        UpdateLoupeInteractivity(app);  // Ctrl+Alt to grab/move the looking glass
+        UpdateLoupeInteractivity(app);  // hover the chrome to grab/move the looking glass
 
         if (IsIconic(app.hwnd))
         {
@@ -441,9 +444,14 @@ namespace
             return;
         }
 
+        // Pace to the display before grabbing the newest frame (lowest latency).
+        app.renderer.WaitForFrame();
+
         // Resolve the current source frame: the test image, or a capture frame.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         int srcW = 0, srcH = 0;
+        bool capSizeChanged = false;
+        bool gotFrame = false;   // a new capture frame arrived this iteration
         if (app.source == SourceKind::TestImage)
         {
             srcSRV = app.weaver.SourceSRV();
@@ -455,26 +463,46 @@ namespace
             // For passthrough, weave only the region of the monitor beneath the viewer.
             if (app.source == SourceKind::CaptureMonitor && app.capture.FrameWidth() > 0)
             {
-                RECT r = PassthroughRegion(app);
+                RECT r = PassthroughRegion(app, app.hwnd);
                 app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
             }
-            bool sizeChanged = false;
-            app.capture.Update(sizeChanged);   // refresh the capture texture in place
+            gotFrame = app.capture.Update(capSizeChanged);   // refresh the capture texture in place
             srcSRV = app.capture.SRV();
             srcW   = app.capture.Width();
             srcH   = app.capture.Height();
         }
 
-        // Convert the source into a side-by-side texture and feed it to the weaver.
-        // Re-run the (potentially heavy) conversion ONLY when its output can change:
-        // live capture changes every frame, Pulfrich is temporal, and any setting
-        // change sets captureRebind. A static test image converts once, then we just
-        // keep re-weaving the cached SBS (the weave still tracks the head each frame).
-        const bool liveSource = (app.source != SourceKind::TestImage);
-        const bool temporalFmt = (app.format == StereoFormat::Pulfrich);
-        if (srcSRV && srcW > 0 && srcH > 0 && (liveSource || temporalFmt || app.captureRebind))
+        // FAST PATH: a live source already in full side-by-side layout (no eye swap,
+        // no convergence shift) is identical to what the converter would output — so
+        // feed the captured texture STRAIGHT to the weaver and skip the conversion
+        // pass entirely. Lowest latency / least GPU contention, which matters for
+        // games. (The capture texture updates in place each frame, so the weaver's
+        // input view only needs re-registering on a rebind or a resize.)
+        const bool liveSource  = (app.source != SourceKind::TestImage);
+        const bool temporalFmt = (app.format == StereoFormat::Pulfrich ||
+                                  app.format == StereoFormat::FrameSequential);
+        const bool noConv      = (app.convergence < 1e-4f && app.convergence > -1e-4f);
+        const bool identitySBS = liveSource && app.format == StereoFormat::FullSBS &&
+                                 !app.swapEyes && noConv;
+
+        if (identitySBS)
+        {
+            if (srcSRV && srcW > 0 && srcH > 0 && (app.captureRebind || capSizeChanged))
+            {
+                app.weaver.SetInputView(srcSRV, srcW / 2, srcH, app.capture.SRVFormat());
+                app.captureRebind = false;
+            }
+        }
+        // Otherwise convert the source into a side-by-side texture and feed THAT to
+        // the weaver. Re-run the (potentially heavy) conversion ONLY when its output
+        // can change: a NEW live-capture frame arrived, Pulfrich is temporal, or a
+        // setting changed (captureRebind). When the captured content is unchanged we
+        // skip the convert and re-weave the cached SBS — the weave still tracks the
+        // head every frame, but we don't burn GPU re-converting identical pixels.
+        else if (srcSRV && srcW > 0 && srcH > 0 && ((liveSource && gotFrame) || temporalFmt || app.captureRebind))
         {
             app.converter.SetFormat(app.format, app.swapEyes, app.anaglyphCombo, app.anaglyphMode);
+            app.converter.SetConvergence(app.convergence * 0.03f);   // slider -1..1 -> ±3% width per eye
             {
                 int ndN = 0; const NdLevel* nd = PulfrichNdLevels(ndN);
                 const float trans = nd[(app.pulfrichNd >= 0 && app.pulfrichNd < ndN) ? app.pulfrichNd : 0].transmission;
@@ -497,7 +525,7 @@ namespace
 
         app.renderer.BindAndClearBackBuffer();
         app.weaver.Weave();
-        app.renderer.Present(true);
+        app.renderer.Present(false);   // no-vsync: lowest latency (VRR absorbs tearing)
     }
 
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -509,12 +537,20 @@ namespace
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
             {
-                MenuState ms{ app->weavingEnabled, app->mode, app->source, app->anaTestImage,
+                MenuState ms{ app->weavingEnabled, app->mode, app->source,
                               app->format, app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
                               app->pulfrichMode, app->pulfrichDelay, app->pulfrichNd,
                               app->framePackMode };
                 app->tray.ShowContextMenu(hwnd, ms);
             }
+            else if (app && LOWORD(lParam) == WM_LBUTTONUP)
+            {
+                app->gui.Toggle();   // left-click opens/closes the control panel
+            }
+            return 0;
+
+        case WM_APP_GUI_CAPTURE_WINDOW:   // GUI window-picker chose a window to make 3D
+            if (app) UseWindow(*app, reinterpret_cast<HWND>(lParam));
             return 0;
 
         case WM_COMMAND:
@@ -534,7 +570,7 @@ namespace
                 int n = 0;
                 const StereoFormatEntry* fmts = StereoFormatList(n);
                 const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
-                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; EnsureWeaving(*app); }
+                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; EnsureWeavingFormatOnly(*app); }
                 return 0;
             }
             // Anaglyph colour combo / decode mode (also selects the Anaglyph format).
@@ -543,7 +579,7 @@ namespace
                 app->anaglyphCombo = (int)(cmd - ID_TRAY_ANA_COMBO_BASE);
                 app->format = StereoFormat::Anaglyph;
                 app->captureRebind = true;
-                EnsureWeaving(*app);
+                EnsureWeavingFormatOnly(*app);
                 return 0;
             }
             if (cmd >= ID_TRAY_ANA_MODE_BASE && cmd <= ID_TRAY_ANA_MODE_MAX)
@@ -553,7 +589,7 @@ namespace
                 if (idx < n) app->anaglyphMode = modes[idx].value;   // menu index -> shader mode value
                 app->format = StereoFormat::Anaglyph;
                 app->captureRebind = true;
-                EnsureWeaving(*app);
+                EnsureWeavingFormatOnly(*app);
                 return 0;
             }
             // Pulfrich sub-options (each also selects the Pulfrich format).
@@ -568,7 +604,7 @@ namespace
                                                                         : PulfrichMode::NDFilter;
                 app->format = StereoFormat::Pulfrich;
                 app->captureRebind = true;
-                EnsureWeaving(*app);
+                EnsureWeavingFormatOnly(*app);
                 return 0;
             }
             if (cmd >= ID_TRAY_FP_BASE && cmd <= ID_TRAY_FP_MAX)
@@ -576,7 +612,7 @@ namespace
                 app->framePackMode = (int)(cmd - ID_TRAY_FP_BASE);
                 app->format = StereoFormat::FramePacking;
                 app->captureRebind = true;
-                EnsureWeaving(*app);
+                EnsureWeavingFormatOnly(*app);
                 return 0;
             }
 
@@ -585,7 +621,12 @@ namespace
             case ID_TRAY_TOGGLE_WEAVE: SetWeaving(*app, !app->weavingEnabled); return 0;
             case ID_TRAY_MODE_FULLSCREEN:
                 app->mode = OutputMode::Fullscreen;
-                if (app->weavingEnabled) ApplyMode(*app);
+                // Fullscreen the test image is pointless — weave the actual screen
+                // (passthrough). A live window capture stays its own source so it can
+                // be fullscreened (the low-latency flip path).
+                if (app->source == SourceKind::TestImage)
+                    UsePassthrough(*app);
+                EnsureWeaving(*app);
                 return 0;
             case ID_TRAY_MODE_WINDOWED:
                 app->mode = OutputMode::Windowed;
@@ -598,11 +639,9 @@ namespace
             case ID_TRAY_CAPTURE_FOREGROUND: CaptureForeground(*app); return 0;
             case ID_TRAY_SWAP_EYES: app->swapEyes = !app->swapEyes; app->captureRebind = true; return 0;
             case ID_TRAY_DETECT: DetectFormat(*app); return 0;
-            case ID_TRAY_SRC_TESTIMAGE: UseTestImage(*app); return 0;
-            case ID_TRAY_SRC_TESTIMAGE_ANA: UseAnaglyphTestImage(*app); return 0;
             case ID_TRAY_SRC_MONITOR:
                 UsePassthrough(*app);
-                if (app->mode == OutputMode::WindowOverlay) app->mode = OutputMode::Fullscreen;
+                app->mode = OutputMode::Fullscreen;   // Monitor always means fullscreen
                 EnsureWeaving(*app);
                 return 0;
             case ID_TRAY_LOOKING_GLASS:
@@ -621,11 +660,21 @@ namespace
             if (wParam == kHotkeyToggle) SetWeaving(*app, !app->weavingEnabled);
             else if (wParam == kHotkeyMode)
             {
-                app->mode = (app->mode == OutputMode::Fullscreen)
-                          ? OutputMode::Windowed : OutputMode::Fullscreen;
-                if (app->weavingEnabled) ApplyMode(*app);
+                // Toggle Fullscreen <-> Looking Glass (both weave the monitor).
+                if (app->source != SourceKind::CaptureMonitor) UsePassthrough(*app);
+                if (app->mode == OutputMode::LookingGlass)
+                    app->mode = OutputMode::Fullscreen;
+                else { app->mode = OutputMode::LookingGlass; app->loupeInteractive = false; }
+                EnsureWeaving(*app);
             }
-            else if (wParam == kHotkeyCapture) CaptureForeground(*app);
+            else if (wParam == kHotkeyCapture)
+            {
+                // Make the active window 3D; press again to turn it back off.
+                if (app->mode == OutputMode::WindowOverlay && app->weavingEnabled)
+                    SetWeaving(*app, false);
+                else
+                    CaptureForeground(*app);
+            }
             // else if (wParam == kHotkeyDetect)  DetectFormat(*app); // auto-detect disabled
             return 0;
 
@@ -679,7 +728,11 @@ namespace
 
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
-    SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+    // Per-Monitor-Aware v2: unlike v1, Windows auto-scales the NON-CLIENT area
+    // (title bar) per monitor — so the GUI's title bar no longer stays huge when
+    // dragged from a 4K/150% display to a 1440p/100% one. Falls back to v1.
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
 
     // Testing aid: "-noexclude" leaves the window visible to screen capture.
     const bool excludeFromCapture = !(lpCmdLine && strstr(lpCmdLine, "-noexclude"));
@@ -732,27 +785,32 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     if (excludeFromCapture)
         SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
 
-    // Set up Direct3D and load the static SBS test image (the default source).
-    // The weaver/SR session is started on demand when weaving is enabled.
+    // Set up Direct3D. The weaver/SR session is started on demand when weaving is
+    // enabled; the default source is the monitor (passthrough), so no initial image.
     if (!app.renderer.Initialize(app.hwnd))
         return 4;
-    if (!app.weaver.SetStereoImageFromFile(app.renderer.Device(), ExePath("test_sbs.jpg").c_str(),
-                                           StereoFormat::FullSBS,
-                                           app.renderer.BackBufferFormat()))
-        return 6;
 
-    // Initialize live capture (optional — the test image still works without it).
+    // Initialize live capture (this is the default source).
     const bool capInit = app.capture.Initialize(app.renderer.Device(), app.renderer.Context());
     Log("WinMain: capture.Initialize=%d", capInit ? 1 : 0);
 
     // Initialize the format-conversion stage (capture/image -> SBS for the weaver).
     if (!app.converter.Initialize(app.renderer.Device(), app.renderer.Context()))
+    {
+        Log("WinMain: converter.Initialize FAILED (exit 7)");
         return 7;
+    }
+    Log("WinMain: converter.Initialize OK");
     app.detector.Initialize(app.renderer.Device(), app.renderer.Context());  // optional
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
+    // Control GUI (left-click the tray icon). Shares the D3D11 device; lives in its
+    // own top-level window so it can sit on any monitor with its own taskbar button.
+    if (!app.gui.Init(app.hwnd, app.renderer.Device(), app.renderer.Context()))
+        Log("WinMain: GUI init failed (control panel disabled)");
+
     // Tray icon + global hotkeys.
-    app.tray.Add(app.hwnd, "SR Weaver — paused (SR off)");
+    app.tray.Add(app.hwnd, "SR Loom — paused (SR off)");
     RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
     RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
@@ -762,6 +820,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // lens and camera stay off until the user enables weaving (Ctrl+Alt+W).
     app.weavingEnabled = false;
     app.weaver.StopSR();
+    Log("WinMain: ready — idle in tray, entering main loop");
 
     bool running = true;
     while (running)
@@ -777,6 +836,37 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         {
             UpdateLastForeground(app);   // remember the user's active window for "make 3D"
             RenderFrame(app);
+
+            // Render the control panel when it's open, and pick up its convergence slider.
+            if (app.gui.IsVisible())
+            {
+                GuiState gs;
+                gs.weaving       = app.weavingEnabled;
+                gs.mode          = app.mode;
+                gs.source        = app.source;
+                gs.format        = app.format;
+                gs.swapEyes      = app.swapEyes;
+                gs.anaglyphCombo = app.anaglyphCombo;
+                gs.anaglyphMode  = app.anaglyphMode;
+                gs.convergence   = app.convergence;
+                gs.pulfrichMode  = (int)app.pulfrichMode;
+                gs.pulfrichDelay = app.pulfrichDelay;
+                gs.pulfrichNd    = app.pulfrichNd;
+                gs.framePackMode = app.framePackMode;
+                // What's being weaved, for the GUI's collapsed summary line.
+                if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
+                {
+                    if (GetWindowTextA(app.sourceWindow, gs.sourceName, (int)sizeof(gs.sourceName)) <= 0)
+                        strncpy_s(gs.sourceName, "Window", _TRUNCATE);
+                }
+                else
+                    strncpy_s(gs.sourceName, "Monitor", _TRUNCATE);
+                if (app.gui.Render(gs))
+                {
+                    app.convergence   = gs.convergence;
+                    app.captureRebind = true;   // re-run the conversion with the new convergence
+                }
+            }
         }
     }
 
@@ -785,6 +875,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
     // UnregisterHotKey(app.hwnd, kHotkeyDetect); // auto-detect disabled
     app.tray.Remove();
+    app.gui.Shutdown();
     app.detector.Shutdown();
     app.converter.Shutdown();
     app.capture.Shutdown();

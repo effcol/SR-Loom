@@ -33,7 +33,7 @@ bool TrayIcon::Add(HWND hwnd, const char* tooltip)
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon            = LoadTrayIcon();
-    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Weaver", (int)ARRAYSIZE(nid.szTip));
+    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Loom", (int)ARRAYSIZE(nid.szTip));
 
     m_added = Shell_NotifyIconA(NIM_ADD, &nid) != FALSE;
     return m_added;
@@ -60,7 +60,7 @@ void TrayIcon::SetTooltip(const char* tooltip)
     nid.hWnd   = m_hwnd;
     nid.uID    = kIconId;
     nid.uFlags = NIF_TIP;
-    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Weaver", (int)ARRAYSIZE(nid.szTip));
+    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Loom", (int)ARRAYSIZE(nid.szTip));
     Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
 
@@ -118,13 +118,8 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
 
-    // Source submenu: test image, monitor, then live window list.
+    // Source submenu: monitor + the live window list.
     HMENU srcMenu = CreatePopupMenu();
-    const bool testImg = (source == SourceKind::TestImage);
-    AppendMenuA(srcMenu, MF_STRING | (testImg && !s.anaglyphTestImage ? MF_CHECKED : 0),
-                ID_TRAY_SRC_TESTIMAGE, "Test image (side-by-side)");
-    AppendMenuA(srcMenu, MF_STRING | (testImg && s.anaglyphTestImage ? MF_CHECKED : 0),
-                ID_TRAY_SRC_TESTIMAGE_ANA, "Test image (anaglyph)");
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
                 ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor (passthrough)");
     AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);
@@ -181,6 +176,8 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
                             format == StereoFormat::Checkerboard) ? (UINT)MF_CHECKED : 0u;
     AppendMenuA(fmtMenu, MF_POPUP | ilChecked,
                 reinterpret_cast<UINT_PTR>(ilMenu), "Interleaved / Checkerboard");
+
+    addFmt(fmtMenu, StereoFormat::FrameSequential, "Frame sequential");
 
     // Anaglyph submenu: colour combinations + decode mode.
     HMENU anaMenu = CreatePopupMenu();

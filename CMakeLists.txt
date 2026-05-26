@@ -13,10 +13,15 @@
 #   cmake -B build/x64 -A x64
 
 cmake_minimum_required(VERSION 3.21)
-project(SRWeaver CXX)
+project(SRLoom CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Static-link the MSVC runtime so the shipped exe needs no VC++ redistributable —
+# the release is then a single self-contained SRLoom.exe (the SR Platform runtime,
+# which the user already has for the display, is the only external dependency).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # --- Locate the Simulated Reality SDK appropriate for the target architecture ---
 set(SR_SDK_DIR_X64 "${CMAKE_SOURCE_DIR}/lib/Simulated Reality/LeiaSR-SDK-1.36.2-win64"
@@ -60,7 +65,18 @@ set(SR_INCLUDE_DIRS
     "${SR_SDK_DIR_X64}/third_party/OpenCV/include"
 )
 
-add_executable(SRWeaver WIN32
+# Dear ImGui (MIT) for the control GUI window — vendored in third_party/imgui.
+set(IMGUI_DIR "${CMAKE_SOURCE_DIR}/third_party/imgui")
+set(IMGUI_SOURCES
+    "${IMGUI_DIR}/imgui.cpp"
+    "${IMGUI_DIR}/imgui_draw.cpp"
+    "${IMGUI_DIR}/imgui_widgets.cpp"
+    "${IMGUI_DIR}/imgui_tables.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
+)
+
+add_executable(SRLoom WIN32
     src/main.cpp
     src/Renderer.cpp
     src/SRWeaver.cpp
@@ -68,6 +84,7 @@ add_executable(SRWeaver WIN32
     src/Capture.cpp
     src/Converter.cpp
     src/Detector.cpp
+    src/Gui.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
@@ -75,23 +92,27 @@ add_executable(SRWeaver WIN32
     src/Capture.h
     src/Converter.h
     src/Detector.h
+    src/Gui.h
     src/resource.h
     src/app.rc
+    ${IMGUI_SOURCES}
 )
 
-target_include_directories(SRWeaver PRIVATE
+target_include_directories(SRLoom PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
     ${SR_INCLUDE_DIRS}
 )
 
-target_compile_definitions(SRWeaver PRIVATE
+target_compile_definitions(SRLoom PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     _CRT_SECURE_NO_WARNINGS
 )
 
-target_link_libraries(SRWeaver PRIVATE
+target_link_libraries(SRLoom PRIVATE
     ${SR_IMPORT_LIBS}
     ${SR_THIRD_PARTY_LIBS}
     d3d11
@@ -105,12 +126,5 @@ target_link_libraries(SRWeaver PRIVATE
     windowsapp    # Windows.Graphics.Capture (WinRT)
 )
 
-# Copy the bundled test stereo images next to the executable.
-add_custom_command(TARGET SRWeaver POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/assets/test_sbs.jpg"
-        "$<TARGET_FILE_DIR:SRWeaver>/test_sbs.jpg"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/assets/test_anaglyph.png"
-        "$<TARGET_FILE_DIR:SRWeaver>/test_anaglyph.png"
-    VERBATIM)
+# Nothing to copy beside the exe: the UI fonts are embedded as resources (app.rc) and
+# the SR runtime DLLs come from the installed SR Platform. The release is just the exe.

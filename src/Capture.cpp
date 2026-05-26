@@ -165,6 +165,11 @@ bool Capture::StartCaptureInternalActive()
     // trailing cursor on top of the real one. (Property added in Windows 10 2004;
     // guarded so older builds still work.)
     try { m_impl->session.IsCursorCaptureEnabled(false); } catch (...) {}
+    // Remove the yellow "capture in progress" rectangle WGC draws around the
+    // captured monitor/window. Needs borderless access (granted per-app on Win11);
+    // all guarded so it degrades gracefully on older builds.
+    try { GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get(); } catch (...) {}
+    try { m_impl->session.IsBorderRequired(false); } catch (...) {}
     m_impl->session.StartCapture();
     m_active = true;
     return true;
