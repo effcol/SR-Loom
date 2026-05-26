@@ -329,6 +329,13 @@ namespace
             app.captureRebind = true;   // re-register the SRV once frames arrive
             app.mode = OutputMode::WindowOverlay;
             EnsureWeaving(app);
+            // Hand input focus back to the captured window. The overlay is NOACTIVATE
+            // (it never takes focus), but the panel/menu we were clicked from did — so
+            // without this the game sits in the background and ignores controller/key
+            // input. We're the current foreground process here, so the OS lets us set
+            // it. The overlay stays topmost, so the 3D remains visible over the window.
+            if (IsWindow(target))
+                SetForegroundWindow(target);
         }
     }
 
