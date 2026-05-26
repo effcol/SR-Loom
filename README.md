@@ -1,5 +1,10 @@
 # SR Loom
 
+<img width="210" height="258" alt="Screenshot 2026-05-26 220250" src="https://github.com/user-attachments/assets/82918258-978b-43bf-a060-85bf2056b88b" /> <img width="210" height="258" alt="Screenshot 2026-05-26 221234" src="https://github.com/user-attachments/assets/7b5f002d-dbea-4f95-866d-6e68d2a09e62" />
+
+
+
+
 A lightweight Windows tray app that weaves stereo 3D onto **Simulated Reality**
 displays (Samsung Odyssey 3D, Acer SpatialLabs, and other LeiaSR / Dimenco
 panels). Point it at your screen, a window, or a floating "looking glass," pick
