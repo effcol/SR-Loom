@@ -128,8 +128,11 @@ namespace
 
         case OutputMode::WindowOverlay:
             style   = WS_POPUP;
-            exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-            zorder  = HWND_TOPMOST;
+            // NOT topmost: the overlay is pinned directly above the source window each
+            // frame (UpdateOverlayTracking), so windows you alt-tab to can occlude the
+            // weave. HWND_NOTOPMOST drops it out of the topmost band on entry.
+            exStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            zorder  = HWND_NOTOPMOST;
             rect    = { d.left, d.top, d.left + 1280, d.top + 720 };
             if (app.sourceWindow && IsWindow(app.sourceWindow))
                 rect = VisibleWindowRect(app.sourceWindow);
@@ -246,11 +249,25 @@ namespace
 
         RECT r = VisibleWindowRect(src), cur{};
         GetWindowRect(app.hwnd, &cur);
-        if (!EqualRect(&r, &cur))
+        const bool rectChanged = !EqualRect(&r, &cur);
+
+        // Pin the overlay DIRECTLY ABOVE the source in the z-order (not global
+        // topmost), so windows the user alt-tabs to occlude the weave. Only re-pin
+        // when the source has risen above us (e.g. the game was just clicked/focused),
+        // not every frame — that avoids constant z-order churn and flicker.
+        const HWND above = GetWindow(src, GW_HWNDPREV);   // window directly above src
+        const bool zBad  = (above != app.hwnd);           // overlay isn't sitting above src
+
+        if (rectChanged || zBad)
         {
-            SetWindowPos(app.hwnd, HWND_TOPMOST, r.left, r.top,
-                         r.right - r.left, r.bottom - r.top,
-                         SWP_NOACTIVATE | SWP_SHOWWINDOW);  // WM_SIZE resizes the swap chain
+            UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;   // WM_SIZE resizes the swap chain
+            HWND insertAfter = HWND_TOP;
+            if (zBad)
+                insertAfter = above ? above : HWND_TOP;     // slot just above src
+            else
+                flags |= SWP_NOZORDER;                      // z is fine; only move/resize
+            SetWindowPos(app.hwnd, insertAfter, r.left, r.top,
+                         r.right - r.left, r.bottom - r.top, flags);
         }
         if (!IsWindowVisible(app.hwnd))
             ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
