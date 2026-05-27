@@ -277,19 +277,60 @@ namespace
     }
 
     // Enumerate the monitors (real + virtual/headless) into `out` for the display picker.
-    struct MonEntry { HMONITOR mon; char label[96]; };
+    struct MonEntry { HMONITOR mon; char gdi[32]; int w, h; char label[128]; };
     BOOL CALLBACK MonEnumProc(HMONITOR mon, HDC, LPRECT, LPARAM lp)
     {
         auto* out = reinterpret_cast<std::vector<MonEntry>*>(lp);
         MONITORINFOEXA mi{}; mi.cbSize = sizeof(mi);
         GetMonitorInfoA(mon, &mi);
-        const int w = mi.rcMonitor.right - mi.rcMonitor.left;
-        const int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
         MonEntry e{}; e.mon = mon;
-        snprintf(e.label, sizeof(e.label), "Display %d  (%dx%d)%s", (int)out->size() + 1, w, h,
+        strncpy_s(e.gdi, mi.szDevice, _TRUNCATE);     // \\.\DISPLAYn
+        e.w = mi.rcMonitor.right - mi.rcMonitor.left;
+        e.h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        // Fallback label; ResolveDisplayNames() upgrades it to the friendly name.
+        snprintf(e.label, sizeof(e.label), "Display %d  (%dx%d)%s", (int)out->size() + 1, e.w, e.h,
                  (mi.dwFlags & MONITORINFOF_PRIMARY) ? "  primary" : "");
         out->push_back(e);
         return TRUE;
+    }
+
+    // Replace each monitor's label with the friendly EDID name Windows knows (e.g.
+    // "Odyssey G9 (3840x2160)") when available, via one DisplayConfig query. Headless/
+    // virtual displays often have no name → they keep the "Display N" fallback.
+    void ResolveDisplayNames(std::vector<MonEntry>& mons)
+    {
+        UINT32 nPath = 0, nMode = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPath, &nMode) != ERROR_SUCCESS) return;
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPath);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nMode);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPath, paths.data(), &nMode, modes.data(), nullptr) != ERROR_SUCCESS)
+            return;
+        paths.resize(nPath);
+        for (auto& p : paths)
+        {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = sizeof(src);
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
+            char gdi[32] = {};
+            WideCharToMultiByte(CP_UTF8, 0, src.viewGdiDeviceName, -1, gdi, sizeof(gdi), nullptr, nullptr);
+
+            DISPLAYCONFIG_TARGET_DEVICE_NAME tgt{};
+            tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            tgt.header.size = sizeof(tgt);
+            tgt.header.adapterId = p.targetInfo.adapterId;
+            tgt.header.id = p.targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&tgt.header) != ERROR_SUCCESS) continue;
+            if (tgt.monitorFriendlyDeviceName[0] == 0) continue;
+            char name[64] = {};
+            WideCharToMultiByte(CP_UTF8, 0, tgt.monitorFriendlyDeviceName, -1, name, sizeof(name), nullptr, nullptr);
+
+            for (auto& m : mons)
+                if (_stricmp(m.gdi, gdi) == 0)
+                    snprintf(m.label, sizeof(m.label), "%s  (%dx%d)", name, m.w, m.h);
+        }
     }
 
     // Specific label for a stereo format (for the compact status line) — includes
@@ -737,7 +778,7 @@ bool Gui::Render(GuiState& state)
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
                 ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
             }
-            if (ImGui::Button("This Display", ImVec2(half, 0))) post(ID_TRAY_SRC_MONITOR);
+            if (ImGui::Button("Fullscreen", ImVec2(half, 0))) post(ID_TRAY_SRC_MONITOR);
             if (monActive) ImGui::PopStyleColor(4);
 
             // Looking Glass → floating loupe of the monitor (drag/resize anywhere).
@@ -764,7 +805,8 @@ bool Gui::Render(GuiState& state)
             ImGui::SetNextItemWidth(-FLT_MIN);
             std::vector<MonEntry> mons;
             EnumDisplayMonitors(nullptr, nullptr, MonEnumProc, reinterpret_cast<LPARAM>(&mons));
-            const char* dispLabel = "Other display";
+            ResolveDisplayNames(mons);   // friendly EDID names where Windows knows them
+            const char* dispLabel = "Other Displays";
             if (dispActive)
                 for (auto& m : mons) if (m.mon == state.captureMonitor) dispLabel = m.label;
             if (ImGui::BeginCombo("##srcdisp", dispLabel, ImGuiComboFlags_HeightLargest))
