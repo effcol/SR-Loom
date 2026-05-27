@@ -27,6 +27,12 @@ namespace srw
         bool StartMonitor(HMONITOR monitor);
         void Stop();
 
+        // Whether the OS cursor is composited into the captured frame. Off by default
+        // (avoids a double cursor when weaving the same screen the cursor is on); turned
+        // ON for the display picker so you can see your pointer on a captured display.
+        // Call before Start*; also applied live if a session is running.
+        void SetCaptureCursor(bool enabled);
+
         bool IsActive() const { return m_active; }
 
         // Poll for the newest frame and copy it into the source texture.
@@ -67,6 +73,7 @@ namespace srw
         int                       m_frameH  = 0;
         int                       m_regX = 0, m_regY = 0, m_regW = 0, m_regH = 0; // crop, frame px
         bool                      m_active  = false;
+        bool                      m_captureCursor = false;   // composite the OS cursor into the frame
         // TYPELESS buffer so we can copy the BGRA frame into it and still create
         // an sRGB shader view (sRGB casting isn't allowed on a fully-typed res).
         DXGI_FORMAT               m_texFormat = DXGI_FORMAT_B8G8R8A8_TYPELESS;

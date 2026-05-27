@@ -161,10 +161,11 @@ bool Capture::StartCaptureInternalActive()
     m_impl->framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
     m_impl->session = m_impl->framePool.CreateCaptureSession(m_impl->item);
-    // Don't capture the OS mouse cursor: otherwise the woven output shows a second,
-    // trailing cursor on top of the real one. (Property added in Windows 10 2004;
-    // guarded so older builds still work.)
-    try { m_impl->session.IsCursorCaptureEnabled(false); } catch (...) {}
+    // Composite the OS cursor only when asked (the display picker wants it so you can
+    // see your pointer on the captured display; passthrough/overlay leave it off to
+    // avoid a second cursor on the screen the real one is already on). Property added
+    // in Windows 10 2004; guarded so older builds still work.
+    try { m_impl->session.IsCursorCaptureEnabled(m_captureCursor); } catch (...) {}
     // Remove the yellow "capture in progress" rectangle WGC draws around the
     // captured monitor/window. Needs borderless access (granted per-app on Win11);
     // all guarded so it degrades gracefully on older builds.
@@ -248,6 +249,13 @@ bool Capture::Update(bool& sizeChanged)
 void Capture::SetSourceRegion(int x, int y, int w, int h)
 {
     m_regX = x; m_regY = y; m_regW = w; m_regH = h;
+}
+
+void Capture::SetCaptureCursor(bool enabled)
+{
+    m_captureCursor = enabled;
+    if (m_impl && m_impl->session)
+        try { m_impl->session.IsCursorCaptureEnabled(enabled); } catch (...) {}
 }
 
 bool Capture::EnsureTarget(int width, int height)

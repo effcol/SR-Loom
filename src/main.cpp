@@ -352,6 +352,7 @@ namespace
     // Capture a window and present it as an in-place 3D overlay tracking that window.
     void UseWindow(AppState& app, HWND target)
     {
+        app.capture.SetCaptureCursor(false);   // overlay sits on the source; real cursor shows through
         if (target && app.capture.StartWindow(target))
         {
             app.source       = SourceKind::CaptureWindow;
@@ -401,6 +402,7 @@ namespace
     void UsePassthrough(AppState& app)
     {
         app.sourceWindow = nullptr;
+        app.capture.SetCaptureCursor(false);   // same screen as the real cursor → don't double it
         HMONITOR mon = SrMonitor(app);
         if (app.capture.StartMonitor(mon))
         {
@@ -416,6 +418,7 @@ namespace
     // crop, since the source isn't the screen we're drawing on, so there's no feedback).
     void UseDisplay(AppState& app, HMONITOR mon)
     {
+        app.capture.SetCaptureCursor(true);   // show the pointer on the captured display
         if (!mon || !app.capture.StartMonitor(mon))
             return;
         app.sourceWindow = nullptr;
