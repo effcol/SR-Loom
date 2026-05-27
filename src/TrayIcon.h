@@ -12,6 +12,9 @@ namespace srw
     // GUI -> main window: capture the window whose HWND is in lParam (window picker).
     constexpr UINT WM_APP_GUI_CAPTURE_WINDOW = WM_APP + 2;
 
+    // GUI -> main window: weave the display (monitor) whose HMONITOR is in lParam.
+    constexpr UINT WM_APP_GUI_CAPTURE_DISPLAY = WM_APP + 3;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {

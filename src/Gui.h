@@ -29,6 +29,9 @@ namespace srw
         int          pulfrichNd    = 1;      // index into PulfrichNdLevels
         int          framePackMode = 0;      // index into FramePackPresets
         char         sourceName[160] = "";   // what's being weaved (window title / "Monitor")
+        HMONITOR     srMonitor      = nullptr; // the SR display's monitor ("This Display")
+        HMONITOR     captureMonitor = nullptr; // the monitor currently being captured
+        bool         foreignDisplay = false;   // a picked (non-SR) display is the active source
     };
 
     class Gui

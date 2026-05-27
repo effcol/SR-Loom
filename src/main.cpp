@@ -58,6 +58,8 @@ namespace
         bool       loupeActive    = false;   // looking glass shown (keep its position across re-applies)
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
+        HMONITOR   sourceMonitor  = nullptr; // monitor being captured (passthrough / display picker)
+        bool       foreignDisplay = false;   // capturing a NON-SR display: weave the whole frame (no crop)
     };
 
     AppState* g_app = nullptr;
@@ -388,17 +390,41 @@ namespace
     // Start a passthrough capture of the SR display. What gets woven is the
     // region of that monitor beneath our (capture-excluded) window — full screen
     // in Fullscreen, or just the viewer's area in Windowed/LookingGlass.
+    // The monitor the SR display itself lives on (the "this display" passthrough target).
+    HMONITOR SrMonitor(const AppState& app)
+    {
+        const RECT& d = app.srDisplayRect;
+        POINT center{ (d.left + d.right) / 2, (d.top + d.bottom) / 2 };
+        return MonitorFromPoint(center, MONITOR_DEFAULTTOPRIMARY);
+    }
+
     void UsePassthrough(AppState& app)
     {
         app.sourceWindow = nullptr;
-        const RECT& d = app.srDisplayRect;
-        POINT center{ (d.left + d.right) / 2, (d.top + d.bottom) / 2 };
-        HMONITOR mon = MonitorFromPoint(center, MONITOR_DEFAULTTOPRIMARY);
+        HMONITOR mon = SrMonitor(app);
         if (app.capture.StartMonitor(mon))
         {
             app.source = SourceKind::CaptureMonitor;
+            app.sourceMonitor = mon;
+            app.foreignDisplay = false;   // this IS the SR display → crop to the viewer region
             app.captureRebind = true;
         }
+    }
+
+    // Weave another display (real or virtual) — picked from the GUI's display dropdown.
+    // The whole captured frame is woven onto the SR display in fullscreen (no region
+    // crop, since the source isn't the screen we're drawing on, so there's no feedback).
+    void UseDisplay(AppState& app, HMONITOR mon)
+    {
+        if (!mon || !app.capture.StartMonitor(mon))
+            return;
+        app.sourceWindow = nullptr;
+        app.source = SourceKind::CaptureMonitor;
+        app.sourceMonitor = mon;
+        app.foreignDisplay = (mon != SrMonitor(app));
+        app.captureRebind = true;
+        app.mode = OutputMode::Fullscreen;   // show the whole captured display, woven
+        EnsureWeaving(app);
     }
 
     // Map a window's client area to a rectangle in the captured frame's pixels.
@@ -495,8 +521,9 @@ namespace
         }
         else if (app.capture.IsActive())
         {
-            // For passthrough, weave only the region of the monitor beneath the viewer.
-            if (app.source == SourceKind::CaptureMonitor && app.capture.FrameWidth() > 0)
+            // SR-display passthrough: weave only the region beneath the viewer. A
+            // foreign display (the picker) is woven whole — no crop.
+            if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay && app.capture.FrameWidth() > 0)
             {
                 RECT r = PassthroughRegion(app, app.hwnd);
                 app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
@@ -586,6 +613,10 @@ namespace
 
         case WM_APP_GUI_CAPTURE_WINDOW:   // GUI window-picker chose a window to make 3D
             if (app) UseWindow(*app, reinterpret_cast<HWND>(lParam));
+            return 0;
+
+        case WM_APP_GUI_CAPTURE_DISPLAY:  // GUI display-picker chose a monitor to weave
+            if (app) UseDisplay(*app, reinterpret_cast<HMONITOR>(lParam));
             return 0;
 
         case WM_COMMAND:
@@ -888,6 +919,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 gs.pulfrichDelay = app.pulfrichDelay;
                 gs.pulfrichNd    = app.pulfrichNd;
                 gs.framePackMode = app.framePackMode;
+                gs.srMonitor     = SrMonitor(app);        // "this display" (excluded from the picker)
+                gs.captureMonitor = app.sourceMonitor;    // currently-captured display
+                gs.foreignDisplay = app.foreignDisplay;   // a picked display (vs this one) is active
                 // What's being weaved, for the GUI's collapsed summary line.
                 if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
                 {
@@ -895,7 +929,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                         strncpy_s(gs.sourceName, "Window", _TRUNCATE);
                 }
                 else
-                    strncpy_s(gs.sourceName, "Monitor", _TRUNCATE);
+                    strncpy_s(gs.sourceName, app.foreignDisplay ? "Display" : "Monitor", _TRUNCATE);
                 if (app.gui.Render(gs))
                 {
                     app.convergence   = gs.convergence;

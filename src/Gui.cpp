@@ -276,6 +276,22 @@ namespace
         return TRUE;
     }
 
+    // Enumerate the monitors (real + virtual/headless) into `out` for the display picker.
+    struct MonEntry { HMONITOR mon; char label[96]; };
+    BOOL CALLBACK MonEnumProc(HMONITOR mon, HDC, LPRECT, LPARAM lp)
+    {
+        auto* out = reinterpret_cast<std::vector<MonEntry>*>(lp);
+        MONITORINFOEXA mi{}; mi.cbSize = sizeof(mi);
+        GetMonitorInfoA(mon, &mi);
+        const int w = mi.rcMonitor.right - mi.rcMonitor.left;
+        const int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        MonEntry e{}; e.mon = mon;
+        snprintf(e.label, sizeof(e.label), "Display %d  (%dx%d)%s", (int)out->size() + 1, w, h,
+                 (mi.dwFlags & MONITORINFOF_PRIMARY) ? "  primary" : "");
+        out->push_back(e);
+        return TRUE;
+    }
+
     // Specific label for a stereo format (for the compact status line) — includes
     // the Full/Half and Row/Column variant so compact shows exactly what's active.
     const char* FormatCatLabel(StereoFormat f)
@@ -711,8 +727,9 @@ bool Gui::Render(GuiState& state)
             const float gap = 3.0f;
             const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
 
-            // Monitor → fullscreen weave of the whole screen.
+            // This Display → fullscreen passthrough weave of the SR display itself.
             const bool monActive = (state.source == SourceKind::CaptureMonitor &&
+                                    !state.foreignDisplay &&
                                     state.mode == OutputMode::Fullscreen);
             if (monActive) {
                 ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
@@ -720,7 +737,7 @@ bool Gui::Render(GuiState& state)
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
                 ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
             }
-            if (ImGui::Button("Monitor", ImVec2(half, 0))) post(ID_TRAY_SRC_MONITOR);
+            if (ImGui::Button("This Display", ImVec2(half, 0))) post(ID_TRAY_SRC_MONITOR);
             if (monActive) ImGui::PopStyleColor(4);
 
             // Looking Glass → floating loupe of the monitor (drag/resize anywhere).
@@ -734,6 +751,40 @@ bool Gui::Render(GuiState& state)
             }
             if (ImGui::Button("Looking Glass", ImVec2(half, 0))) post(ID_TRAY_LOOKING_GLASS);
             if (lgActive) ImGui::PopStyleColor(4);
+
+            // Other display → weave another real/virtual monitor (the SR display is
+            // "This Display" above, so it's excluded from this list). Enables the
+            // dummy-/virtual-HDMI fullscreen workflow: game fullscreen on that display,
+            // woven here.
+            const bool dispActive = (state.source == SourceKind::CaptureMonitor && state.foreignDisplay);
+            if (dispActive) {
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, g_accent);
+                ImGui::PushStyleColor(ImGuiCol_Text,    g_accentText);
+            }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            std::vector<MonEntry> mons;
+            EnumDisplayMonitors(nullptr, nullptr, MonEnumProc, reinterpret_cast<LPARAM>(&mons));
+            const char* dispLabel = "Other display";
+            if (dispActive)
+                for (auto& m : mons) if (m.mon == state.captureMonitor) dispLabel = m.label;
+            if (ImGui::BeginCombo("##srcdisp", dispLabel, ImGuiComboFlags_HeightLargest))
+            {
+                if (dispActive) ImGui::PopStyleColor(2);
+                int shown = 0;
+                for (int i = 0; i < (int)mons.size(); ++i)
+                {
+                    if (mons[i].mon == state.srMonitor) continue;   // that's "This Display"
+                    ImGui::PushID(i);
+                    const bool sel = dispActive && mons[i].mon == state.captureMonitor;
+                    if (ImGui::Selectable(mons[i].label, sel))
+                        PostMessageA(m_mainHwnd, WM_APP_GUI_CAPTURE_DISPLAY, 0, reinterpret_cast<LPARAM>(mons[i].mon));
+                    ImGui::PopID();
+                    ++shown;
+                }
+                if (shown == 0) ImGui::TextDisabled("No other displays");
+                ImGui::EndCombo();
+            }
+            else if (dispActive) ImGui::PopStyleColor(2);
 
             // Window → overlay the weave on a chosen window (windowed).
             const bool winActive = (state.source == SourceKind::CaptureWindow);
