@@ -231,6 +231,8 @@ namespace
                      SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
     }
 
+    void SetWeaving(AppState& app, bool enable);   // fwd decl (defined below)
+
     // Keep the overlay aligned with the tracked source window each frame.
     void UpdateOverlayTracking(AppState& app)
     {
@@ -239,7 +241,16 @@ namespace
 
         HWND src = app.sourceWindow;
         if (!src || !IsWindow(src))
-            return;  // source gone; leave last frame on screen
+        {
+            // The captured window has closed. Don't keep weaving its last frame —
+            // tear the overlay down and go idle (turns the lens off too), so the
+            // stale 3D image disappears without having to quit SR Loom.
+            app.capture.Stop();
+            app.sourceWindow = nullptr;
+            app.source = SourceKind::CaptureMonitor;   // sane default for the next enable
+            SetWeaving(app, false);
+            return;
+        }
 
         if (IsIconic(src) || !IsWindowVisible(src))
         {

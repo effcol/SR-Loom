@@ -11,7 +11,7 @@ panels). Point it at your screen, a window, or a floating "looking glass," pick
 the stereo format your content is in, and it converts and weaves it with
 head-tracked depth — no glasses.
 
-> **v1.1** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
+> **v1.2** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
 > display and the SR Platform runtime installed.
 
 ## What it does
@@ -54,10 +54,31 @@ plus a light/dark theme toggle.
 
 ## Requirements
 
-- 64-bit Windows 10/11
-- A Simulated Reality display + the **SR Platform runtime** installed (the SR
-  Service must be running — it provides the `SimulatedReality*.dll`s and the
-  eye-tracking)
+- **64-bit Windows 10 (1903+) or Windows 11** — older builds lack the
+  screen-capture APIs SR Loom relies on.
+- A Simulated Reality display + a **current SR Platform runtime** installed (the
+  SR Service must be running — it provides the `SimulatedReality*.dll`s and the
+  eye-tracking). An out-of-date runtime can be missing the modern weaver API.
+
+## Troubleshooting
+
+- **A "fullscreen" game shows a frozen 3D image / doesn't update / has no input.**
+  SR Loom captures and overlays via Windows' screen-capture API, which can't see
+  or draw over a game in **exclusive fullscreen**. Run the game in **borderless**
+  (or windowed) instead. Most modern games default to borderless-flip anyway; only
+  true exclusive fullscreen is unsupported. Games that gate their own 3D mode
+  behind exclusive fullscreen can't be driven yet.
+- **`CreateDX11Weaver ... could not be located`** — your **SR Platform runtime is
+  out of date**. Update it (and make sure the SR Service is running).
+- **`CreateDirect3D11DeviceFromDXGIDevice ... could not be located`** — your
+  **Windows is too old**; update to a current Windows 10/11.
+- **Windows Defender / SmartScreen flags it.** It's an unsigned app that captures
+  the screen and draws overlays, which trips antivirus heuristics — a false
+  positive. The source is here for review; you can "Allow on device," and the
+  detection has been reported to Microsoft.
+- **A yellow border around the captured area.** That's Windows' capture indicator.
+  SR Loom asks the OS to hide it, but Windows only grants that to packaged apps,
+  so it may remain.
 
 ## Releasing / running
 
