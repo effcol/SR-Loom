@@ -74,6 +74,8 @@ namespace srw
         ImFont*                  m_fontIcons   = nullptr;   // Segoe Fluent/MDL2 caption glyphs
         bool                     m_draggingBg = false;      // dragging the window by empty space
         POINT                    m_dragCur0{}, m_dragWin0{}; // cursor + window origin at drag start
+        bool                     m_acerNeedsAdmin = false;  // last Acer SpatialLabs write was ACCESS_DENIED
+        bool                     m_acerSectionOpen = false; // ACER SPATIALLABS section expanded?
         GuiState                 m_lastState;   // last rendered state (to repaint during a window drag)
         float                    m_sectionsH = 0.0f;   // measured height of the scrolling options
     };

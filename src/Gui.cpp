@@ -1,5 +1,6 @@
 #include "Gui.h"
 #include "TrayIcon.h"   // ID_TRAY_* command ids (reused by the GUI)
+#include "AcerSpatialLabs.h"
 #include "resource.h"   // IDI_TRAY (app icon)
 
 #include "imgui.h"
@@ -630,7 +631,7 @@ bool Gui::Render(GuiState& state)
                     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x,
                                                      nameBottom - ImGui::GetTextLineHeight()));
                     ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
-                    ImGui::TextUnformatted("v1.2");
+                    ImGui::TextUnformatted("v1.3");
                     ImGui::PopStyleColor();
 
                     Section("KEYBOARD SHORTCUTS");
@@ -973,17 +974,8 @@ bool Gui::Render(GuiState& state)
                     }
                 }
             }
-            else if (curCat == C_FP)
-            {
-                int fpN = 0; const FramePackPreset* fps = FramePackPresets(fpN);
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##fp", fps[state.framePackMode < fpN ? state.framePackMode : 0].label))
-                {
-                    for (int i = 0; i < fpN; ++i)
-                        if (ImGui::Selectable(fps[i].label, state.framePackMode == i)) post(ID_TRAY_FP_BASE + (UINT)i);
-                    ImGui::EndCombo();
-                }
-            }
+            // Frame Packing has no second dropdown -- the 720p and 1080p HDMI 1.4 modes
+            // share the same proportions, so a single preset covers both.
         }
 
         Section("ADJUST");
@@ -1007,6 +999,102 @@ bool Gui::Render(GuiState& state)
         };
         if (adjSlider("Convergence", "##conv", &state.convergence)) convChanged = true;
 
+        // Acer SpatialLabs: surface Acer's auto-detect registry toggles when an
+        // Acer display is present. Those auto-detects tend to fight SR Loom (auto-
+        // switching 2D/3D by focus, or auto-engaging on fullscreen apps), so giving
+        // the user a one-click off here removes a common class of flicker reports.
+        // Writes go to HKLM and need admin; if denied, offer a Restart-as-admin link.
+        if (AcerSpatialLabs::Available())
+        {
+            // Subtle header: dim "ACER SPATIALLABS" label + a small chevron right
+            // after the text (no boxed background, no full-width hit-rect).
+            ImGui::Dummy(ImVec2(0, 5));
+            {
+                const char* hdr   = "ACER SPATIALLABS";
+                const ImVec2 ts   = ImGui::CalcTextSize(hdr);
+                const float  h    = ImGui::GetFrameHeight();
+                const float  s    = 4.0f * m_dpiScale;     // chevron half-size
+                const float  gap  = 7.0f * m_dpiScale;     // text→chevron gap
+                const float  bw   = ts.x + gap + s * 2;    // hit rect width: text + arrow
+                const ImVec2 p    = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("##acerhdr", ImVec2(bw, h));
+                if (ImGui::IsItemClicked()) m_acerSectionOpen = !m_acerSectionOpen;
+                const bool hov = ImGui::IsItemHovered();
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+                dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+                const float cx = p.x + ts.x + gap + s;
+                const float cy = p.y + h * 0.5f;
+                if (m_acerSectionOpen)   // up = collapse
+                    dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                          ImVec2(cx + s, cy + s * 0.55f),
+                                          ImVec2(cx,     cy - s * 0.55f), col);
+                else                     // down = expand
+                    dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                          ImVec2(cx + s, cy - s * 0.55f),
+                                          ImVec2(cx,     cy + s * 0.55f), col);
+            }
+
+            if (m_acerSectionOpen)
+            {
+                const auto sls = AcerSpatialLabs::Read();
+                // Inlined row (vs RowToggle) so the tooltip only triggers when hovering
+                // the LABEL text — not the switch — per design.
+                auto slToggle = [&](const char* label, const char* tip,
+                                    AcerSpatialLabs::Setting s, int cur)
+                {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(label);
+                    if (ImGui::IsItemHovered())
+                    {
+                        // Cap the tooltip width and wrap, so it stays inside the panel
+                        // (we don't run with multi-viewport, so popups can't escape it).
+                        const float maxW = 280.0f * m_dpiScale;
+                        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                        ImGui::TextUnformatted(tip);
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
+                    ImGui::SameLine();
+                    const float w = ImGui::GetFrameHeight() * 1.8f;
+                    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - w - ImGui::GetStyle().WindowPadding.x);
+                    if (ToggleSwitch(label, cur == 1))
+                    {
+                        auto r = AcerSpatialLabs::Write(s, !(cur == 1));
+                        if (r == AcerSpatialLabs::WriteResult::NeedsAdmin)
+                            m_acerNeedsAdmin = true;
+                    }
+                };
+                slToggle("Focus Detection",
+                         "Acer turns weaving off when you look away from the screen. "
+                         "Turn this off to keep weaving on.",
+                         AcerSpatialLabs::Setting::Focus, sls.focusDetection);
+                slToggle("Fullscreen Detection",
+                         "Lets SpatialLabs Go weave non-fullscreen content. "
+                         "May not work on non-Pro models.",
+                         AcerSpatialLabs::Setting::Fullscreen, sls.fullscreenDetection);
+
+                if (m_acerNeedsAdmin)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
+                    ImGui::TextWrapped("Changing these writes to HKLM and needs admin.");
+                    ImGui::PopStyleColor();
+                    ImGui::PushStyleColor(ImGuiCol_Text, g_accent);
+                    if (ImGui::Selectable("Restart SR Loom as administrator", false, 0,
+                                          ImGui::CalcTextSize("Restart SR Loom as administrator")))
+                    {
+                        char exe[MAX_PATH] = {};
+                        GetModuleFileNameA(nullptr, exe, (DWORD)sizeof(exe));
+                        SHELLEXECUTEINFOA sei{}; sei.cbSize = sizeof(sei);
+                        sei.lpVerb = "runas"; sei.lpFile = exe; sei.nShow = SW_NORMAL;
+                        if (ShellExecuteExA(&sei)) PostQuitMessage(0);
+                    }
+                    ImGui::PopStyleColor();
+                }
+            }
+        }
     }
 
     m_sectionsH = ImGui::GetCursorPosY() + 4.0f;   // measured content height (snug sizing)

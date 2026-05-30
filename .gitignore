@@ -20,3 +20,11 @@ slnx.sqlite
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
+
+# tools/ holds the offline SIRA research script + saved-attempt patches, but
+# test anaglyph images (often third-party) and the generated comparison
+# outputs / parameter-sweep directories shouldn't be redistributed.
+tools/*.jpg
+tools/*.jpeg
+tools/*.png
+tools/sweep_*/

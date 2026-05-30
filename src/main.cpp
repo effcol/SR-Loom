@@ -7,6 +7,7 @@
 #include "SRWeaver.h"
 #include "TrayIcon.h"
 #include "Capture.h"
+#include "CaptureDXGI.h"
 #include "Converter.h"
 #include "Detector.h"
 #include "Gui.h"
@@ -35,7 +36,8 @@ namespace
         Renderer     renderer;
         SRWeaver     weaver;
         TrayIcon     tray;
-        Capture      capture;
+        Capture      capture;        // WGC: default; only API that can do per-window + window-exclusion
+        CaptureDXGI  captureDxgi;    // Output Duplication fallback for exclusive-fullscreen sources
         Converter    converter;
         Detector     detector;
         Gui          gui;
@@ -60,6 +62,14 @@ namespace
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
         HMONITOR   sourceMonitor  = nullptr; // monitor being captured (passthrough / display picker)
         bool       foreignDisplay = false;   // capturing a NON-SR display: weave the whole frame (no crop)
+        // Exclusive-fullscreen fallback state. WGC stops delivering frames when the
+        // captured monitor hosts a true exclusive-fullscreen app; we switch to DXGI
+        // Output Duplication for those, then back to WGC when fullscreen ends. Only
+        // engaged for foreign-display monitor capture (DXGI on the SR display itself
+        // would capture our own overlay -> feedback loop).
+        bool       dxgiActive     = false;
+        int        wgcStuck       = 0;     // consecutive iterations with no new WGC frame
+        int        dxgiCheckCtr   = 0;     // polls the foreground-fullscreen state every ~30 ticks
     };
 
     AppState* g_app = nullptr;
@@ -77,6 +87,29 @@ namespace
         rc.right  = GetSystemMetrics(SM_CXSCREEN);
         rc.bottom = GetSystemMetrics(SM_CYSCREEN);
         return rc;
+    }
+
+    // Heuristic: is the current foreground window covering the entirety of `target`?
+    // Used to decide whether to keep the DXGI Output Duplication fallback engaged.
+    // Catches both true exclusive fullscreen and borderless-fullscreen; we don't
+    // actually need to distinguish them -- DXGI captures both equally well, and the
+    // signal that we should swap BACK to WGC is "the foreground stopped being
+    // fullscreen-sized on this monitor".
+    bool ForegroundCoversMonitor(HMONITOR target)
+    {
+        if (!target) return false;
+        HWND fg = GetForegroundWindow();
+        if (!fg) return false;
+        if (MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) != target) return false;
+        MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfo(target, &mi)) return false;
+        RECT wr{};
+        if (!GetWindowRect(fg, &wr)) return false;
+        const LONG tol = 2;   // a few px of slop for borderless windows that don't quite hit the edge
+        return wr.left  <= mi.rcMonitor.left  + tol &&
+               wr.top   <= mi.rcMonitor.top   + tol &&
+               wr.right >= mi.rcMonitor.right - tol &&
+               wr.bottom >= mi.rcMonitor.bottom - tol;
     }
 
     // Apply fullscreen (borderless on the SR display) or windowed styling.
@@ -499,9 +532,6 @@ namespace
             return;
         }
 
-        UpdateOverlayTracking(app);     // follow the source window in overlay mode
-        UpdateLoupeInteractivity(app);  // hover the chrome to grab/move the looking glass
-
         if (IsIconic(app.hwnd))
         {
             Sleep(10);
@@ -510,6 +540,13 @@ namespace
 
         // Pace to the display before grabbing the newest frame (lowest latency).
         app.renderer.WaitForFrame();
+
+        // Anti-lag pattern (BlueSkyDefender's: max-frames-in-flight=1, sample input
+        // AFTER the wait): tracking source-window position / cursor hover gets read
+        // here so it's the freshest state by the time the frame reaches the panel.
+        // Reading them BEFORE WaitForFrame would let them go up-to-one-refresh stale.
+        UpdateOverlayTracking(app);     // follow the source window in overlay mode
+        UpdateLoupeInteractivity(app);  // hover the chrome to grab/move the looking glass
 
         // Resolve the current source frame: the test image, or a capture frame.
         ID3D11ShaderResourceView* srcSRV = nullptr;
@@ -531,30 +568,91 @@ namespace
                 RECT r = PassthroughRegion(app, app.hwnd);
                 app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
             }
-            gotFrame = app.capture.Update(capSizeChanged);   // refresh the capture texture in place
-            srcSRV = app.capture.SRV();
-            srcW   = app.capture.Width();
-            srcH   = app.capture.Height();
+            const bool wgcGotFrame = app.capture.Update(capSizeChanged);
+
+            // Track whether WGC is still delivering frames. An exclusive-fullscreen
+            // app on the captured monitor freezes WGC (it sees DWM's last composed
+            // frame and nothing new). For FOREIGN-DISPLAY monitor capture only, fall
+            // back to DXGI Output Duplication in that case. We never use DXGI for the
+            // SR display itself (it would capture our own woven overlay).
+            const bool dxgiEligible = (app.source == SourceKind::CaptureMonitor)
+                                      && app.foreignDisplay && app.sourceMonitor;
+            if (wgcGotFrame) app.wgcStuck = 0;
+            else if (dxgiEligible) ++app.wgcStuck;
+
+            if (!app.dxgiActive && dxgiEligible && app.wgcStuck > 30)   // ~500ms at typical render cadence
+            {
+                if (app.captureDxgi.StartMonitor(app.sourceMonitor))
+                {
+                    app.dxgiActive = true;
+                    app.captureRebind = true;
+                    app.dxgiCheckCtr = 0;
+                    Log("Capture: WGC stuck for %d ticks, switched to DXGI Output Duplication", app.wgcStuck);
+                }
+                app.wgcStuck = 0;
+            }
+
+            if (app.dxgiActive)
+            {
+                // Apply the same source region as WGC for foreign-display passthrough
+                // (a foreign display is woven whole today, so this is a no-op pre-crop,
+                // but matched to WGC's behaviour for symmetry).
+                bool dxgiSizeChanged = false;
+                gotFrame = app.captureDxgi.Update(dxgiSizeChanged);
+                if (dxgiSizeChanged) capSizeChanged = true;
+                srcSRV = app.captureDxgi.SRV();
+                srcW   = app.captureDxgi.Width();
+                srcH   = app.captureDxgi.Height();
+
+                // Periodically check whether the captured monitor's foreground is still
+                // covering it. When it stops (user alt-tabbed out, game quit), DXGI is
+                // no longer needed and we'd rather be back on WGC (cheaper, supports
+                // window exclusion if we switch source modes).
+                if (++app.dxgiCheckCtr > 30)
+                {
+                    app.dxgiCheckCtr = 0;
+                    if (!ForegroundCoversMonitor(app.sourceMonitor))
+                    {
+                        app.captureDxgi.Stop();
+                        app.dxgiActive = false;
+                        app.captureRebind = true;
+                        Log("Capture: foreground no longer fullscreen on monitor, back to WGC");
+                    }
+                }
+            }
+            else
+            {
+                gotFrame = wgcGotFrame;
+                srcSRV = app.capture.SRV();
+                srcW   = app.capture.Width();
+                srcH   = app.capture.Height();
+            }
         }
 
-        // FAST PATH: a live source already in full side-by-side layout (no eye swap,
-        // no convergence shift) is identical to what the converter would output — so
-        // feed the captured texture STRAIGHT to the weaver and skip the conversion
-        // pass entirely. Lowest latency / least GPU contention, which matters for
-        // games. (The capture texture updates in place each frame, so the weaver's
-        // input view only needs re-registering on a rebind or a resize.)
+        // FAST PATH: a live source already in side-by-side layout (full OR half SBS,
+        // no eye swap, no convergence shift) is identical to what the converter would
+        // output -- so feed the captured texture STRAIGHT to the weaver and skip the
+        // conversion pass entirely. Lowest latency / least GPU contention, which
+        // matters for games. Works for Half SBS too because the weaver only cares about
+        // per-eye-width / height in the source texture; the weaver's internal bilinear
+        // sample naturally un-squeezes anamorphic half-SBS when sampling to the woven
+        // output's per-eye dimensions. The capture texture updates in place each frame
+        // so the weaver's input view only needs re-registering on a rebind or a resize.
         const bool liveSource  = (app.source != SourceKind::TestImage);
         const bool temporalFmt = (app.format == StereoFormat::Pulfrich ||
                                   app.format == StereoFormat::FrameSequential);
         const bool noConv      = (app.convergence < 1e-4f && app.convergence > -1e-4f);
-        const bool identitySBS = liveSource && app.format == StereoFormat::FullSBS &&
-                                 !app.swapEyes && noConv;
+        const bool sbsFmt      = (app.format == StereoFormat::FullSBS ||
+                                  app.format == StereoFormat::HalfSBS);
+        const bool identitySBS = liveSource && sbsFmt && !app.swapEyes && noConv;
 
         if (identitySBS)
         {
             if (srcSRV && srcW > 0 && srcH > 0 && (app.captureRebind || capSizeChanged))
             {
-                app.weaver.SetInputView(srcSRV, srcW / 2, srcH, app.capture.SRVFormat());
+                const DXGI_FORMAT srvFmt = app.dxgiActive ? app.captureDxgi.SRVFormat()
+                                                          : app.capture.SRVFormat();
+                app.weaver.SetInputView(srcSRV, srcW / 2, srcH, srvFmt);
                 app.captureRebind = false;
             }
         }
@@ -577,7 +675,7 @@ namespace
             {
                 int fpN = 0; const FramePackPreset* fps = FramePackPresets(fpN);
                 const FramePackPreset& fp = fps[(app.framePackMode >= 0 && app.framePackMode < fpN) ? app.framePackMode : 0];
-                app.converter.SetFramePacking(fp.eyeFrac, fp.gapFrac);
+                app.converter.SetFramePacking(fp.eyeFrac, fp.gapFrac, fp.eyeAlign);
             }
             bool resized = false;
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
@@ -862,6 +960,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Initialize live capture (this is the default source).
     const bool capInit = app.capture.Initialize(app.renderer.Device(), app.renderer.Context());
     Log("WinMain: capture.Initialize=%d", capInit ? 1 : 0);
+    // DXGI Output Duplication is the fallback for exclusive-fullscreen capture; it
+    // sits idle until the render loop detects WGC isn't delivering frames for a
+    // foreign-display monitor source.
+    const bool dxgiInit = app.captureDxgi.Initialize(app.renderer.Device(), app.renderer.Context());
+    Log("WinMain: captureDxgi.Initialize=%d", dxgiInit ? 1 : 0);
 
     // Initialize the format-conversion stage (capture/image -> SBS for the weaver).
     if (!app.converter.Initialize(app.renderer.Device(), app.renderer.Context()))
@@ -871,24 +974,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
     Log("WinMain: converter.Initialize OK");
     app.detector.Initialize(app.renderer.Device(), app.renderer.Context());  // optional
+    Log("WinMain: detector.Initialize done");
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
     // Control GUI (left-click the tray icon). Shares the D3D11 device; lives in its
     // own top-level window so it can sit on any monitor with its own taskbar button.
-    if (!app.gui.Init(app.hwnd, app.renderer.Device(), app.renderer.Context()))
-        Log("WinMain: GUI init failed (control panel disabled)");
+    const bool guiOK = app.gui.Init(app.hwnd, app.renderer.Device(), app.renderer.Context());
+    Log("WinMain: gui.Init=%d", guiOK ? 1 : 0);
 
     // Tray icon + global hotkeys.
-    app.tray.Add(app.hwnd, "SR Loom — paused (SR off)");
-    RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
-    RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
-    RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+    const bool trayOK = app.tray.Add(app.hwnd, "SR Loom — paused (SR off)");
+    Log("WinMain: tray.Add=%d", trayOK ? 1 : 0);
+    const int hk1 = RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
+    const int hk2 = RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
+    const int hk3 = RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+    Log("WinMain: hotkeys W=%d F=%d C=%d", hk1, hk2, hk3);
     // RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D'); // auto-detect disabled
 
     // Start idle: release the SR session used to query the display rect so the
     // lens and camera stay off until the user enables weaving (Ctrl+Alt+W).
     app.weavingEnabled = false;
+    Log("WinMain: StopSR start");
     app.weaver.StopSR();
+    Log("WinMain: StopSR done");
     Log("WinMain: ready — idle in tray, entering main loop");
 
     bool running = true;

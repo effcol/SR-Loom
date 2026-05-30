@@ -23,7 +23,9 @@ namespace srw
         void SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmission, int delayFrames);
 
         // Frame-packing layout (fractions of source height), used when FramePacking.
-        void SetFramePacking(float eyeFrac, float gapFrac);
+        // eyeAlign shifts the bottom eye sampling start by this many source rows
+        // to correct residual rounding misalignment from the capture pipeline.
+        void SetFramePacking(float eyeFrac, float gapFrac, float eyeAlign);
 
         // Convergence: per-eye horizontal shift in UV (typically ±0.03).
         void SetConvergence(float shift) { m_convergence = shift; }
@@ -112,6 +114,7 @@ namespace srw
         int          m_pulfDelay = 1;      // delay frames
         float        m_fpEyeFrac = 1080.0f / 2205.0f;  // frame-packing eye height fraction
         float        m_fpGapFrac = 45.0f / 2205.0f;    // frame-packing gap fraction
+        float        m_fpEyeAlign = 0.0f;              // bottom-eye vertical alignment (source rows)
         float        m_convergence = 0.0f;             // per-eye horizontal shift (UV)
         DXGI_FORMAT  m_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };

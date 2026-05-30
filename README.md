@@ -11,7 +11,7 @@ panels). Point it at your screen, a window, or a floating "looking glass," pick
 the stereo format your content is in, and it converts and weaves it with
 head-tracked depth — no glasses.
 
-> **v1.2** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
+> **v1.3** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
 > display and the SR Platform runtime installed.
 
 ## What it does

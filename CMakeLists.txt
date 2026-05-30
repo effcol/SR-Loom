@@ -82,17 +82,21 @@ add_executable(SRLoom WIN32
     src/SRWeaver.cpp
     src/TrayIcon.cpp
     src/Capture.cpp
+    src/CaptureDXGI.cpp
     src/Converter.cpp
     src/Detector.cpp
     src/Gui.cpp
+    src/AcerSpatialLabs.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
     src/TrayIcon.h
     src/Capture.h
+    src/CaptureDXGI.h
     src/Converter.h
     src/Detector.h
     src/Gui.h
+    src/AcerSpatialLabs.h
     src/resource.h
     src/app.rc
     ${IMGUI_SOURCES}

@@ -51,15 +51,17 @@ namespace srw
         FramePacking        // HDMI 1.4: top eye, blanking gap, bottom eye
     };
 
-    // HDMI 1.4 frame-packing presets. 720p and 1080p share the same proportions
-    // (each eye 48.98% of height, ~2.04% blanking gap), so the decode is identical;
-    // the selector is offered for clarity. eyeFrac/gapFrac are fractions of height.
-    struct FramePackPreset { const char* label; float eyeFrac; float gapFrac; };
+    // HDMI 1.4 frame packing. The 720p (1280x1470) and 1080p (1920x2205) variants
+    // share the same proportions (eye 48.98%, gap 2.04% of the squeezed capture
+    // height) so a single preset covers both. eyeFrac/gapFrac are fractions of
+    // the captured height; eyeAlign is a residual vertical shift in source pixels
+    // for the bottom eye to correct capture-pipeline rounding (default 0 — works
+    // out of the box for most capture devices).
+    struct FramePackPreset { const char* label; float eyeFrac; float gapFrac; float eyeAlign; };
     inline const FramePackPreset* FramePackPresets(int& count)
     {
         static const FramePackPreset presets[] = {
-            { "1080p (1920x2205, 45-line gap)", 1080.0f / 2205.0f, 45.0f / 2205.0f },
-            { "720p (1280x1470, 30-line gap)",   720.0f / 1470.0f, 30.0f / 1470.0f },
+            { "HDMI 1.4 Frame Packing", 1080.0f / 2205.0f, 45.0f / 2205.0f, 0.0f },
         };
         count = (int)(sizeof(presets) / sizeof(presets[0]));
         return presets;

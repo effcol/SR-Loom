@@ -221,16 +221,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     AppendMenuA(fmtMenu, MF_POPUP | (pulfActive ? MF_CHECKED : 0),
                 reinterpret_cast<UINT_PTR>(pulfMenu), "Pulfrich Effect");
 
-    // Frame Packing submenu: HDMI 1.4 720p / 1080p.
-    HMENU fpMenu = CreatePopupMenu();
-    const bool fpActive = (format == StereoFormat::FramePacking);
-    int fpCount = 0;
-    const FramePackPreset* fps = FramePackPresets(fpCount);
-    for (int i = 0; i < fpCount; ++i)
-        AppendMenuA(fpMenu, MF_STRING | ((fpActive && i == s.framePackMode) ? MF_CHECKED : 0),
-                    ID_TRAY_FP_BASE + (UINT)i, fps[i].label);
-    AppendMenuA(fmtMenu, MF_POPUP | (fpActive ? MF_CHECKED : 0),
-                reinterpret_cast<UINT_PTR>(fpMenu), "Frame Packing (HDMI 1.4)");
+    // Frame Packing: single entry now (720p and 1080p HDMI 1.4 share the same proportions
+    // so the decode is identical -- no per-resolution submenu needed).
+    addFmt(fmtMenu, StereoFormat::FramePacking, "Frame Packing (HDMI 1.4)");
 
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");

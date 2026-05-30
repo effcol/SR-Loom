@@ -33,6 +33,7 @@ cbuffer Params : register(b0)
     float g_coarseW;   // coarse disparity-map width (px)
     float g_coarseH;   // coarse disparity-map height (px)
     float g_propStride; // colour-propagation pass: neighbour sample stride (texels)
+    float g_fpEyeAlign; // frame packing: bottom-eye vertical alignment (source rows)
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -442,13 +443,28 @@ float4 PSMain(VSOut i) : SV_Target
             // high contrast but a rival match) is now low-confidence and gets filled.
             float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
 
-            // Block processing (SIRA): borrow the aligned colour as a small patch
-            // average. FULL borrow here; propagation cleans up the low-confidence ones.
+            // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
+            // matched centre tap defines the "patch region"; each neighbour is
+            // exponentially down-weighted by its luminance difference from the
+            // centre, so taps that land across an object edge at the matched
+            // location contribute almost nothing. Plain 9-tap averaging smeared
+            // cross-eye colour across edges -> the persistent borrow-edge
+            // marbelling. SIRA's superpixel containment serves the same purpose;
+            // luminance-weighting is the shader-feasible analogue.
+            float3 centreC = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
+            float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
             float3 there = 0;
+            float  tw    = 1e-4;
             [unroll] for (int by = -1; by <= 1; ++by)
             [unroll] for (int bx = -1; bx <= 1; ++bx)
-                there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
-            there /= 9.0;
+            {
+                float3 s = srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+                float  sY = dot(s, float3(0.299, 0.587, 0.114));
+                float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
+                there += s * w;
+                tw    += w;
+            }
+            there /= tw;
 
             // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
@@ -477,12 +493,33 @@ float4 PSMain(VSOut i) : SV_Target
         if (g_pulfMode == 1)    return float4(cur * g_ndTrans, 1); // ND: darken this eye
         return float4(srcPrev.Sample(samp, e).rgb, 1);           // time delay: older frame
     }
-    // Frame-packing decode informed by 3DToElse / 3DToElse_NTM3D
-    // (CC BY 3.0, Jose Negrete "BlueSkyDefender" + NTM3D); re-implemented here.
+    // Frame-packing decode -- NTM-3D's corrected math from 3DToElse_NTM3D.fx (3DConsoleBridge).
+    // Original 3DToElse shader (CC BY 3.0, Jose Negrete "BlueSkyDefender" + NTM-3D);
+    // re-implemented in HLSL here. Capture devices squeeze the native 2205-line
+    // frame-packing signal into a 16:9 capture (typically 1080 lines), which squeezes
+    // the blanking gap too AND can leave the two eyes off by 1 row due to rounding. The
+    // OLD approach (even-split + stretch from the middle) hid the gap by stretching,
+    // distorting top/bottom geometry. This approach takes explicit top/bottom line
+    // counts (derived from the preset's eyeFrac/gapFrac applied to the actual captured
+    // height), uses sharedUsable = min(top, bottom) so both eyes contribute identical
+    // vertical geometry, places the bottom eye at its TRUE start (totalLines - bottomLines,
+    // not the even-split midpoint), and samples at pixel centres so bilinear doesn't
+    // bleed in the blanking rows. g_fpEyeAlign is a fractional source-pixel shift on
+    // the bottom eye for residual misalignment.
     else if (g_format == 7)   // HDMI 1.4 frame packing: top eye, gap, bottom eye
     {
-        float v = right ? (g_fpEyeFrac + g_fpGapFrac + e.y * g_fpEyeFrac)
-                        : (e.y * g_fpEyeFrac);
+        float totalLines  = g_srcH;
+        float topLines    = floor(g_fpEyeFrac * totalLines + 0.5);
+        float gapLines    = floor(g_fpGapFrac * totalLines + 0.5);
+        float bottomLines = max(1.0, totalLines - topLines - gapLines);
+        float sharedUsable = max(1.0, min(topLines, bottomLines));
+        float bottomStart  = totalLines - bottomLines;
+
+        // ("line" is a reserved word in HLSL -- it's a primitive topology type.)
+        float srcRow = e.y * (sharedUsable - 1.0);
+        float row  = right ? clamp(bottomStart + g_fpEyeAlign + srcRow, bottomStart, totalLines - 1.0)
+                           : srcRow;
+        float v = (row + 0.5) / totalLines;
         return srcTex.Sample(samp, float2(e.x, v));
     }
     else if (g_format == 8)   // Frame sequential: alternating L/R frames over time
@@ -538,7 +575,8 @@ float4 PSMain(VSOut i) : SV_Target
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
                float ndTrans; float fpEyeFrac; float fpGapFrac; float convergence;
-               float dispMaxUV; float coarseW; float coarseH; float propStride; };
+               float dispMaxUV; float coarseW; float coarseH; float propStride;
+               float fpEyeAlign; float _pad0; float _pad1; float _pad2; };
 }
 
 Converter::~Converter()
@@ -631,10 +669,11 @@ void Converter::SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmis
     m_pulfDelay = delayFrames < 1 ? 1 : (delayFrames > kHistory - 1 ? kHistory - 1 : delayFrames);
 }
 
-void Converter::SetFramePacking(float eyeFrac, float gapFrac)
+void Converter::SetFramePacking(float eyeFrac, float gapFrac, float eyeAlign)
 {
     m_fpEyeFrac = eyeFrac;
     m_fpGapFrac = gapFrac;
+    m_fpEyeAlign = eyeAlign;
 }
 
 bool Converter::EnsureOutput(int width, int height)
@@ -734,7 +773,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
                m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
                m_ndTrans, m_fpEyeFrac, m_fpGapFrac, m_convergence,
-               dispMaxUV, coarseW, coarseH, 0 };
+               dispMaxUV, coarseW, coarseH, 0,
+               m_fpEyeAlign, 0, 0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
 
@@ -794,7 +834,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     {
         auto cbProp = [&](float v) {
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
-                    0, 0, 0, 0, dispMaxUV, 0, 0, v };
+                    0, 0, 0, 0, dispMaxUV, 0, 0, v,
+                    0, 0, 0, 0 };
             m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &pcb, 0, 0);
         };
         ID3D11ShaderResourceView* nul = nullptr;
@@ -835,7 +876,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         CB copyCb{ 99, m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
                    m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
                    m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0,
-                   dispMaxUV, 0, 0, 0 };
+                   dispMaxUV, 0, 0, 0,
+                   0, 0, 0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &copyCb, 0, 0);
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)m_histW; vp.Height = (FLOAT)m_histH; vp.MaxDepth = 1.0f;
