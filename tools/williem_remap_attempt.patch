@@ -1,0 +1,348 @@
+diff --git a/src/Converter.cpp b/src/Converter.cpp
+index 03ff2b6..c78217f 100644
+--- a/src/Converter.cpp
++++ b/src/Converter.cpp
+@@ -13,6 +13,18 @@ namespace
+ Texture2D    srcTex  : register(t0);   // current source frame
+ Texture2D    srcPrev : register(t1);   // delayed source frame (Pulfrich time delay)
+ Texture2D    dispTex : register(t2);   // disparity map: .r=dLR .g=dRL (UV), .b=confidence
++// Williem (2015) R↔C local linear-regression remap (used by anaglyph mode 4
++// red/cyan only). Dual purpose -- the same HLSL slot is bound to two different
++// textures depending on the pass:
++//   - In PSAnaRemap: bound to the PACKED (R, G, R*G, R*R) mip pyramid; sampled
++//     at a coarse mip level to read tile-averaged regression statistics.
++//   - In PSAnaDisp / PSAnaRefine / PSMain mode 4 refine: bound to the REMAP
++//     OUTPUT with .r = remapped red (predicts local equivalent of green for
++//     this pixel's red), .g = original green, .b = original blue. Matching the
++//     remapped .r against the original .g gives the matcher two channels in the
++//     same intensity space, so block matching works on saturated content where
++//     raw red and green of the same surface have wildly different values.
++Texture2D    matchTex : register(t3);
+ SamplerState samp    : register(s0);
+ 
+ cbuffer Params : register(b0)
+@@ -99,10 +111,13 @@ R"HLSL(
+ // in blue adds noise). 5-tap window -> 4 adjacent differences per channel.
+ void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
+ {
++    // Read from matchTex (Williem remap): .r = remapped red, .g = original green.
++    // The remap brings .r and .g into the same intensity space on saturated
++    // content, so gradients of one against the other are meaningful for matching.
+     float rr[5], gg[5];
+     [unroll] for (int w = 0; w < 5; ++w)
+     {
+-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
++        float3 s = matchTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
+         rr[w] = s.r; gg[w] = s.g;
+     }
+     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
+@@ -114,13 +129,14 @@ void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
+ // making the match far more discriminative than a single horizontal line.
+ void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn[16])
+ {
++    // Read from matchTex (Williem remap), same reason as gradWindow above.
+     float2 dirs[4] = { float2(tx, 0), float2(0, ty), float2(tx, ty), float2(-tx, ty) };
+     [unroll] for (int a = 0; a < 4; ++a)
+     {
+         float rr[5], gg[5];
+         [unroll] for (int i = 0; i < 5; ++i)
+         {
+-            float3 s = srcTex.SampleLevel(samp, uv + dirs[a] * (float)(i - 2), 0).rgb;
++            float3 s = matchTex.SampleLevel(samp, uv + dirs[a] * (float)(i - 2), 0).rgb;
+             rr[i] = s.r; gg[i] = s.g;
+         }
+         [unroll] for (int k = 0; k < 4; ++k)
+@@ -144,6 +160,43 @@ float descCost(float a16[16], float b16[16])
+     return sad / en;
+ }
+ 
++// Williem (2015) §A: pack (R, G, R*G, R*R) per pixel so that GenerateMips on this
++// texture yields tile-averaged versions of all four quantities at every level. The
++// remap pass below then reads one coarse mip to do a per-pixel local R-to-G
++// regression -- cheap stand-in for the paper's iterative tile-wise fit.
++float4 PSAnaPack(VSOut i) : SV_Target
++{
++    float3 c = srcTex.SampleLevel(samp, i.uv, 0.0).rgb;
++    return float4(c.r, c.g, c.r * c.g, c.r * c.r);
++}
++
++// Williem R↔C local linear regression: at each pixel, sample the packed mip pyramid
++// at a coarse level (= tile-averaged means of R, G, R*G, R*R over ~32-64 src px),
++// fit the local map G ≈ a*R + b in closed form, then output (a*R + b, G, B, 1).
++// .r is the REMAPPED red -- it predicts what the green channel WOULD be at this
++// pixel given the local R->G relationship. Downstream disparity matching does
++// remappedR vs G, which works because both are now in the green-channel intensity
++// space (saturated red wrapper: raw R=255, raw G=30, remappedR ≈ 30, so the
++// matcher sees two near-identical channels for the same surface and can match it).
++//
++// matchTex here is bound to the PACKED (R, G, R*G, R*R) mip pyramid; g_propStride
++// is the mip level the caller picked for the desired tile size.
++float4 PSAnaRemap(VSOut i) : SV_Target
++{
++    float4 m = matchTex.SampleLevel(samp, i.uv, g_propStride);
++    float3 c = srcTex.SampleLevel(samp, i.uv, 0.0).rgb;
++    float meanR  = m.r;
++    float meanG  = m.g;
++    float meanRG = m.b;
++    float meanRR = m.a;
++    float varR  = max(meanRR - meanR * meanR, 1.0 / 65025.0);  // floor at one 8-bit step squared
++    float covRG = meanRG - meanR * meanG;
++    float a = covRG / varR;
++    float b = meanG - a * meanR;
++    float remappedR = saturate(a * c.r + b);
++    return float4(remappedR, c.g, c.b, 1.0);
++}
++
+ // Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal
+ // disparity between the L (red) and R (green) views, both directions, via 4-angle
+ // gradient matching. Low resolution makes winner-take-all robust and smooth.
+@@ -442,13 +495,28 @@ float4 PSMain(VSOut i) : SV_Target
+             // high contrast but a rival match) is now low-confidence and gets filled.
+             float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
+ 
+-            // Block processing (SIRA): borrow the aligned colour as a small patch
+-            // average. FULL borrow here; propagation cleans up the low-confidence ones.
++            // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
++            // matched centre tap defines the "patch region"; each neighbour is
++            // exponentially down-weighted by its luminance difference from the
++            // centre, so taps that land across an object edge at the matched
++            // location contribute almost nothing. Plain 9-tap averaging smeared
++            // cross-eye colour across edges -> the persistent borrow-edge
++            // marbelling. SIRA's superpixel containment serves the same purpose;
++            // luminance-weighting is the shader-feasible analogue.
++            float3 centreC = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
++            float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
+             float3 there = 0;
++            float  tw    = 1e-4;
+             [unroll] for (int by = -1; by <= 1; ++by)
+             [unroll] for (int bx = -1; bx <= 1; ++bx)
+-                there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+-            there /= 9.0;
++            {
++                float3 s = srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
++                float  sY = dot(s, float3(0.299, 0.587, 0.114));
++                float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
++                there += s * w;
++                tw    += w;
++            }
++            there /= tw;
+ 
+             // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
+             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
+@@ -583,6 +651,8 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
+ 
+     // Disparity passes (used only by the multi-scale anaglyph recovery mode).
+     struct { const char* entry; ID3D11PixelShader** out; } passes[] = {
++        { "PSAnaPack",    &m_psPack    },
++        { "PSAnaRemap",   &m_psRemap   },
+         { "PSAnaDisp",    &m_psCoarse  },
+         { "PSAnaRefine",  &m_psRefine  },
+         { "PSAnaFill",    &m_psFill    },
+@@ -725,8 +795,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+         EnsureDispTarget(m_disp1, w4,  h4);
+         EnsureDispTarget(m_disp2, w4,  h4);
+         EnsureDispTarget(m_dispF, w4,  h4);
++        EnsureRemap(srcWidth, srcHeight);   // Williem pack + match (source-sized)
+     }
+-    else ReleaseDisparity();
++    else { ReleaseDisparity(); ReleaseRemap(); }
+ 
+     const float dispMaxUV = 0.06f;
+     auto uploadCB = [&](float coarseW, float coarseH)
+@@ -746,7 +817,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+     m_context->PSSetConstantBuffers(0, 1, &m_cbuffer);
+ 
+     // Render one disparity-pyramid level: source at t0, an optional coarser-level
+-    // disparity at t2, output to a DispTarget.
++    // disparity at t2, the Williem remap at t3, output to a DispTarget.
+     auto runDispPass = [&](ID3D11PixelShader* ps, const DispTarget& rt,
+                            ID3D11ShaderResourceView* prior)
+     {
+@@ -755,16 +826,56 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+         m_context->PSSetShader(ps, nullptr, 0);
+         m_context->OMSetRenderTargets(1, &rt.rtv, nullptr);
+         m_context->RSSetViewports(1, &vp);
+-        ID3D11ShaderResourceView* srvs[3] = { source, nullptr, prior };
+-        m_context->PSSetShaderResources(0, 3, srvs);
++        ID3D11ShaderResourceView* srvs[4] = { source, nullptr, prior, m_matchSRV };
++        m_context->PSSetShaderResources(0, 4, srvs);
+         m_context->Draw(3, 0);
+-        ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
+-        m_context->PSSetShaderResources(0, 3, nulls);
++        ID3D11ShaderResourceView* nulls[4] = { nullptr, nullptr, nullptr, nullptr };
++        m_context->PSSetShaderResources(0, 4, nulls);
+         m_context->OMSetRenderTargets(0, nullptr, nullptr);
+     };
+ 
+-    if (anaRecover && m_disp0.rtv && m_disp1.rtv && m_disp2.rtv && m_dispF.rtv)
++    if (anaRecover && m_disp0.rtv && m_disp1.rtv && m_disp2.rtv && m_dispF.rtv
++                   && m_packRTV && m_matchRTV)
+     {
++        // Williem pre-pass: (1) pack (R, G, R*G, R*R) at source res, (2) GenerateMips
++        // gives tile-averaged means at every level, (3) PSAnaRemap samples a coarse
++        // mip and writes a per-pixel R->G linear-regression remapped red into matchTex.
++        // gradWindow / buildDesc now read matchTex.r (remapped) vs matchTex.g (orig
++        // green), which actually correspond on saturated content.
++        ID3D11ShaderResourceView* nul = nullptr;
++        D3D11_VIEWPORT pvp{};
++        pvp.Width = (FLOAT)srcWidth; pvp.Height = (FLOAT)srcHeight; pvp.MaxDepth = 1.0f;
++        uploadCB((float)srcWidth, (float)srcHeight);
++        m_context->PSSetShader(m_psPack, nullptr, 0);
++        m_context->OMSetRenderTargets(1, &m_packRTV, nullptr);
++        m_context->RSSetViewports(1, &pvp);
++        m_context->PSSetShaderResources(0, 1, &source);
++        m_context->Draw(3, 0);
++        m_context->PSSetShaderResources(0, 1, &nul);
++        m_context->OMSetRenderTargets(0, nullptr, nullptr);
++
++        m_context->GenerateMips(m_packSRV);
++
++        // Mip 5 ≈ 32-px-tile regression statistic regardless of source resolution.
++        // Clamp to actual mip count for very small sources.
++        const float mipLevel = (float)((m_packMips > 5) ? 5 : (m_packMips - 1));
++        CB rcb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
++                m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
++                m_ndTrans, m_fpEyeFrac, m_fpGapFrac, m_convergence,
++                dispMaxUV, (float)srcWidth, (float)srcHeight, mipLevel };
++        m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &rcb, 0, 0);
++        m_context->PSSetShader(m_psRemap, nullptr, 0);
++        m_context->OMSetRenderTargets(1, &m_matchRTV, nullptr);
++        m_context->RSSetViewports(1, &pvp);
++        // PSAnaRemap reads srcTex (t0) for the per-pixel R, G, B and matchTex (t3)
++        // bound to packSRV to sample the mip-averaged regression stats.
++        ID3D11ShaderResourceView* rsrvs[4] = { source, nullptr, nullptr, m_packSRV };
++        m_context->PSSetShaderResources(0, 4, rsrvs);
++        m_context->Draw(3, 0);
++        ID3D11ShaderResourceView* rnulls[4] = { nullptr, nullptr, nullptr, nullptr };
++        m_context->PSSetShaderResources(0, 4, rnulls);
++        m_context->OMSetRenderTargets(0, nullptr, nullptr);
++
+         uploadCB((float)w16, (float)h16); runDispPass(m_psCoarse, m_disp0, nullptr);      // full search 1/16
+         uploadCB((float)w4,  (float)h4);  runDispPass(m_psRefine, m_disp1, m_disp0.srv);  // refine 1/4
+                                           runDispPass(m_psFill,   m_disp2, m_disp1.srv);  // occlusion fill 1/4
+@@ -780,11 +891,14 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+         m_context->PSSetShader(m_ps, nullptr, 0);
+         m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
+         m_context->RSSetViewports(1, &vp);
+-        ID3D11ShaderResourceView* srvs[3] = { source, delayedSRV, anaRecover ? m_dispF.srv : nullptr };
+-        m_context->PSSetShaderResources(0, 3, srvs);
++        // anaglyph mode 4 refine inside PSMain reads matchTex (t3); other modes ignore it.
++        ID3D11ShaderResourceView* srvs[4] = { source, delayedSRV,
++                                              anaRecover ? m_dispF.srv : nullptr,
++                                              anaRecover ? m_matchSRV : nullptr };
++        m_context->PSSetShaderResources(0, 4, srvs);
+         m_context->Draw(3, 0);
+-        ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
+-        m_context->PSSetShaderResources(0, 3, nulls);
++        ID3D11ShaderResourceView* nulls[4] = { nullptr, nullptr, nullptr, nullptr };
++        m_context->PSSetShaderResources(0, 4, nulls);
+     }
+ 
+     // Push-pull colorization (anaglyph recovery): split the recovered SBS into two
+@@ -932,13 +1046,65 @@ void Converter::ReleaseDisparity()
+     ReleaseDispTarget(m_dispF);
+ }
+ 
++bool Converter::EnsureRemap(int width, int height)
++{
++    if (m_packTex && width == m_remapW && height == m_remapH)
++        return false;
++
++    ReleaseRemap();
++
++    // m_packTex: (R, G, R*G, R*R) at source size, FULL mip chain so that
++    // GenerateMips gives tile-averaged means at every level. RGBA16F: products
++    // are in [0,1] but we want headroom and consistent precision across levels.
++    m_packMips = 1;
++    for (int w = width, h = height; w > 1 || h > 1; ) { w = (w > 1) ? w / 2 : 1; h = (h > 1) ? h / 2 : 1; ++m_packMips; }
++    D3D11_TEXTURE2D_DESC pd{};
++    pd.Width = (UINT)width; pd.Height = (UINT)height; pd.MipLevels = (UINT)m_packMips; pd.ArraySize = 1;
++    pd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; pd.SampleDesc.Count = 1; pd.Usage = D3D11_USAGE_DEFAULT;
++    pd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    pd.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
++    if (FAILED(m_device->CreateTexture2D(&pd, nullptr, &m_packTex))) { ReleaseRemap(); return false; }
++    // RTV must reference mip 0 explicitly (we only ever write the finest level).
++    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
++    rtvDesc.Format = pd.Format;
++    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++    rtvDesc.Texture2D.MipSlice = 0;
++    if (FAILED(m_device->CreateRenderTargetView(m_packTex, &rtvDesc, &m_packRTV))) { ReleaseRemap(); return false; }
++    if (FAILED(m_device->CreateShaderResourceView(m_packTex, nullptr, &m_packSRV))) { ReleaseRemap(); return false; }
++
++    // m_matchTex: (remapped R, original G, original B, 1) at source size. sRGB so
++    // gradWindow / buildDesc read it in the same linear space they'd read srcTex.
++    D3D11_TEXTURE2D_DESC md{};
++    md.Width = (UINT)width; md.Height = (UINT)height; md.MipLevels = 1; md.ArraySize = 1;
++    md.Format = m_format;   // R8G8B8A8 sRGB; matches srcTex's space
++    md.SampleDesc.Count = 1; md.Usage = D3D11_USAGE_DEFAULT;
++    md.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++    if (FAILED(m_device->CreateTexture2D(&md, nullptr, &m_matchTex))) { ReleaseRemap(); return false; }
++    if (FAILED(m_device->CreateRenderTargetView(m_matchTex, nullptr, &m_matchRTV))) { ReleaseRemap(); return false; }
++    if (FAILED(m_device->CreateShaderResourceView(m_matchTex, nullptr, &m_matchSRV))) { ReleaseRemap(); return false; }
++
++    m_remapW = width; m_remapH = height;
++    return true;
++}
++
++void Converter::ReleaseRemap()
++{
++    SAFE_RELEASE(m_matchSRV); SAFE_RELEASE(m_matchRTV); SAFE_RELEASE(m_matchTex);
++    SAFE_RELEASE(m_packSRV);  SAFE_RELEASE(m_packRTV);  SAFE_RELEASE(m_packTex);
++    m_packMips = 0;
++    m_remapW = m_remapH = 0;
++}
++
+ void Converter::Shutdown()
+ {
+     ReleaseOutput();
+     ReleaseHistory();
+     ReleaseDisparity();
++    ReleaseRemap();
+     SAFE_RELEASE(m_cbuffer);
+     SAFE_RELEASE(m_sampler);
++    SAFE_RELEASE(m_psRemap);
++    SAFE_RELEASE(m_psPack);
+     SAFE_RELEASE(m_psCompose);
+     SAFE_RELEASE(m_psSplit);
+     SAFE_RELEASE(m_psSmooth);
+diff --git a/src/Converter.h b/src/Converter.h
+index bf80791..3a9c518 100644
+--- a/src/Converter.h
++++ b/src/Converter.h
+@@ -56,6 +56,8 @@ namespace srw
+         bool EnsureDispTarget(DispTarget& t, int width, int height);
+         void ReleaseDispTarget(DispTarget& t);
+         void ReleaseDisparity();   // releases all disparity levels
++        bool EnsureRemap(int width, int height);   // Williem pack + match (source-sized)
++        void ReleaseRemap();
+ 
+         static const int kHistory = 6;  // frame-history ring depth (delay 1..5)
+ 
+@@ -63,6 +65,8 @@ namespace srw
+         ID3D11DeviceContext*     m_context = nullptr;
+         ID3D11VertexShader*      m_vs      = nullptr;
+         ID3D11PixelShader*       m_ps      = nullptr;
++        ID3D11PixelShader*       m_psPack   = nullptr;  // Williem: pack (R, G, R*G, R*R) for local regression
++        ID3D11PixelShader*       m_psRemap  = nullptr;  // Williem: per-pixel local R->G linear regression remap
+         ID3D11PixelShader*       m_psCoarse = nullptr;  // full-search disparity (coarsest level)
+         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
+         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
+@@ -78,6 +82,18 @@ namespace srw
+         DispTarget m_disp2;   // occlusion-filled (1/4)
+         DispTarget m_dispF;   // edge-aware smoothed (1/4); the compose pass reads this
+ 
++        // Williem R↔C remap textures (source-size, RGBA). m_packTex holds (R, G, R*G,
++        // R*R) with a full mip chain (Gaussian downsamples = tile-averaged regression
++        // statistics); m_matchTex holds the remap output (.r = remapped red, .gb = orig).
++        ID3D11Texture2D*          m_packTex   = nullptr;
++        ID3D11RenderTargetView*   m_packRTV   = nullptr;   // mip 0
++        ID3D11ShaderResourceView* m_packSRV   = nullptr;   // full chain
++        int                       m_packMips  = 0;
++        ID3D11Texture2D*          m_matchTex  = nullptr;
++        ID3D11RenderTargetView*   m_matchRTV  = nullptr;
++        ID3D11ShaderResourceView* m_matchSRV  = nullptr;
++        int                       m_remapW = 0, m_remapH = 0;
++
+         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
+         ID3D11RenderTargetView*   m_outRTV = nullptr;
+         ID3D11ShaderResourceView* m_outSRV = nullptr;

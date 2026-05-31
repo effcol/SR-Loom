@@ -1,0 +1,284 @@
+diff --git a/src/Converter.cpp b/src/Converter.cpp
+index 03ff2b6..95e15b0 100644
+--- a/src/Converter.cpp
++++ b/src/Converter.cpp
+@@ -295,13 +295,62 @@ float4 PSAnaSplit(VSOut i) : SV_Target
+ {
+     float2 uv = float2(g_propStride + i.uv.x * 0.5, i.uv.y);   // left half or right half
+     float4 s = srcTex.SampleLevel(samp, uv, 0.0);              // recovered SBS; .a = confidence
+-    // Floor the weight so a zero-confidence pixel's colour isn't multiplied away to
+-    // black; un-premultiply (rgb*w)/w still recovers its colour, and valid pixels
+-    // (weight ~1) still dominate the confidence-weighted mip averages (~50x).
+-    float w = max(s.a, 0.02);
++    // Tiny floor on the weight so we never divide by exactly zero when un-premultiplying.
++    // Edge-aware PSAnaPyramidDown can correctly suppress low-conf pixels via the
++    // bilateral weight, so the floor is now just numerical safety (was 0.02 to keep
++    // some pull for Gaussian-downsample fairness; that's no longer needed).
++    float w = max(s.a, 1e-4);
+     return float4(s.rgb * w, w);
+ }
+ 
++// Edge-aware 2x2 downsample for the push-pull pyramid (replaces hardware GenerateMips).
++// For each output pixel, reads the 2x2 region of the previous level, picks the
++// most-confident input's luminance as a "region reference", then averages all 4
++// weighted by (confidence * exp(-|luma_i - ref| * k)). Inputs across an object
++// boundary get vanishing weight, so the dominant region's colour stays dominant
++// at every coarser level -- no Gaussian-style yellow-green-from-the-boundary
++// averages that produce the blob fills in interiors.
++//
++// Input bound to t0 = previous level as a single-mip SRV; g_srcW/g_srcH = input
++// level's dimensions (NOT the source frame's), used for the half-input-texel offsets.
++float4 PSAnaPyramidDown(VSOut i) : SV_Target
++{
++    float ix = 1.0 / max(g_srcW, 1.0);
++    float iy = 1.0 / max(g_srcH, 1.0);
++    float2 b = i.uv;
++    float4 s00 = srcTex.SampleLevel(samp, b + float2(-0.5 * ix, -0.5 * iy), 0.0);
++    float4 s10 = srcTex.SampleLevel(samp, b + float2(+0.5 * ix, -0.5 * iy), 0.0);
++    float4 s01 = srcTex.SampleLevel(samp, b + float2(-0.5 * ix, +0.5 * iy), 0.0);
++    float4 s11 = srcTex.SampleLevel(samp, b + float2(+0.5 * ix, +0.5 * iy), 0.0);
++
++    float3 c00 = s00.rgb / max(s00.a, 1e-4);
++    float3 c10 = s10.rgb / max(s10.a, 1e-4);
++    float3 c01 = s01.rgb / max(s01.a, 1e-4);
++    float3 c11 = s11.rgb / max(s11.a, 1e-4);
++    float3 Y3 = float3(0.299, 0.587, 0.114);
++    float y00 = dot(c00, Y3), y10 = dot(c10, Y3);
++    float y01 = dot(c01, Y3), y11 = dot(c11, Y3);
++
++    // Reference luminance = the most-confident input's luma. Picking a single
++    // anchor (rather than the mean) means cross-edge inputs are judged against
++    // the dominant-region's brightness, not against a halfway-blended value.
++    float refY = y00; float maxA = s00.a;
++    if (s10.a > maxA) { refY = y10; maxA = s10.a; }
++    if (s01.a > maxA) { refY = y01; maxA = s01.a; }
++    if (s11.a > maxA) { refY = y11; maxA = s11.a; }
++
++    const float k = 10.0;   // luminance edge stiffness (~0.1 luma delta -> ~37% weight)
++    float w00 = s00.a * exp(-abs(y00 - refY) * k);
++    float w10 = s10.a * exp(-abs(y10 - refY) * k);
++    float w01 = s01.a * exp(-abs(y01 - refY) * k);
++    float w11 = s11.a * exp(-abs(y11 - refY) * k);
++    float wsum = w00 + w10 + w01 + w11 + 1e-6;
++
++    // Weighted average of premultiplied inputs preserves the (rgb*a, a) invariant
++    // so the compose pass can un-premultiply normally.
++    return (s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11) / wsum;
++}
++
+ // COMPOSE: rebuild the SBS. For each pixel walk the eye's mip pyramid from finest to
+ // coarsest, accumulating colour weighted by confidence until full. A confident pixel
+ // uses its own (finest) colour; a low-confidence pixel (flat region / occlusion /
+@@ -442,19 +491,65 @@ float4 PSMain(VSOut i) : SV_Target
+             // high contrast but a rival match) is now low-confidence and gets filled.
+             float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
+ 
+-            // Block processing (SIRA): borrow the aligned colour as a small patch
+-            // average. FULL borrow here; propagation cleans up the low-confidence ones.
++            // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
++            // matched centre tap defines the "patch region"; each neighbour is
++            // exponentially down-weighted by its luminance difference from the
++            // centre, so taps that land across an object edge at the matched
++            // location contribute almost nothing. Plain 9-tap averaging smeared
++            // cross-eye colour across edges -> the persistent borrow-edge
++            // marbelling. SIRA's superpixel containment serves the same purpose;
++            // luminance-weighting is the shader-feasible analogue.
++            float3 centreC = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
++            float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
+             float3 there = 0;
++            float  tw    = 1e-4;
+             [unroll] for (int by = -1; by <= 1; ++by)
+             [unroll] for (int bx = -1; bx <= 1; ++bx)
+-                there += srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+-            there /= 9.0;
++            {
++                float3 s = srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
++                float  sY = dot(s, float3(0.299, 0.587, 0.114));
++                float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
++                there += s * w;
++                tw    += w;
++            }
++            there /= tw;
+ 
+             // PER-EYE: own channel(s) + the missing channel(s) from the aligned borrow.
+             float3 alignedCol = (eye == 0) ? float3(c.r, there.g, there.b)
+                                            : float3(there.r, c.g, c.b);
+             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
+-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
++            float3 recovered = saturate(alignedCol * (eyeY / aY));
++
++            // Mode-0 fallback for low-confidence pixels. Per-eye luminance + shared
++            // 2D-blurred anaglyph chroma, LUMINANCE-WEIGHTED so chroma doesn't cross
++            // object boundaries. 9x5 2D window (vs the old 9x1 horizontal-only) so
++            // an interior pixel of a large coloured region can reach across rows
++            // and pick up chroma info that horizontal-only would miss -- especially
++            // important when disparity offset puts the matching colour info one or
++            // two rows away. Still cheap (45 taps, all in-shader, no extra passes).
++            float yCentre = dot(c, float3(0.299, 0.587, 0.114));
++            float3 blurCol = 0;
++            float  blurW   = 1e-4;
++            [unroll] for (int by = -2; by <= 2; ++by)
++            [unroll] for (int bx = -4; bx <= 4; ++bx)
++            {
++                float2 nuv = float2(e.x + (float)bx / g_srcW, e.y + (float)by / g_srcH);
++                float3 nC = srcTex.Sample(samp, nuv).rgb;
++                float  nY = dot(nC, float3(0.299, 0.587, 0.114));
++                float  w  = exp(-abs(nY - yCentre) * 10.0);  // ~0.1 luma delta -> ~37% weight
++                blurCol += nC * w;
++                blurW   += w;
++            }
++            blurCol /= blurW;
++            float blurY = max(dot(blurCol, float3(0.299, 0.587, 0.114)), 1e-3);
++            float3 fallback = saturate(blurCol * (eyeY / blurY));
++
++            // Smooth blend: high conf -> recovered, low conf -> fallback. Push-pull
++            // re-enabled with alpha = blend so its (now EDGE-AWARE) pyramid spreads
++            // confident recovered colours into solid interiors without the
++            // Gaussian-downsample blob risk that killed it before.
++            float blend = smoothstep(0.05, 0.30, conf);
++            return float4(lerp(fallback, recovered, blend), blend);
+         }
+ 
+         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
+@@ -587,8 +682,9 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
+         { "PSAnaRefine",  &m_psRefine  },
+         { "PSAnaFill",    &m_psFill    },
+         { "PSAnaSmooth",  &m_psSmooth  },
+-        { "PSAnaSplit",   &m_psSplit   },
+-        { "PSAnaCompose", &m_psCompose },
++        { "PSAnaSplit",       &m_psSplit   },
++        { "PSAnaPyramidDown", &m_psPyDown  },
++        { "PSAnaCompose",     &m_psCompose },
+     };
+     for (auto& p : passes)
+     {
+@@ -675,6 +771,28 @@ bool Converter::EnsureOutput(int width, int height)
+     if (FAILED(m_device->CreateRenderTargetView(m_ppRightTex, nullptr, &m_ppRightRTV))) { ReleaseOutput(); return false; }
+     if (FAILED(m_device->CreateShaderResourceView(m_ppRightTex, nullptr, &m_ppRightSRV))) { ReleaseOutput(); return false; }
+ 
++    // Per-mip RTVs (write target) and SRVs (single-mip source) for edge-aware
++    // downsample: PSAnaPyramidDown reads mip L via *SRVs[L], writes mip L+1 via
++    // *RTVs[L+1]. Hardware can't expose mip L for both read and write at once
++    // unless they're distinct view objects, hence per-level views.
++    for (int L = 0; L < m_ppMips && L < kMaxPpMips; ++L)
++    {
++        D3D11_RENDER_TARGET_VIEW_DESC rd{};
++        rd.Format = pd.Format;
++        rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++        rd.Texture2D.MipSlice = (UINT)L;
++        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
++        sd.Format = pd.Format;
++        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++        sd.Texture2D.MostDetailedMip = (UINT)L;
++        sd.Texture2D.MipLevels = 1;
++        if (FAILED(m_device->CreateRenderTargetView(m_ppLeftTex,  &rd, &m_ppLeftRTVs[L]))  ||
++            FAILED(m_device->CreateRenderTargetView(m_ppRightTex, &rd, &m_ppRightRTVs[L])) ||
++            FAILED(m_device->CreateShaderResourceView(m_ppLeftTex,  &sd, &m_ppLeftSRVs[L])) ||
++            FAILED(m_device->CreateShaderResourceView(m_ppRightTex, &sd, &m_ppRightSRVs[L])))
++        { ReleaseOutput(); return false; }
++    }
++
+     m_outWidth  = width;
+     m_outHeight = height;
+     return true;
+@@ -812,9 +930,38 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+         m_context->PSSetShaderResources(0, 1, &nul);
+         m_context->OMSetRenderTargets(0, nullptr, nullptr);
+ 
+-        // PULL: confidence-weighted averages at every coarser level.
+-        m_context->GenerateMips(m_ppLeftSRV);
+-        m_context->GenerateMips(m_ppRightSRV);
++        // PULL: edge-aware confidence-weighted downsample at every coarser level.
++        // Replaces GenerateMips, whose Gaussian downsample averaged colour across
++        // object boundaries and produced the cross-region blob fills in interiors.
++        // PSAnaPyramidDown uses luminance-similarity weights so cross-edge inputs
++        // contribute almost nothing; each output texel is anchored to the dominant
++        // region around it.
++        m_context->PSSetShader(m_psPyDown, nullptr, 0);
++        for (int L = 1; L < m_ppMips; ++L)
++        {
++            int prevW = (ew >> (L - 1)); if (prevW < 1) prevW = 1;
++            int prevH = (eh >> (L - 1)); if (prevH < 1) prevH = 1;
++            int currW = (ew >>  L);      if (currW < 1) currW = 1;
++            int currH = (eh >>  L);      if (currH < 1) currH = 1;
++            // CB: g_srcW/g_srcH = INPUT level dimensions (used in the shader for
++            // the half-input-texel sample offsets).
++            CB dcb{ 0, 0, (float)prevW, (float)prevH, 0, 0, 0, 0,
++                    0, 0, 0, 0, dispMaxUV, 0, 0, 0 };
++            m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &dcb, 0, 0);
++            D3D11_VIEWPORT dvp{}; dvp.Width = (FLOAT)currW; dvp.Height = (FLOAT)currH; dvp.MaxDepth = 1.0f;
++            m_context->RSSetViewports(1, &dvp);
++
++            m_context->OMSetRenderTargets(1, &m_ppLeftRTVs[L], nullptr);
++            m_context->PSSetShaderResources(0, 1, &m_ppLeftSRVs[L - 1]);
++            m_context->Draw(3, 0);
++            m_context->PSSetShaderResources(0, 1, &nul);
++
++            m_context->OMSetRenderTargets(1, &m_ppRightRTVs[L], nullptr);
++            m_context->PSSetShaderResources(0, 1, &m_ppRightSRVs[L - 1]);
++            m_context->Draw(3, 0);
++            m_context->PSSetShaderResources(0, 1, &nul);
++        }
++        m_context->OMSetRenderTargets(0, nullptr, nullptr);
+ 
+         // COMPOSE: fill from the pyramids back into the SBS (m_outTex).
+         cbProp((float)(m_ppMips - 1));
+@@ -890,6 +1037,13 @@ void Converter::ReleaseOutput()
+     SAFE_RELEASE(m_outSRV);
+     SAFE_RELEASE(m_outRTV);
+     SAFE_RELEASE(m_outTex);
++    for (int L = 0; L < kMaxPpMips; ++L)
++    {
++        SAFE_RELEASE(m_ppLeftRTVs[L]);
++        SAFE_RELEASE(m_ppLeftSRVs[L]);
++        SAFE_RELEASE(m_ppRightRTVs[L]);
++        SAFE_RELEASE(m_ppRightSRVs[L]);
++    }
+     SAFE_RELEASE(m_ppLeftSRV);  SAFE_RELEASE(m_ppLeftRTV);  SAFE_RELEASE(m_ppLeftTex);
+     SAFE_RELEASE(m_ppRightSRV); SAFE_RELEASE(m_ppRightRTV); SAFE_RELEASE(m_ppRightTex);
+     m_ppMips = 0;
+@@ -940,6 +1094,7 @@ void Converter::Shutdown()
+     SAFE_RELEASE(m_cbuffer);
+     SAFE_RELEASE(m_sampler);
+     SAFE_RELEASE(m_psCompose);
++    SAFE_RELEASE(m_psPyDown);
+     SAFE_RELEASE(m_psSplit);
+     SAFE_RELEASE(m_psSmooth);
+     SAFE_RELEASE(m_psFill);
+diff --git a/src/Converter.h b/src/Converter.h
+index bf80791..1c9eb16 100644
+--- a/src/Converter.h
++++ b/src/Converter.h
+@@ -68,6 +68,7 @@ namespace srw
+         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
+         ID3D11PixelShader*       m_psSmooth  = nullptr;  // edge-aware disparity smoothing
+         ID3D11PixelShader*       m_psSplit   = nullptr;  // SBS half -> premultiplied per-eye pyramid
++        ID3D11PixelShader*       m_psPyDown  = nullptr;  // edge-aware 2x2 downsample (replaces GenerateMips)
+         ID3D11PixelShader*       m_psCompose = nullptr;  // push-pull colorize -> final SBS
+         ID3D11SamplerState*      m_sampler = nullptr;
+         ID3D11Buffer*            m_cbuffer = nullptr;
+@@ -85,14 +86,20 @@ namespace srw
+         int                       m_outHeight = 0;
+ 
+         // Per-eye colour pyramids (mip-chained, RGBA16F, premultiplied) for the
+-        // push-pull colorization of anaglyph recovery. GenerateMips on premultiplied
+-        // colour gives a confidence-weighted average at each level.
++        // push-pull colorization of anaglyph recovery. We replace GenerateMips with
++        // a per-level custom downsample (PSAnaPyramidDown) so per-mip RTV + single-mip
++        // SRV arrays are needed to bind one level at a time.
++        static const int kMaxPpMips = 16;   // covers up to 32k textures
+         ID3D11Texture2D*          m_ppLeftTex  = nullptr;
+-        ID3D11RenderTargetView*   m_ppLeftRTV  = nullptr;   // mip 0
+-        ID3D11ShaderResourceView* m_ppLeftSRV  = nullptr;   // full chain
++        ID3D11RenderTargetView*   m_ppLeftRTV  = nullptr;   // mip 0 (PSAnaSplit target)
++        ID3D11ShaderResourceView* m_ppLeftSRV  = nullptr;   // full chain (compose reads)
++        ID3D11RenderTargetView*   m_ppLeftRTVs[kMaxPpMips] = {};   // per-mip write
++        ID3D11ShaderResourceView* m_ppLeftSRVs[kMaxPpMips] = {};   // per-mip read (single-mip view)
+         ID3D11Texture2D*          m_ppRightTex = nullptr;
+         ID3D11RenderTargetView*   m_ppRightRTV = nullptr;
+         ID3D11ShaderResourceView* m_ppRightSRV = nullptr;
++        ID3D11RenderTargetView*   m_ppRightRTVs[kMaxPpMips] = {};
++        ID3D11ShaderResourceView* m_ppRightSRVs[kMaxPpMips] = {};
+         int                       m_ppMips = 0;
+ 
+         // Frame-history ring (for Pulfrich time delay), source-sized, sRGB.
