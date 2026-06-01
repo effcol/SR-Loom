@@ -171,6 +171,12 @@ bool Capture::StartCaptureInternalActive()
     // all guarded so it degrades gracefully on older builds.
     try { GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get(); } catch (...) {}
     try { m_impl->session.IsBorderRequired(false); } catch (...) {}
+    // Lift the WGC ~60fps cap: without an explicit MinUpdateInterval, the API
+    // delivers frames at roughly display-composition rate (60Hz) regardless of
+    // how fast the source updates. Same fix used by Sunshine (PR #4424) and
+    // Apollo (#676). 1ms is small enough to track 120/144/160/240Hz content;
+    // wrapped in try/catch in case the API isn't present on older Win10 builds.
+    try { m_impl->session.MinUpdateInterval(std::chrono::milliseconds(1)); } catch (...) {}
     m_impl->session.StartCapture();
     m_active = true;
     return true;

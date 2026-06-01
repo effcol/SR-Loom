@@ -631,7 +631,7 @@ bool Gui::Render(GuiState& state)
                     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x,
                                                      nameBottom - ImGui::GetTextLineHeight()));
                     ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
-                    ImGui::TextUnformatted("v1.3");
+                    ImGui::TextUnformatted("v1.4");
                     ImGui::PopStyleColor();
 
                     Section("KEYBOARD SHORTCUTS");

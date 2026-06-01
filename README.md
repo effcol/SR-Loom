@@ -79,6 +79,22 @@ plus a light/dark theme toggle.
 - **A yellow border around the captured area.** That's Windows' capture indicator.
   SR Loom asks the OS to hide it, but Windows only grants that to packaged apps,
   so it may remain.
+- **Variable refresh rate (G-Sync / FreeSync) causes judder.** SR Loom captures
+  the source and re-presents to the SR display, so the SR display's VRR ends up
+  synced to *SR Loom's* present cadence rather than the source game's. If the
+  game runs below the SR display's refresh rate, you'll see judder. This is a
+  fundamental limitation of capture-based mirroring on Windows — Sunshine,
+  ShaderGlass, OBS, and every other tool in this category have the same
+  constraint, and the DXGI API that could fix it (`SetPresentDuration`) is
+  explicitly restricted by Microsoft to internal panels. For best results: cap
+  the game at (or just below) the SR display's refresh rate so VRR isn't engaged,
+  or disable VRR on the SR display and run a clean integer multiple
+  (e.g. 60 fps source on a 120 Hz panel).
+- **RTSS (RivaTuner Statistics Server) causes stutter or drops.** RTSS hooks
+  `IDXGISwapChain::Present` on every D3D11 app, which interferes with SR Loom's
+  output. If you use RTSS, **add `SRLoom.exe` to its exclusion list**
+  (RTSS Settings → "Application detection level" → exclude, or per-process
+  exclusion). Same trick OBS users use for the same reason.
 
 ## Releasing / running
 
