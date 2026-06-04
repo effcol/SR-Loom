@@ -32,6 +32,9 @@ namespace srw
         HMONITOR     srMonitor      = nullptr; // the SR display's monitor ("This Display")
         HMONITOR     captureMonitor = nullptr; // the monitor currently being captured
         bool         foreignDisplay = false;   // a picked (non-SR) display is the active source
+        int          quiltCols      = 8;       // current quilt grid columns (1..12)
+        int          quiltRows      = 6;       // current quilt grid rows    (1..9)
+        bool         hasTestImage   = false;   // true once a TestImage has been loaded
     };
 
     class Gui
@@ -76,6 +79,11 @@ namespace srw
         POINT                    m_dragCur0{}, m_dragWin0{}; // cursor + window origin at drag start
         bool                     m_acerNeedsAdmin = false;  // last Acer SpatialLabs write was ACCESS_DENIED
         bool                     m_acerSectionOpen = false; // ACER SPATIALLABS section expanded?
+        bool                     m_startupSectionOpen = false; // STARTUP section expanded?
+        // STARTUP-section state, cached from HKCU at Init() so toggling doesn't
+        // read the registry per frame.
+        bool                     m_runAtStartup = false;
+        bool                     m_startInTray  = true;
         GuiState                 m_lastState;   // last rendered state (to repaint during a window drag)
         float                    m_sectionsH = 0.0f;   // measured height of the scrolling options
     };

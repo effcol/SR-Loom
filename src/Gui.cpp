@@ -1,6 +1,7 @@
 #include "Gui.h"
 #include "TrayIcon.h"   // ID_TRAY_* command ids (reused by the GUI)
 #include "AcerSpatialLabs.h"
+#include "Settings.h"   // run-at-startup / start-in-tray persistence
 #include "resource.h"   // IDI_TRAY (app icon)
 
 #include "imgui.h"
@@ -361,6 +362,12 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     m_mainHwnd = mainHwnd;
     (void)device; (void)context;   // intentionally NOT shared — see below
 
+    // Cache the persisted STARTUP toggles up-front so the panel renders the right
+    // state without hitting the registry every frame. Writes go through Settings
+    // and update these in place.
+    m_runAtStartup = Settings::ReadRunAtStartup();
+    m_startInTray  = Settings::ReadStartInTray();
+
     // The GUI renders on its OWN D3D11 device, never the weaver's. The SR runtime
     // drives the weaver's immediate context (including from its own thread while
     // weaving), so letting ImGui touch that same context from the main loop races
@@ -631,7 +638,7 @@ bool Gui::Render(GuiState& state)
                     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x,
                                                      nameBottom - ImGui::GetTextLineHeight()));
                     ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
-                    ImGui::TextUnformatted("v1.4");
+                    ImGui::TextUnformatted("v1.5");
                     ImGui::PopStyleColor();
 
                     Section("KEYBOARD SHORTCUTS");
@@ -766,7 +773,7 @@ bool Gui::Render(GuiState& state)
         // a picked Window = windowed overlay; Looking Glass is the floating loupe.
         Section("DISPLAY");
         {
-            const float gap = 3.0f;
+            const float gap = 10.0f;
             const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
 
             // This Display → fullscreen passthrough weave of the SR display itself.
@@ -794,25 +801,50 @@ bool Gui::Render(GuiState& state)
             if (ImGui::Button("Looking Glass", ImVec2(half, 0))) post(ID_TRAY_LOOKING_GLASS);
             if (lgActive) ImGui::PopStyleColor(4);
 
-            // Other display → weave another real/virtual monitor (the SR display is
-            // "This Display" above, so it's excluded from this list). Enables the
-            // dummy-/virtual-HDMI fullscreen workflow: game fullscreen on that display,
-            // woven here.
+            // Row 2: paired buttons-as-combos for "Other Displays" and "Window".
+            // Using Button + popup instead of BeginCombo so we can centre the
+            // text via ButtonTextAlign (ImGui combos always left-align preview).
             const bool dispActive = (state.source == SourceKind::CaptureMonitor && state.foreignDisplay);
-            if (dispActive) {
-                ImGui::PushStyleColor(ImGuiCol_FrameBg, g_accent);
-                ImGui::PushStyleColor(ImGuiCol_Text,    g_accentText);
-            }
-            ImGui::SetNextItemWidth(-FLT_MIN);
+            const bool winActive  = (state.source == SourceKind::CaptureWindow);
+
             std::vector<MonEntry> mons;
             EnumDisplayMonitors(nullptr, nullptr, MonEnumProc, reinterpret_cast<LPARAM>(&mons));
             ResolveDisplayNames(mons);   // friendly EDID names where Windows knows them
             const char* dispLabel = "Other Displays";
             if (dispActive)
                 for (auto& m : mons) if (m.mon == state.captureMonitor) dispLabel = m.label;
-            if (ImGui::BeginCombo("##srcdisp", dispLabel, ImGuiComboFlags_HeightLargest))
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
+
+            // -- Other display (left half) -----------------------------------
+            if (dispActive) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
+                ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
+            }
+            if (ImGui::Button(dispLabel, ImVec2(half, 0)))
+                ImGui::OpenPopup("##srcdisp_popup");
+            if (dispActive) ImGui::PopStyleColor(4);
+
+            // -- Window (right half) -----------------------------------------
+            ImGui::SameLine(0, gap);
+            if (winActive) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
+                ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
+            }
+            const char* winLabel = (winActive && state.sourceName[0]) ? state.sourceName : "Window";
+            if (ImGui::Button(winLabel, ImVec2(half, 0)))
+                ImGui::OpenPopup("##srcwin_popup");
+            if (winActive) ImGui::PopStyleColor(4);
+
+            ImGui::PopStyleVar();
+
+            // Popups (their own selectables, kept outside the centred-button styling).
+            if (ImGui::BeginPopup("##srcdisp_popup"))
             {
-                if (dispActive) ImGui::PopStyleColor(2);
                 int shown = 0;
                 for (int i = 0; i < (int)mons.size(); ++i)
                 {
@@ -825,21 +857,10 @@ bool Gui::Render(GuiState& state)
                     ++shown;
                 }
                 if (shown == 0) ImGui::TextDisabled("No other displays");
-                ImGui::EndCombo();
+                ImGui::EndPopup();
             }
-            else if (dispActive) ImGui::PopStyleColor(2);
-
-            // Window → overlay the weave on a chosen window (windowed).
-            const bool winActive = (state.source == SourceKind::CaptureWindow);
-            if (winActive) {
-                ImGui::PushStyleColor(ImGuiCol_FrameBg, g_accent);
-                ImGui::PushStyleColor(ImGuiCol_Text,    g_accentText);
-            }
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            const char* winLabel = (winActive && state.sourceName[0]) ? state.sourceName : "Window";
-            if (ImGui::BeginCombo("##srcwin", winLabel, ImGuiComboFlags_HeightLargest))
+            if (ImGui::BeginPopup("##srcwin_popup"))
             {
-                if (winActive) ImGui::PopStyleColor(2);   // popup uses normal colours
                 std::vector<WinEntry> wins;
                 EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&wins));
                 for (int i = 0; i < (int)wins.size(); ++i)
@@ -850,22 +871,26 @@ bool Gui::Render(GuiState& state)
                     ImGui::PopID();
                 }
                 if (wins.empty()) ImGui::TextDisabled("No windows");
-                ImGui::EndCombo();
+                ImGui::EndPopup();
             }
-            else if (winActive) ImGui::PopStyleColor(2);
 
-            // Make the currently-active window 3D right now (overlay).
-            if (ImGui::Button("Make active window 3D", ImVec2(-FLT_MIN, 0))) post(ID_TRAY_CAPTURE_FOREGROUND);
+            // Row 3: paired action buttons — "Load Image..." (left) and
+            // "Make Active Window 3D" (right). Image load opens the standard
+            // file dialog and routes through the existing tray command.
+            if (ImGui::Button("Load Media...",          ImVec2(half, 0))) post(ID_TRAY_SRC_TESTIMAGE);
+            ImGui::SameLine(0, gap);
+            if (ImGui::Button("Make Active Window 3D", ImVec2(half, 0))) post(ID_TRAY_CAPTURE_FOREGROUND);
         }
 
         Section("STEREO 3D INPUT");
         {
             // Category combo (whole list, no scroll). SBS / TAB / Interleaved expose a
             // second "variant" combo (like anaglyph's) for Full|Half / Row|Column.
-            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_N };
+            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_N };
             static const char* const kCat[C_N] = {
                 "Side-by-Side", "Top-and-Bottom", "Interleaved", "Checkerboard",
-                "Anaglyph", "Frame Sequential", "Pulfrich Effect", "Frame Packing" };
+                "Anaglyph", "Frame Sequential", "Pulfrich Effect", "Frame Packing",
+                "Quilt" };
             auto catOf = [](StereoFormat f) -> int {
                 switch (f) {
                 case StereoFormat::FullSBS: case StereoFormat::HalfSBS:        return C_SBS;
@@ -876,6 +901,7 @@ bool Gui::Render(GuiState& state)
                 case StereoFormat::FrameSequential: return C_FSEQ;
                 case StereoFormat::Pulfrich:        return C_PULF;
                 case StereoFormat::FramePacking:    return C_FP;
+                case StereoFormat::Quilt:           return C_QUILT;
                 default:                            return C_SBS;
                 }
             };
@@ -897,6 +923,7 @@ bool Gui::Render(GuiState& state)
                         case C_FSEQ:  postFmt(StereoFormat::FrameSequential); break;
                         case C_PULF:  postFmt(StereoFormat::Pulfrich); break;
                         case C_FP:    postFmt(StereoFormat::FramePacking); break;
+                        case C_QUILT: postFmt(StereoFormat::Quilt); break;
                         }
                     }
                 ImGui::EndCombo();
@@ -976,6 +1003,47 @@ bool Gui::Render(GuiState& state)
             }
             // Frame Packing has no second dropdown -- the 720p and 1080p HDMI 1.4 modes
             // share the same proportions, so a single preset covers both.
+
+            else if (curCat == C_QUILT)
+            {
+                // Quilt cols / rows pickers (max 12 / 9 per LG docs) + an
+                // image-content auto-detect for files that lack the LG "_qsCxR"
+                // filename token. Cols and Rows post WM_APP_QUILT_GRID; auto
+                // posts WM_APP_QUILT_AUTODETECT (handled in main's WndProc).
+                const float gap  = 8.0f;
+                const float colW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+                // Both cols and rows post WM_APP_QUILT_GRID with (cols in WPARAM,
+                // rows in LPARAM); we always send both current values so the main
+                // window doesn't have to remember which dim is being changed.
+                auto intCombo = [&](const char* id, int curVal, int maxVal,
+                                    const char* unit, bool isCols, float width) {
+                    char preview[24]; snprintf(preview, sizeof(preview), "%d %s", curVal, unit);
+                    ImGui::SetNextItemWidth(width);
+                    if (ImGui::BeginCombo(id, preview))
+                    {
+                        for (int v = 1; v <= maxVal; ++v)
+                        {
+                            char buf[24]; snprintf(buf, sizeof(buf), "%d %s", v, unit);
+                            if (ImGui::Selectable(buf, v == curVal))
+                            {
+                                const WPARAM wp = (WPARAM)(isCols ? v : state.quiltCols);
+                                const LPARAM lp = (LPARAM)(isCols ? state.quiltRows : v);
+                                PostMessageA(m_mainHwnd, WM_APP_QUILT_GRID, wp, lp);
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                };
+                intCombo("##quiltcols", state.quiltCols, 12, "cols", true,  colW);
+                ImGui::SameLine(0, gap);
+                intCombo("##quiltrows", state.quiltRows,  9, "rows", false, colW);
+                // Auto-detect lights up only when a test image is loaded (it
+                // needs pixel data to run image-content detection).
+                ImGui::BeginDisabled(!state.hasTestImage);
+                if (ImGui::Button("Auto-detect grid", ImVec2(-FLT_MIN, 0)))
+                    PostMessageA(m_mainHwnd, WM_APP_QUILT_AUTODETECT, 0, 0);
+                ImGui::EndDisabled();
+            }
         }
 
         Section("ADJUST");
@@ -1035,46 +1103,50 @@ bool Gui::Render(GuiState& state)
                                           ImVec2(cx,     cy + s * 0.55f), col);
             }
 
+            // Label + right-aligned toggle inside a given column width. Used for
+            // the side-by-side two-toggles-per-row layout in both Acer and Startup.
+            auto pairToggle = [&](const char* label, const char* tip,
+                                  bool on, float colW) -> bool {
+                const float startX = ImGui::GetCursorPosX();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(label);
+                if (tip && ImGui::IsItemHovered())
+                {
+                    const float maxW = 280.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(tip);
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine();
+                const float togW = ImGui::GetFrameHeight() * 1.8f;
+                ImGui::SetCursorPosX(startX + colW - togW);
+                return ToggleSwitch(label, on);
+            };
+
             if (m_acerSectionOpen)
             {
                 const auto sls = AcerSpatialLabs::Read();
-                // Inlined row (vs RowToggle) so the tooltip only triggers when hovering
-                // the LABEL text — not the switch — per design.
-                auto slToggle = [&](const char* label, const char* tip,
-                                    AcerSpatialLabs::Setting s, int cur)
-                {
-                    ImGui::AlignTextToFramePadding();
-                    ImGui::TextUnformatted(label);
-                    if (ImGui::IsItemHovered())
-                    {
-                        // Cap the tooltip width and wrap, so it stays inside the panel
-                        // (we don't run with multi-viewport, so popups can't escape it).
-                        const float maxW = 280.0f * m_dpiScale;
-                        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
-                        ImGui::BeginTooltip();
-                        ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
-                        ImGui::TextUnformatted(tip);
-                        ImGui::PopTextWrapPos();
-                        ImGui::EndTooltip();
-                    }
-                    ImGui::SameLine();
-                    const float w = ImGui::GetFrameHeight() * 1.8f;
-                    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - w - ImGui::GetStyle().WindowPadding.x);
-                    if (ToggleSwitch(label, cur == 1))
-                    {
-                        auto r = AcerSpatialLabs::Write(s, !(cur == 1));
-                        if (r == AcerSpatialLabs::WriteResult::NeedsAdmin)
-                            m_acerNeedsAdmin = true;
-                    }
+                auto slWrite = [&](AcerSpatialLabs::Setting s, bool v) {
+                    auto r = AcerSpatialLabs::Write(s, v);
+                    if (r == AcerSpatialLabs::WriteResult::NeedsAdmin)
+                        m_acerNeedsAdmin = true;
                 };
-                slToggle("Focus Detection",
-                         "Acer turns weaving off when you look away from the screen. "
-                         "Turn this off to keep weaving on.",
-                         AcerSpatialLabs::Setting::Focus, sls.focusDetection);
-                slToggle("Fullscreen Detection",
-                         "Lets SpatialLabs Go weave non-fullscreen content. "
-                         "May not work on non-Pro models.",
-                         AcerSpatialLabs::Setting::Fullscreen, sls.fullscreenDetection);
+                const float halfW = (ImGui::GetContentRegionAvail().x
+                                     - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                if (pairToggle("Focus",
+                               "Acer turns weaving off when you look away from the screen. "
+                               "Turn this off to keep weaving on.",
+                               sls.focusDetection == 1, halfW))
+                    slWrite(AcerSpatialLabs::Setting::Focus, sls.focusDetection != 1);
+                ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+                if (pairToggle("Fullscreen",
+                               "Lets SpatialLabs Go weave non-fullscreen content. "
+                               "May not work on non-Pro models.",
+                               sls.fullscreenDetection == 1, halfW))
+                    slWrite(AcerSpatialLabs::Setting::Fullscreen, sls.fullscreenDetection != 1);
 
                 if (m_acerNeedsAdmin)
                 {
@@ -1093,6 +1165,67 @@ bool Gui::Render(GuiState& state)
                     }
                     ImGui::PopStyleColor();
                 }
+            }
+        }
+
+        // STARTUP section -- collapsible chevron header (same pattern as Acer),
+        // with the two preferences in a single two-column row. Skip the top
+        // breathing-room dummy when the previous section is just a collapsed
+        // header above us, otherwise the two header rows feel too far apart.
+        const bool acerCollapsedJustAbove = AcerSpatialLabs::Available() && !m_acerSectionOpen;
+        ImGui::Dummy(ImVec2(0, acerCollapsedJustAbove ? 0.0f : 5.0f));
+        {
+            const char* hdr  = "STARTUP";
+            const ImVec2 ts  = ImGui::CalcTextSize(hdr);
+            const float  h   = ImGui::GetFrameHeight();
+            const float  s   = 4.0f * m_dpiScale;
+            const float  gap = 7.0f * m_dpiScale;
+            const float  bw  = ts.x + gap + s * 2;
+            const ImVec2 p   = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##startuphdr", ImVec2(bw, h));
+            if (ImGui::IsItemClicked()) m_startupSectionOpen = !m_startupSectionOpen;
+            const bool hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+            dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+            const float cx = p.x + ts.x + gap + s;
+            const float cy = p.y + h * 0.5f;
+            if (m_startupSectionOpen)
+                dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                      ImVec2(cx + s, cy + s * 0.55f),
+                                      ImVec2(cx,     cy - s * 0.55f), col);
+            else
+                dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                      ImVec2(cx + s, cy - s * 0.55f),
+                                      ImVec2(cx,     cy + s * 0.55f), col);
+        }
+
+        if (m_startupSectionOpen)
+        {
+            // Both are tiny HKCU registry settings; run-at-startup just adds/removes
+            // our exe from the Run key (no elevation needed), and start-in-tray
+            // defaults to on -- flipping it off opens the control panel on launch.
+            auto pairToggle2 = [&](const char* label, bool on, float colW) -> bool {
+                const float startX = ImGui::GetCursorPosX();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(label);
+                ImGui::SameLine();
+                const float togW = ImGui::GetFrameHeight() * 1.8f;
+                ImGui::SetCursorPosX(startX + colW - togW);
+                return ToggleSwitch(label, on);
+            };
+            const float halfW = (ImGui::GetContentRegionAvail().x
+                                 - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            if (pairToggle2("Run at startup", m_runAtStartup, halfW))
+            {
+                m_runAtStartup = !m_runAtStartup;
+                Settings::WriteRunAtStartup(m_runAtStartup);
+            }
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Start in tray", m_startInTray, halfW))
+            {
+                m_startInTray = !m_startInTray;
+                Settings::WriteStartInTray(m_startInTray);
             }
         }
     }

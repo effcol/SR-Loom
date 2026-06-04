@@ -122,6 +122,8 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     HMENU srcMenu = CreatePopupMenu();
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
                 ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor (passthrough)");
+    AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::TestImage ? MF_CHECKED : 0),
+                ID_TRAY_SRC_TESTIMAGE, "Load media...");
     AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);
 
     m_windowList.clear();
@@ -224,6 +226,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     // Frame Packing: single entry now (720p and 1080p HDMI 1.4 share the same proportions
     // so the decode is identical -- no per-resolution submenu needed).
     addFmt(fmtMenu, StereoFormat::FramePacking, "Frame Packing (HDMI 1.4)");
+
+    // Quilt: cols x rows grid of views; picks centre pair by default.
+    addFmt(fmtMenu, StereoFormat::Quilt, "Quilt");
 
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");

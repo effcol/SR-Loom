@@ -48,7 +48,8 @@ namespace srw
         Checkerboard,       // quincunx
         FrameSequential,    // alternating frames over time
         Pulfrich,           // mono source -> depth via per-eye delay or ND darkening
-        FramePacking        // HDMI 1.4: top eye, blanking gap, bottom eye
+        FramePacking,       // HDMI 1.4: top eye, blanking gap, bottom eye
+        Quilt               // Looking Glass quilt: cols x rows grid of views; pick a pair as L/R
     };
 
     // HDMI 1.4 frame packing. The 720p (1280x1470) and 1080p (1920x2205) variants
@@ -134,6 +135,7 @@ namespace srw
             { StereoFormat::FrameSequential,   "Frame sequential" },
             { StereoFormat::Pulfrich,          "Pulfrich" },
             { StereoFormat::FramePacking,      "Frame packing" },
+            { StereoFormat::Quilt,             "Quilt" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));
         return list;
@@ -173,6 +175,33 @@ namespace srw
         int n = 0; const StereoFormatEntry* l = StereoFormatList(n);
         for (int i = 0; i < n; ++i) if (l[i].fmt == f) return i;
         return -1;
+    }
+
+    // Parse a Looking Glass quilt grid out of a filename. The LG naming convention
+    // embeds the grid as "_qsCxR" or "_qsCxR_" before the extension (e.g.
+    // "Foo_qs8x6_Final.png" -> 8x6). Returns true and fills cols/rows on a match.
+    inline bool ParseQuiltDims(const char* path, int& cols, int& rows)
+    {
+        if (!path) return false;
+        const char* p = path;
+        while (*p) ++p;                                // end
+        const char* end = p;
+        // Search the filename for "_qs<digits>x<digits>" (case-insensitive on qs).
+        for (const char* s = path; s + 4 < end; ++s)
+        {
+            if (s[0] != '_') continue;
+            if ((s[1] != 'q' && s[1] != 'Q') || (s[2] != 's' && s[2] != 'S')) continue;
+            const char* d = s + 3;
+            int c = 0, r = 0; bool gotC = false, gotR = false;
+            while (*d >= '0' && *d <= '9') { c = c * 10 + (*d++ - '0'); gotC = true; }
+            if (!gotC || (*d != 'x' && *d != 'X')) continue;
+            ++d;
+            while (*d >= '0' && *d <= '9') { r = r * 10 + (*d++ - '0'); gotR = true; }
+            if (!gotR || c <= 0 || r <= 0) continue;
+            cols = c; rows = r;
+            return true;
+        }
+        return false;
     }
 
     // Show a modal error box (used for unrecoverable startup failures).

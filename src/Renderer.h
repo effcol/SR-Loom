@@ -5,6 +5,7 @@
 #include "Common.h"
 #include <d3d11.h>
 #include <dxgi1_2.h>   // IDXGISwapChain1, IDXGIFactory2
+#include <chrono>
 
 namespace srw
 {
@@ -34,7 +35,15 @@ namespace srw
         // waitable object). Paces the render loop to the display's refresh with ~1
         // frame of latency WITHOUT a vsync stall, so no-vsync presents don't spin
         // the GPU at thousands of fps. No-op on the bit-blt path (vsync paces it).
+        // Also enforces the render-rate cap set by SetTargetRefreshHz, if any.
         void WaitForFrame();
+
+        // Cap the render loop's Present rate to the given refresh in Hz. Pass 0 to
+        // disable. Avoids burning GPU rendering faster than the SR panel can show;
+        // the waitable object alone doesn't always stop us going past refresh on a
+        // no-vsync flip swap chain. Hybrid sleep+yield+spin pacing for sub-ms
+        // precision without burning a full CPU core.
+        void SetTargetRefreshHz(double hz);
 
         // Choose the swap-chain model for the window's current state: a low-latency
         // FLIP swap chain when the window is NOT layered (fullscreen/windowed — e.g.
@@ -47,6 +56,8 @@ namespace srw
         ID3D11DeviceContext* Context() const       { return m_context; }
         // The sRGB format the weaver should treat its input/output as.
         DXGI_FORMAT          BackBufferFormat() const { return m_rtvFormat; }
+        UINT                 Width()  const        { return m_width;  }
+        UINT                 Height() const        { return m_height; }
         bool                 IsValid() const        { return m_device != nullptr; }
 
     private:
@@ -71,5 +82,12 @@ namespace srw
         bool                    m_allowTearing = false; // GPU/OS supports tearing (VRR)
         bool                    m_flip       = true;    // current model: true=flip, false=bit-blt
         bool                    m_layered    = false;   // current window layered state
+
+        // Render-rate cap state. m_targetIntervalNs is the minimum number of
+        // nanoseconds between consecutive Present()s; 0 disables the cap.
+        // m_lastPresentEnd is stamped at the end of Present() so WaitForFrame()
+        // can compute the remaining wait time.
+        int64_t                              m_targetIntervalNs = 0;
+        std::chrono::steady_clock::time_point m_lastPresentEnd{};
     };
 }

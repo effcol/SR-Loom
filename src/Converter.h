@@ -30,6 +30,22 @@ namespace srw
         // Convergence: per-eye horizontal shift in UV (typically ±0.03).
         void SetConvergence(float shift) { m_convergence = shift; }
 
+        // Quilt layout (used only when format == Quilt). cols x rows grid of
+        // views indexed left-to-right, BOTTOM-to-top (Looking Glass convention).
+        // leftIdx / rightIdx pick the integer-floor view for each pane; the
+        // optional leftBlend / rightBlend (0..1) cross-fades to the next view
+        // -- mimicking the smooth between-view transition Looking Glass shows
+        // as the user moves their head between physical lenticular columns.
+        void SetQuilt(int cols, int rows, int leftIdx, int rightIdx,
+                      float leftBlend = 0.0f, float rightBlend = 0.0f);
+
+        // Per-eye pane the weaver will actually display on (panel native dims).
+        // When set, Quilt sizes its output panes to this and pillar/letterboxes
+        // each view inside; the weaver then samples 1:1 with no stretching.
+        // (0,0) disables -- panes default to the view's native pixel size and
+        // the weaver scales to the panel.
+        void SetTargetPaneSize(int w, int h) { m_targetPaneW = w; m_targetPaneH = h; }
+
         // Convert the source view into the internal SBS texture. Sets
         // outputResized=true when the SBS texture was (re)created (the caller
         // must then re-register OutputSRV() with the weaver).
@@ -116,6 +132,14 @@ namespace srw
         float        m_fpGapFrac = 45.0f / 2205.0f;    // frame-packing gap fraction
         float        m_fpEyeAlign = 0.0f;              // bottom-eye vertical alignment (source rows)
         float        m_convergence = 0.0f;             // per-eye horizontal shift (UV)
+        int          m_quiltCols = 8;                   // quilt grid: columns of views
+        int          m_quiltRows = 6;                   // quilt grid: rows of views
+        int          m_quiltLeftIdx  = 23;              // L pane view index (8x6: centre-1)
+        int          m_quiltRightIdx = 24;              // R pane view index (8x6: centre)
+        float        m_quiltLeftBlend  = 0.0f;          // 0..1 fade from leftIdx to leftIdx+1
+        float        m_quiltRightBlend = 0.0f;          // 0..1 fade from rightIdx to rightIdx+1
+        int          m_targetPaneW = 0;                 // SR panel per-eye dims (0 = unset)
+        int          m_targetPaneH = 0;
         DXGI_FORMAT  m_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };
 }

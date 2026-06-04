@@ -3,6 +3,7 @@
 #include <dxgi1_3.h>   // IDXGISwapChain2, FRAME_LATENCY_WAITABLE_OBJECT
 #include <dxgi1_5.h>   // IDXGIFactory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING
 #include <dwmapi.h>    // DwmFlush (pace layered/bit-blt presents to the compositor)
+#include <thread>      // std::this_thread::sleep_for / yield for the render-rate cap
 #pragma comment(lib, "dwmapi.lib")
 
 using namespace srw;
@@ -221,10 +222,37 @@ void Renderer::BindAndClearBackBuffer()
     m_context->RSSetViewports(1, &vp);
 }
 
+void Renderer::SetTargetRefreshHz(double hz)
+{
+    m_targetIntervalNs = (hz > 0.0) ? (int64_t)(1.0e9 / hz) : 0;
+}
+
 void Renderer::WaitForFrame()
 {
     if (m_waitable)
         WaitForSingleObjectEx(m_waitable, 1000, TRUE);
+
+    // Render-rate cap: hold here until the configured minimum interval has
+    // elapsed since the last Present(). Avoids rendering past the SR panel's
+    // refresh, which would just be wasted GPU + heat (panel can't display
+    // frames it doesn't have time to scan). Hybrid sleep+yield+spin pacing
+    // gives sub-ms precision without burning a full core continuously.
+    if (m_targetIntervalNs > 0)
+    {
+        using namespace std::chrono;
+        const auto target = m_lastPresentEnd + nanoseconds(m_targetIntervalNs);
+        for (;;)
+        {
+            const auto now = steady_clock::now();
+            if (now >= target) break;
+            const auto remain = duration_cast<nanoseconds>(target - now).count();
+            if (remain > 2'000'000)        // > 2ms: sleep the bulk, leave ~1ms slack
+                std::this_thread::sleep_for(nanoseconds(remain - 1'000'000));
+            else if (remain > 200'000)     // 200µs – 2ms: yield (cheap)
+                std::this_thread::yield();
+            // else < 200µs: tight spin for sub-ms accuracy
+        }
+    }
 }
 
 void Renderer::Present(bool vsync)
@@ -239,6 +267,7 @@ void Renderer::Present(bool vsync)
         // compositor's). DwmFlush returns at the next composition (~refresh).
         m_swapChain->Present(0, 0);
         DwmFlush();
+        m_lastPresentEnd = std::chrono::steady_clock::now();
         return;
     }
     // Flip: no-vsync presents immediately with tearing allowed (VRR drives the
@@ -246,6 +275,7 @@ void Renderer::Present(bool vsync)
     UINT flags = (!vsync && (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))
                ? DXGI_PRESENT_ALLOW_TEARING : 0;
     m_swapChain->Present(vsync ? 1 : 0, flags);
+    m_lastPresentEnd = std::chrono::steady_clock::now();
 }
 
 void Renderer::Shutdown()

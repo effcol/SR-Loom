@@ -15,6 +15,18 @@ namespace srw
     // GUI -> main window: weave the display (monitor) whose HMONITOR is in lParam.
     constexpr UINT WM_APP_GUI_CAPTURE_DISPLAY = WM_APP + 3;
 
+    // Fullscreen-controls overlay -> main window: the user clicked a button.
+    // WPARAM = 0 minimise, 1 switch to Windowed mode, 2 close (stop weaving).
+    constexpr UINT WM_APP_FS_BUTTON = WM_APP + 4;
+
+    // GUI -> main window: set the quilt grid (cols in WPARAM, rows in LPARAM).
+    // Either may be 0 to leave unchanged.
+    constexpr UINT WM_APP_QUILT_GRID = WM_APP + 5;
+
+    // GUI -> main window: re-run image-content quilt auto-detection on the
+    // currently-loaded test image and apply the result.
+    constexpr UINT WM_APP_QUILT_AUTODETECT = WM_APP + 6;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {

@@ -1,7 +1,13 @@
 #include "Converter.h"
 #include <d3dcompiler.h>
+#include <shlobj.h>     // SHGetKnownFolderPath, SHCreateDirectoryExW (shader cache dir)
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cstdio>
 
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "shell32.lib")
 
 using namespace srw;
 
@@ -17,7 +23,7 @@ SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
 {
-    int   g_format;   // 0 SBS,1 TAB,2 Anaglyph,3 Row,4 Col,5 Checker,6 Pulfrich,99 copy
+    int   g_format;   // 0 SBS,1 TAB,2 Anaglyph,3 Row,4 Col,5 Checker,6 Pulfrich,7 FP,8 FrameSeq,9 Quilt,99 copy
     int   g_swap;     // swap left/right eyes
     float g_srcW;
     float g_srcH;
@@ -33,7 +39,17 @@ cbuffer Params : register(b0)
     float g_coarseW;   // coarse disparity-map width (px)
     float g_coarseH;   // coarse disparity-map height (px)
     float g_propStride; // colour-propagation pass: neighbour sample stride (texels)
-    float g_fpEyeAlign; // frame packing: bottom-eye vertical alignment (source rows)
+    float g_fpEyeAlign;    // frame packing: bottom-eye vertical alignment (source rows)
+    int   g_quiltCols;     // quilt: grid columns of views
+    int   g_quiltRows;     // quilt: grid rows of views
+    int   g_quiltLeftIdx;  // quilt: view index that feeds the LEFT  pane (integer floor)
+    int   g_quiltRightIdx; // quilt: view index that feeds the RIGHT pane (integer floor)
+    float g_paneW;         // SBS pane width  in px (for aspect / letterbox math)
+    float g_paneH;         // SBS pane height in px
+    float g_quiltLBlend;   // L pane: cross-fade from view[leftIdx]  to view[leftIdx+1]
+    float g_quiltRBlend;   // R pane: cross-fade from view[rightIdx] to view[rightIdx+1]
+    float _pad_b;
+    float _pad_c;
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -328,6 +344,49 @@ float4 PSAnaCompose(VSOut i) : SV_Target
     }
     return float4(acc / max(w, 1e-3), 1.0);
 }
+// ----- Lanczos-3 sampling ---------------------------------------------------
+// Sinc-windowed Lanczos-3 kernel — gold-standard non-ML upscale (FSR1 / mpv /
+// every quality image viewer build on this). 36-tap, sharper than bilinear or
+// Catmull-Rom and the right pick when a small quilt cell has to fill a much
+// larger SR panel pane. Filters in linear light: the sRGB SRV does the
+// sRGB->linear conversion on Load() and the SRGB RTV does linear->sRGB on write,
+// so the math here is already linear.
+float lanczos3Weight(float x)
+{
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    const float pi = 3.14159265358979;
+    float px = pi * x;
+    return (sin(px) * sin(px / 3.0)) / (px * px / 3.0);
+}
+
+// 6x6 Lanczos-3 sample inside a rectangular sub-region of srcTex, clamped so
+// the kernel never reaches into neighbouring quilt cells (each cell is a
+// different view -- bleeding would ghost cross-view content).
+float3 sampleLanczos3Cell(float2 uvWithinCell, int2 cellMinPx, int2 cellSizePx)
+{
+    float2 px   = uvWithinCell * float2(cellSizePx) - 0.5;
+    int2   ip   = int2(floor(px));
+    float2 frac = px - float2(ip);
+    float3 acc  = 0;
+    float  wsum = 0;
+    [unroll] for (int dy = -2; dy <= 3; ++dy)
+    {
+        float wy = lanczos3Weight((float)dy - frac.y);
+        [unroll] for (int dx = -2; dx <= 3; ++dx)
+        {
+            float wx = lanczos3Weight((float)dx - frac.x);
+            float w = wx * wy;
+            int2 q = clamp(int2(ip.x + dx, ip.y + dy),
+                           int2(0, 0), cellSizePx - int2(1, 1));
+            acc  += srcTex.Load(int3(cellMinPx + q, 0)).rgb * w;
+            wsum += w;
+        }
+    }
+    return acc / max(wsum, 1e-5);
+}
+
 )HLSL"
 R"HLSL(
 float4 PSMain(VSOut i) : SV_Target
@@ -531,6 +590,60 @@ float4 PSMain(VSOut i) : SV_Target
         if (right) return float4(srcTex.Sample(samp, e).rgb, 1);
         return float4(srcPrev.Sample(samp, e).rgb, 1);
     }
+    else if (g_format == 9)   // Quilt: cols x rows grid of views; pick a pair
+    {
+        // Looking Glass convention: views indexed left-to-right, BOTTOM-to-top.
+        // View 0 = bottom-left cell = leftmost camera position; view (cols*rows-1)
+        // = top-right cell = rightmost camera position.
+        int total  = max(1, g_quiltCols * g_quiltRows);
+        int viewLo = clamp(right ? g_quiltRightIdx : g_quiltLeftIdx, 0, total - 1);
+        int viewHi = min(viewLo + 1, total - 1);
+        float blend = saturate(right ? g_quiltRBlend : g_quiltLBlend);
+        int colLo  = viewLo % g_quiltCols;
+        int rowLoB = viewLo / g_quiltCols;
+        int colHi  = viewHi % g_quiltCols;
+        int rowHiB = viewHi / g_quiltCols;
+
+        // Preserve native view aspect inside the pane: when the SR panel pane
+        // doesn't match the view's aspect (e.g. portrait view in a landscape
+        // pane), pillar/letterbox with black bars instead of stretching.
+        float viewAspect = (g_srcW / (float)g_quiltCols) / max(1.0, g_srcH / (float)g_quiltRows);
+        float paneAspect = (g_paneH > 0.0) ? (g_paneW / g_paneH) : viewAspect;
+        float2 ev = e;
+        if (viewAspect < paneAspect)         // view narrower than pane -> pillarbox
+        {
+            float widthFrac = viewAspect / paneAspect;
+            float marginX   = (1.0 - widthFrac) * 0.5;
+            if (e.x < marginX || e.x > 1.0 - marginX) return float4(0, 0, 0, 1);
+            ev.x = (e.x - marginX) / widthFrac;
+        }
+        else if (viewAspect > paneAspect)    // view wider than pane -> letterbox
+        {
+            float heightFrac = paneAspect / viewAspect;
+            float marginY    = (1.0 - heightFrac) * 0.5;
+            if (e.y < marginY || e.y > 1.0 - marginY) return float4(0, 0, 0, 1);
+            ev.y = (e.y - marginY) / heightFrac;
+        }
+
+        // Lanczos-3 sample of EACH of the two bracketing views, clamped to its
+        // own cell so the kernel can't bleed into adjacent views. Cross-fading
+        // between them by the head-position fractional component gives Looking
+        // Glass's smooth between-views transition. We skip the second sample
+        // (and its 36 texture reads) when blend rounds to zero -- the common
+        // case for a perfectly-still head pinned to one view.
+        int viewWpx = max(1, (int)(g_srcW / (float)g_quiltCols));
+        int viewHpx = max(1, (int)(g_srcH / (float)g_quiltRows));
+        int2 cellLo = int2(colLo * viewWpx, (g_quiltRows - 1 - rowLoB) * viewHpx);
+        float3 colourLo = sampleLanczos3Cell(ev, cellLo, int2(viewWpx, viewHpx));
+        float3 result   = colourLo;
+        if (blend > 0.002 && viewHi != viewLo)
+        {
+            int2 cellHi = int2(colHi * viewWpx, (g_quiltRows - 1 - rowHiB) * viewHpx);
+            float3 colourHi = sampleLanczos3Cell(ev, cellHi, int2(viewWpx, viewHpx));
+            result = lerp(colourLo, colourHi, blend);
+        }
+        return float4(result, 1);
+    }
 
     // Default: side-by-side. left=left half, right=right half.
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, e.y);
@@ -551,11 +664,14 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::Pulfrich:          return 6;
         case StereoFormat::FramePacking:      return 7;
         case StereoFormat::FrameSequential:   return 8;
+        case StereoFormat::Quilt:             return 9;
         default:                              return 0;  // SBS (and unimplemented)
         }
     }
 
     // Per-eye dimensions produced from a source of (w,h) in the given layout.
+    // Quilt is intentionally NOT handled here — the converter overrides it at the
+    // call site using its known cols/rows.
     void PerEyeSize(StereoFormat f, int w, int h, int& ew, int& eh)
     {
         switch (f)
@@ -566,17 +682,120 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::HalfTAB:
         case StereoFormat::RowInterleaved:    ew = w;     eh = h / 2; break;
         case StereoFormat::ColumnInterleaved: ew = w / 2; eh = h;     break;
-        default:                              ew = w;     eh = h;     break; // anaglyph/checker/pulfrich
+        default:                              ew = w;     eh = h;     break; // anaglyph/checker/pulfrich/quilt
         }
         if (ew < 1) ew = 1;
         if (eh < 1) eh = 1;
     }
 
+    // 28 x 4 bytes = 112 (7 rows of 16); cbuffer ByteWidth must be a multiple of 16.
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
                float ndTrans; float fpEyeFrac; float fpGapFrac; float convergence;
                float dispMaxUV; float coarseW; float coarseH; float propStride;
-               float fpEyeAlign; float _pad0; float _pad1; float _pad2; };
+               float fpEyeAlign; int quiltCols; int quiltRows; int quiltLeftIdx;
+               int quiltRightIdx; float paneW; float paneH; float quiltLBlend;
+               float quiltRBlend; float _pad_b; float _pad_c; float _pad_d; };
+
+    // ---- Shader bytecode disk cache --------------------------------------------
+    // First launch: compile every PS via D3DCompile (slow, the FXC optimizer's
+    // multi-second pass on the big disparity passes is what users feel as "the
+    // app takes ages to open"). Subsequent launches: load the .cso blobs from
+    // %LOCALAPPDATA%\SRLoom\shaders\, skip D3DCompile entirely (~10ms total).
+    // Cache key includes a hash of the entire shader source, so any HLSL edit
+    // (or a new build with different flags) invalidates automatically.
+
+    uint64_t Fnv1a(const char* s, size_t len)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < len; ++i) { h ^= (uint8_t)s[i]; h *= 1099511628211ULL; }
+        return h;
+    }
+    uint64_t Fnv1a(const char* s) { return Fnv1a(s, strlen(s)); }
+
+    std::wstring ShaderCacheDir()
+    {
+        wchar_t* base = nullptr;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) || !base)
+            return {};
+        std::wstring dir = base;
+        CoTaskMemFree(base);
+        dir += L"\\SRLoom\\shaders";
+        // SHCreateDirectoryExW creates intermediate directories. Existing dir = success.
+        SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        return dir;
+    }
+
+    std::wstring ShaderCachePath(const std::wstring& dir, const char* entry, uint64_t hash)
+    {
+        wchar_t buf[96];
+        swprintf(buf, 96, L"\\%hs_%016llX.cso", entry, (unsigned long long)hash);
+        return dir + buf;
+    }
+
+    std::vector<uint8_t> ReadAllBytes(const std::wstring& path)
+    {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return {};
+        LARGE_INTEGER sz{}; GetFileSizeEx(h, &sz);
+        std::vector<uint8_t> buf(sz.QuadPart > 0 ? (size_t)sz.QuadPart : 0);
+        DWORD rd = 0;
+        if (!buf.empty() && (!ReadFile(h, buf.data(), (DWORD)buf.size(), &rd, nullptr) || rd != buf.size()))
+            buf.clear();
+        CloseHandle(h);
+        return buf;
+    }
+
+    void WriteAllBytes(const std::wstring& path, const void* data, size_t size)
+    {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        DWORD wr = 0;
+        WriteFile(h, data, (DWORD)size, &wr, nullptr);
+        CloseHandle(h);
+    }
+
+    // Holds either a freshly-compiled D3DBlob* or a disk-loaded byte buffer.
+    // Uniform Data()/Size() so callers don't care which path produced it.
+    struct ShaderBytecode
+    {
+        std::vector<uint8_t>  fromDisk;
+        ID3DBlob*             fromCompile = nullptr;
+        ~ShaderBytecode() { if (fromCompile) fromCompile->Release(); }
+        const void* Data() const { return fromCompile ? fromCompile->GetBufferPointer() : fromDisk.data(); }
+        SIZE_T      Size() const { return fromCompile ? fromCompile->GetBufferSize() : fromDisk.size(); }
+    };
+
+    // Returns true on success (out populated). On compile failure returns false and
+    // sets *errOut (caller releases). Cache-key combines source hash, entry, target
+    // and flags so any of those changing invalidates the cached blob automatically.
+    bool LoadOrCompileShader(const char* entry, const char* target, UINT flags,
+                             ShaderBytecode& out, ID3DBlob** errOut)
+    {
+        static const uint64_t srcHash = Fnv1a(kShaderSrc);
+        const uint64_t key = srcHash ^ Fnv1a(entry) ^ Fnv1a(target) ^ ((uint64_t)flags << 32);
+
+        const std::wstring dir = ShaderCacheDir();
+        if (!dir.empty())
+        {
+            const std::wstring path = ShaderCachePath(dir, entry, key);
+            out.fromDisk = ReadAllBytes(path);
+            if (!out.fromDisk.empty()) return true;   // cache hit
+        }
+
+        HRESULT hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert",
+                                nullptr, nullptr, entry, target, flags, 0,
+                                &out.fromCompile, errOut);
+        if (FAILED(hr)) return false;
+
+        if (!dir.empty())
+            WriteAllBytes(ShaderCachePath(dir, entry, key),
+                          out.fromCompile->GetBufferPointer(),
+                          out.fromCompile->GetBufferSize());
+        return true;
+    }
 }
 
 Converter::~Converter()
@@ -589,7 +808,7 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     m_device  = device;
     m_context = context;
 
-    ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* err = nullptr;
+    ID3DBlob* err = nullptr;
     UINT flags = 0;
 #ifdef _DEBUG
     flags |= D3DCOMPILE_DEBUG;
@@ -606,17 +825,16 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         ShowError(msg.c_str());
     };
 
-    HRESULT hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
-                            "VSMain", "vs_5_0", flags, 0, &vsBlob, &err);
-    if (FAILED(hr)) { reportCompileError("VS", err); if (err) err->Release(); return false; }
-    hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
-                    "PSMain", "ps_5_0", flags, 0, &psBlob, &err);
-    if (FAILED(hr)) { reportCompileError("PS", err); if (err) err->Release(); SAFE_RELEASE(vsBlob); return false; }
+    // VS + main PS go through the bytecode cache (disk-loaded after first compile).
+    ShaderBytecode vs, ps;
+    if (!LoadOrCompileShader("VSMain", "vs_5_0", flags, vs, &err))
+    { reportCompileError("VS", err); if (err) err->Release(); return false; }
+    if (!LoadOrCompileShader("PSMain", "ps_5_0", flags, ps, &err))
+    { reportCompileError("PS", err); if (err) err->Release(); return false; }
 
-    hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &m_vs);
+    HRESULT hr = device->CreateVertexShader(vs.Data(), vs.Size(), nullptr, &m_vs);
     if (SUCCEEDED(hr))
-        hr = device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &m_ps);
-    SAFE_RELEASE(vsBlob); SAFE_RELEASE(psBlob);
+        hr = device->CreatePixelShader(ps.Data(), ps.Size(), nullptr, &m_ps);
     if (FAILED(hr)) { ShowError("Converter shader creation failed."); return false; }
 
     // Disparity passes (used only by the multi-scale anaglyph recovery mode).
@@ -630,12 +848,10 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     };
     for (auto& p : passes)
     {
-        ID3DBlob* csBlob = nullptr;
-        hr = D3DCompile(kShaderSrc, strlen(kShaderSrc), "srw_convert", nullptr, nullptr,
-                        p.entry, "ps_5_0", flags, 0, &csBlob, &err);
-        if (FAILED(hr)) { reportCompileError(p.entry, err); if (err) err->Release(); return false; }
-        hr = device->CreatePixelShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), nullptr, p.out);
-        SAFE_RELEASE(csBlob);
+        ShaderBytecode bc;
+        if (!LoadOrCompileShader(p.entry, "ps_5_0", flags, bc, &err))
+        { reportCompileError(p.entry, err); if (err) err->Release(); return false; }
+        hr = device->CreatePixelShader(bc.Data(), bc.Size(), nullptr, p.out);
         if (FAILED(hr)) { ShowError("Converter disparity shader creation failed."); return false; }
     }
 
@@ -645,10 +861,20 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     device->CreateSamplerState(&sd, &m_sampler);
 
     D3D11_BUFFER_DESC bd{};
-    bd.ByteWidth      = sizeof(CB);
+    bd.ByteWidth      = sizeof(CB);   // MUST be a multiple of 16 (D3D11 cbuffer rule)
     bd.Usage          = D3D11_USAGE_DEFAULT;
     bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-    device->CreateBuffer(&bd, nullptr, &m_cbuffer);
+    HRESULT bhr = device->CreateBuffer(&bd, nullptr, &m_cbuffer);
+    if (FAILED(bhr) || !m_cbuffer)
+    {
+        char msg[160];
+        _snprintf_s(msg, _TRUNCATE,
+                    "Converter cbuffer allocation failed (hr=0x%08X, size=%d).",
+                    (unsigned)bhr, (int)sizeof(CB));
+        Log("%s", msg);
+        ShowError(msg);
+        return false;
+    }
 
     return m_vs && m_ps && m_sampler && m_cbuffer;
 }
@@ -674,6 +900,20 @@ void Converter::SetFramePacking(float eyeFrac, float gapFrac, float eyeAlign)
     m_fpEyeFrac = eyeFrac;
     m_fpGapFrac = gapFrac;
     m_fpEyeAlign = eyeAlign;
+}
+
+void Converter::SetQuilt(int cols, int rows, int leftIdx, int rightIdx,
+                         float leftBlend, float rightBlend)
+{
+    m_quiltCols     = cols  > 0 ? cols  : 1;
+    m_quiltRows     = rows  > 0 ? rows  : 1;
+    const int total = m_quiltCols * m_quiltRows;
+    auto clampIx    = [total](int v) { return v < 0 ? 0 : (v >= total ? total - 1 : v); };
+    m_quiltLeftIdx    = clampIx(leftIdx);
+    m_quiltRightIdx   = clampIx(rightIdx);
+    auto clampBlend   = [](float b) { return b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b); };
+    m_quiltLeftBlend  = clampBlend(leftBlend);
+    m_quiltRightBlend = clampBlend(rightBlend);
 }
 
 bool Converter::EnsureOutput(int width, int height)
@@ -736,6 +976,27 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     PerEyeSize(m_fmt, srcWidth, srcHeight, ew, eh);
     if (m_fmt == StereoFormat::FramePacking)   // each eye is eyeFrac of the source height
         eh = (int)(srcHeight * m_fpEyeFrac + 0.5f);
+    if (m_fmt == StereoFormat::Quilt)
+    {
+        // For Quilt, sizing the SBS pane to the SR PANEL'S per-eye dims means
+        // the weaver samples 1:1 with no stretch -- the shader pillar/letterboxes
+        // the view inside each pane. Falling back to the view's native cell size
+        // when we don't know the panel dims lets the weaver do its own resample
+        // (anamorphic but at least not crashing on a degenerate size).
+        if (m_targetPaneW > 0 && m_targetPaneH > 0)
+        {
+            ew = m_targetPaneW;
+            eh = m_targetPaneH;
+        }
+        else
+        {
+            const int qc = m_quiltCols > 0 ? m_quiltCols : 1;
+            const int qr = m_quiltRows > 0 ? m_quiltRows : 1;
+            ew = srcWidth  / qc;
+            eh = srcHeight / qr;
+        }
+    }
+    if (ew < 1) ew = 1;
     if (eh < 1) eh = 1;
     outputResized = EnsureOutput(ew * 2, eh);
     if (!m_outRTV)
@@ -774,7 +1035,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
                m_ndTrans, m_fpEyeFrac, m_fpGapFrac, m_convergence,
                dispMaxUV, coarseW, coarseH, 0,
-               m_fpEyeAlign, 0, 0, 0 };
+               m_fpEyeAlign, m_quiltCols, m_quiltRows, m_quiltLeftIdx,
+               m_quiltRightIdx, (float)ew, (float)eh, m_quiltLeftBlend,
+               m_quiltRightBlend, 0, 0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
 
@@ -835,6 +1098,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         auto cbProp = [&](float v) {
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
                     0, 0, 0, 0, dispMaxUV, 0, 0, v,
+                    0, 0, 0, 0, 0, 0, 0, 0,
                     0, 0, 0, 0 };
             m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &pcb, 0, 0);
         };
@@ -877,6 +1141,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                    m_anaCombo, m_anaMode, (int)m_pulfMode, m_pulfEye,
                    m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0,
                    dispMaxUV, 0, 0, 0,
+                   0, 0, 0, 0, 0, 0, 0, 0,
                    0, 0, 0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &copyCb, 0, 0);
         D3D11_VIEWPORT vp{};

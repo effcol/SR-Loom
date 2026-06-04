@@ -11,6 +11,7 @@ namespace SR
 {
     class SRContext;
     class IDX11Weaver1;
+    class HeadPoseTracker;
 }
 
 namespace srw
@@ -64,11 +65,21 @@ namespace srw
         bool HasContext() const { return m_context != nullptr; }
         bool HasWeaver()  const { return m_weaver != nullptr; }
 
+        // Latest tracked head pose (position in mm relative to display centre,
+        // orientation in radians as (pitch, yaw, roll)). Returns false if the
+        // head-pose stream has never delivered a sample. Thread-safe.
+        bool GetHeadPose(double pos[3], double orient[3]) const;
+
     private:
+        class HeadListenerImpl;          // opaque to keep SDK headers out of this file
         void ReleaseViewTexture();
+        void StartHeadTracker();
+        void StopHeadTracker();
 
         SR::SRContext*            m_context = nullptr;
         SR::IDX11Weaver1*         m_weaver  = nullptr;
+        SR::HeadPoseTracker*      m_headTracker  = nullptr;
+        HeadListenerImpl*         m_headListener = nullptr;
         ID3D11Texture2D*          m_viewTex = nullptr;
         ID3D11ShaderResourceView* m_viewSRV = nullptr;
         int                       m_imgW    = 0;   // loaded image full size

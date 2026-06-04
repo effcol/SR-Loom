@@ -6,6 +6,11 @@
 #include "sr/management/srcontext.h"
 #include "sr/weaver/dx11weaver.h"
 #include "sr/world/display/display.h"
+#include "sr/sense/headtracker/headposetracker.h"
+#include "sr/sense/headtracker/headposelistener.h"
+#include "sr/sense/headtracker/headposestream.h"
+#include "sr/sense/headtracker/head.h"
+#include "sr/sense/core/inputstream.h"
 #include "sr/utility/exception.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -14,8 +19,42 @@
 #include <thread>
 #include <chrono>
 #include <exception>
+#include <mutex>
 
 using namespace srw;
+
+// Head-pose listener -- LeiaSR pushes head poses on a background thread; we
+// snapshot the latest into a mutex-guarded cache that the render loop reads
+// once per frame. Same pattern as the LeiaSR DX11 example + the leia-track-app
+// OpenTrack bridge.
+class SRWeaver::HeadListenerImpl : public SR::HeadPoseListener
+{
+public:
+    SR::InputStream<SR::HeadPoseStream> stream;
+
+    void accept(const SR_headPose& f) override
+    {
+        std::lock_guard<std::mutex> lk(m);
+        pos[0] = f.position.x;     pos[1] = f.position.y;     pos[2] = f.position.z;
+        orient[0] = f.orientation.x; orient[1] = f.orientation.y; orient[2] = f.orientation.z;
+        has = true;
+    }
+
+    bool get(double p[3], double o[3]) const
+    {
+        std::lock_guard<std::mutex> lk(m);
+        if (!has) return false;
+        p[0] = pos[0]; p[1] = pos[1]; p[2] = pos[2];
+        o[0] = orient[0]; o[1] = orient[1]; o[2] = orient[2];
+        return true;
+    }
+
+private:
+    mutable std::mutex m;
+    double pos[3]    = { 0.0, 0.0, 600.0 };   // sensible default: 60cm in front
+    double orient[3] = { 0.0, 0.0, 0.0 };
+    bool   has       = false;
+};
 
 SRWeaver::~SRWeaver()
 {
@@ -95,10 +134,48 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
         return false;
     }
 
-    // Finalize the SR context now that the weaver is registered.
+    // Subscribe to head-pose updates BEFORE initialize() -- the LeiaSR docs +
+    // example apps create their trackers between context creation and
+    // initialize(). Failure to start the tracker is non-fatal (the weaver still
+    // works, we just won't have head data for quilt view selection).
+    StartHeadTracker();
+
+    // Finalize the SR context now that the weaver + tracker are registered.
     m_context->initialize();
     Log("CreateWeaver OK (weaver=%p); SR context initialized", (void*)m_weaver);
     return true;
+}
+
+void SRWeaver::StartHeadTracker()
+{
+    if (m_headListener || !m_context) return;
+    try
+    {
+        m_headTracker  = SR::HeadPoseTracker::create(*m_context);
+        m_headListener = new HeadListenerImpl();
+        m_headListener->stream.set(m_headTracker->openHeadPoseStream(m_headListener));
+    }
+    catch (std::exception& e)
+    {
+        Log("HeadPoseTracker create FAILED: %s (quilt head-tracking will be off)", e.what());
+        delete m_headListener; m_headListener = nullptr;
+        m_headTracker = nullptr;
+    }
+}
+
+void SRWeaver::StopHeadTracker()
+{
+    // The InputStream destructor calls stopListening; the tracker itself is a
+    // Sense registered with the SRContext and will be freed when the context
+    // is. Just drop our pointers/listener.
+    delete m_headListener; m_headListener = nullptr;
+    m_headTracker = nullptr;
+}
+
+bool SRWeaver::GetHeadPose(double pos[3], double orient[3]) const
+{
+    if (!m_headListener) return false;
+    return m_headListener->get(pos, orient);
 }
 
 bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
@@ -180,6 +257,7 @@ void SRWeaver::StopSR()
 {
     // Releasing the weaver and context lets the SR platform power down the
     // lenticular lens and eye-tracking camera. The image texture is preserved.
+    StopHeadTracker();   // before the context goes away
     if (m_weaver)
     {
         m_weaver->destroy();
@@ -223,7 +301,7 @@ void SRWeaver::ReleaseViewTexture()
 void SRWeaver::Shutdown()
 {
     ReleaseViewTexture();
-
+    StopHeadTracker();
     if (m_weaver)
     {
         m_weaver->destroy();

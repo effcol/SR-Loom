@@ -87,6 +87,8 @@ add_executable(SRLoom WIN32
     src/Detector.cpp
     src/Gui.cpp
     src/AcerSpatialLabs.cpp
+    src/Settings.cpp
+    src/VideoSource.cpp
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
@@ -97,6 +99,8 @@ add_executable(SRLoom WIN32
     src/Detector.h
     src/Gui.h
     src/AcerSpatialLabs.h
+    src/Settings.h
+    src/VideoSource.h
     src/resource.h
     src/app.rc
     ${IMGUI_SOURCES}

@@ -28,3 +28,20 @@ tools/*.jpg
 tools/*.jpeg
 tools/*.png
 tools/sweep_*/
+
+# Loose stereo / quilt test images + videos at the repo root. They live in
+# lib/Test Images/ (already ignored via /lib/) -- this stops stray copies at
+# the top level from getting committed by accident. README/docs images live
+# under assets/, which is unaffected.
+/*.png
+/*.jpg
+/*.jpeg
+/*.bmp
+/*.tga
+/*.mp4
+/*.mov
+/*.mkv
+/*.webm
+/*.avi
+/*.m4v
+/*.wmv
