@@ -2298,8 +2298,35 @@ namespace
     }
 }
 
+// Top-level structured-exception handler: writes the exception code and the
+// faulting module name+address to srweaver.log before the process dies. Lets
+// us diagnose unsymbolicated crash dumps from users -- without it, the dump's
+// instruction pointer means nothing without our PDB. Returns
+// EXCEPTION_CONTINUE_SEARCH so the default Windows error reporter + crash
+// dump generation still run.
+static LONG WINAPI SrLoomCrashHandler(EXCEPTION_POINTERS* ep)
+{
+    if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    void* const addr = ep->ExceptionRecord->ExceptionAddress;
+    char modName[MAX_PATH] = "?";
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(addr), &mod) && mod)
+        GetModuleFileNameA(mod, modName, MAX_PATH);
+    Log("CRASH: code=0x%08X at addr=%p (module: %s)",
+        (unsigned)code, addr, modName);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 {
+    // Install the crash handler first so any later init failure that
+    // segfaults / access-violates leaves a useful trail in srweaver.log.
+    SetUnhandledExceptionFilter(SrLoomCrashHandler);
+    Log("WinMain: SR Loom v1.6 starting");
+
     // Per-Monitor-Aware v2: unlike v1, Windows auto-scales the NON-CLIENT area
     // (title bar) per monitor — so the GUI's title bar no longer stays huge when
     // dragged from a 4K/150% display to a 1440p/100% one. Falls back to v1.
@@ -2400,13 +2427,32 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 7;
     }
     Log("WinMain: converter.Initialize OK");
-    app.detector.Initialize(app.renderer.Device(), app.renderer.Context());  // optional
+    // Wrap detector / gui / tray init in begin/end + try/catch -- one of these
+    // dying silently between converter.Initialize OK and tray.Add was the
+    // failure mode reported by the first user, and "begin" / "end" pairs plus
+    // exception messages make it obvious which call is to blame.
+    Log("WinMain: detector.Initialize() begin");
+    try {
+        app.detector.Initialize(app.renderer.Device(), app.renderer.Context());  // optional
+    } catch (std::exception& e) {
+        Log("WinMain: detector.Initialize() std::exception: %s", e.what());
+    } catch (...) {
+        Log("WinMain: detector.Initialize() unknown exception");
+    }
     Log("WinMain: detector.Initialize done");
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
     // Control GUI (left-click the tray icon). Shares the D3D11 device; lives in its
     // own top-level window so it can sit on any monitor with its own taskbar button.
-    const bool guiOK = app.gui.Init(app.hwnd, app.renderer.Device(), app.renderer.Context());
+    Log("WinMain: gui.Init() begin");
+    bool guiOK = false;
+    try {
+        guiOK = app.gui.Init(app.hwnd, app.renderer.Device(), app.renderer.Context());
+    } catch (std::exception& e) {
+        Log("WinMain: gui.Init() std::exception: %s", e.what());
+    } catch (...) {
+        Log("WinMain: gui.Init() unknown exception");
+    }
     Log("WinMain: gui.Init=%d", guiOK ? 1 : 0);
     // Honor the persisted "start in tray" preference. Default is true (tray-only,
     // matches the historical behaviour); flipping it off pops the control panel
@@ -2418,7 +2464,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
     // Tray icon + global hotkeys.
-    const bool trayOK = app.tray.Add(app.hwnd, "SR Loom — paused (SR off)");
+    Log("WinMain: tray.Add() begin");
+    bool trayOK = false;
+    try {
+        trayOK = app.tray.Add(app.hwnd, "SR Loom — paused (SR off)");
+    } catch (std::exception& e) {
+        Log("WinMain: tray.Add() std::exception: %s", e.what());
+    } catch (...) {
+        Log("WinMain: tray.Add() unknown exception");
+    }
     Log("WinMain: tray.Add=%d", trayOK ? 1 : 0);
 
     // Create the floating overlay windows now (all stay hidden until the user

@@ -373,12 +373,19 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // weaving), so letting ImGui touch that same context from the main loop races
     // it and crashes whenever the panel is open during a weave. A dedicated device
     // fully isolates the panel; it shares no textures with the weaver.
+    Log("Gui::Init: D3D11CreateDevice begin");
     UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL fl{};
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createFlags,
-                                 nullptr, 0, D3D11_SDK_VERSION, &m_device, &fl, &m_context)))
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createFlags,
+                                   nullptr, 0, D3D11_SDK_VERSION, &m_device, &fl, &m_context);
+    if (FAILED(hr))
+    {
+        Log("Gui::Init: D3D11CreateDevice FAILED hr=0x%08X", (unsigned)hr);
         return false;
+    }
+    Log("Gui::Init: D3D11CreateDevice ok (FL=0x%04X)", (unsigned)fl);
 
+    Log("Gui::Init: register class + create window");
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_DROPSHADOW;   // a drop shadow for the borderless window
@@ -400,18 +407,25 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
         CW_USEDEFAULT, CW_USEDEFAULT, 440, 720,
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!m_hwnd)
+    {
+        Log("Gui::Init: CreateWindowExA FAILED gle=%lu", GetLastError());
         return false;
+    }
 
     // Round the corners (Win11) to match the modern look.
     DWORD corner = 2;   // DWMWCP_ROUND
     DwmSetWindowAttribute(m_hwnd, kDwmCornerPref, &corner, sizeof(corner));
 
+    Log("Gui::Init: ImGui CreateContext");
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;   // don't write imgui.ini
-    if (!ImGui_ImplWin32_Init(m_hwnd)) return false;
-    if (!ImGui_ImplDX11_Init(m_device, m_context)) return false;
+    Log("Gui::Init: ImGui_ImplWin32_Init");
+    if (!ImGui_ImplWin32_Init(m_hwnd)) { Log("Gui::Init: ImGui_ImplWin32_Init FAILED"); return false; }
+    Log("Gui::Init: ImGui_ImplDX11_Init");
+    if (!ImGui_ImplDX11_Init(m_device, m_context)) { Log("Gui::Init: ImGui_ImplDX11_Init FAILED"); return false; }
     m_imguiReady = true;
+    Log("Gui::Init: imgui ready");
 
     // Scale everything (font + style + window) to the monitor the window is on, so
     // the panel is the same perceptual size on a 4K/150% display and a 1440p/100%
@@ -638,7 +652,7 @@ bool Gui::Render(GuiState& state)
                     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x,
                                                      nameBottom - ImGui::GetTextLineHeight()));
                     ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
-                    ImGui::TextUnformatted("v1.5");
+                    ImGui::TextUnformatted("v1.6");
                     ImGui::PopStyleColor();
 
                     Section("KEYBOARD SHORTCUTS");

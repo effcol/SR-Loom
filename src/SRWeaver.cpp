@@ -274,21 +274,25 @@ void SRWeaver::Weave()
 {
     if (!m_weaver)
         return;
-    // The SR weaver can throw (e.g. lost SR service / tracking). Log the first such
-    // failure instead of letting it bubble up, so a transient drop is diagnosable.
+    // The SR weaver can throw (e.g. lost SR service / tracking). Log every
+    // distinct exception (one per frame max -- we re-log after 1s of silence
+    // so we capture diagnostic info without flooding the log at 165Hz on a
+    // persistently-broken state).
     try
     {
         m_weaver->weave();
     }
     catch (std::exception& e)
     {
-        static bool logged = false;
-        if (!logged) { Log("SRWeaver::Weave exception: %s", e.what()); logged = true; }
+        static DWORD lastTick = 0;
+        const DWORD now = GetTickCount();
+        if (now - lastTick > 1000) { Log("SRWeaver::Weave std::exception: %s", e.what()); lastTick = now; }
     }
     catch (...)
     {
-        static bool logged = false;
-        if (!logged) { Log("SRWeaver::Weave unknown exception"); logged = true; }
+        static DWORD lastTick = 0;
+        const DWORD now = GetTickCount();
+        if (now - lastTick > 1000) { Log("SRWeaver::Weave unknown exception"); lastTick = now; }
     }
 }
 
