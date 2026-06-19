@@ -6,16 +6,21 @@
 #include "sr/management/srcontext.h"
 #include "sr/weaver/dx11weaver.h"
 #include "sr/world/display/display.h"
+#include "sr/world/display/window2.h"
+#include "sr/sense/display/switchablehint.h"
 #include "sr/sense/headtracker/headposetracker.h"
 #include "sr/sense/headtracker/headposelistener.h"
 #include "sr/sense/headtracker/headposestream.h"
 #include "sr/sense/headtracker/head.h"
 #include "sr/sense/core/inputstream.h"
 #include "sr/utility/exception.h"
+#include "sr/utility/logging.h"
+#include "sr/version_c.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <cmath>
 #include <thread>
 #include <chrono>
 #include <exception>
@@ -85,6 +90,85 @@ bool SRWeaver::CreateContext(double maxSeconds)
     return m_context != nullptr;
 }
 
+void SRWeaver::LensEnable()
+{
+    if (!m_lensHint) return;
+    try { m_lensHint->enable(); }
+    catch (...) { Log("SwitchableLensHint::enable() threw"); }
+}
+
+void SRWeaver::LensDisable()
+{
+    if (!m_lensHint) return;
+    try { m_lensHint->disable(); }
+    catch (...) { Log("SwitchableLensHint::disable() threw"); }
+}
+
+bool SRWeaver::GetPredictedEyePositions(float lEye[3], float rEye[3])
+{
+    if (!m_weaver) return false;
+    try
+    {
+        m_weaver->getPredictedEyePositions(lEye, rEye);
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+
+bool SRWeaver::IsLensEnabled() const
+{
+    if (!m_lensHint) return false;
+    try { return m_lensHint->isEnabled(); }
+    catch (...) { return false; }
+}
+
+bool SRWeaver::IsWindowPartVisible(HWND hwnd, int width, int height)
+{
+    if (!m_context || !hwnd || width <= 0 || height <= 0)
+        return true;   // unknown -> safe default
+
+    if (m_window2Hwnd != hwnd)
+    {
+        // HWND changed (or first call): rebuild Window2 instance.
+        m_window2.reset(SR::Window2::create(*m_context, hwnd));
+        m_window2Hwnd = m_window2 ? hwnd : nullptr;
+    }
+    if (!m_window2) return true;
+
+    try
+    {
+        return m_window2->isWindowPartVisible(0, 0,
+                                              (unsigned int)width,
+                                              (unsigned int)height);
+    }
+    catch (...)
+    {
+        return true;   // SDK threw -> err on the side of rendering
+    }
+}
+
+void SRWeaver::InitSRLog(const char* logDir, const char* filePrefix)
+{
+    try
+    {
+        SR::Log::initializeToFile(SR::MediumVerbosity,
+                                  logDir ? logDir : "",
+                                  filePrefix ? filePrefix : "sr-");
+    }
+    catch (...) { /* Already initialized or runtime too old -- ignore */ }
+}
+
+const char* SRWeaver::GetSRPlatformVersion()
+{
+    try
+    {
+        const char* v = ::getSRPlatformVersion();
+        return v ? v : "";
+    }
+    catch (...) { return ""; }
+}
+
 bool SRWeaver::GetSRDisplayRect(RECT& out)
 {
     if (!m_context)
@@ -134,6 +218,58 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
         return false;
     }
 
+    // Late latching: the weaver re-pulls head/eye positions for frames
+    // already in flight, cutting effective tracking latency. Free for
+    // tracked content (per LeiaSR docs in IWeaverBase.h:48). Wrapped in
+    // try/catch in case an older runtime / global INI forces it off.
+    // (A/B-tested off in an earlier build to rule out as the cause of
+    // window-drag flicker -- flicker persists with it off, so it's not
+    // the culprit; long-standing converter behaviour we'll chase later.)
+    try { m_weaver->enableLateLatching(true); }
+    catch (...) { Log("enableLateLatching threw -- continuing without it"); }
+    Log("LateLatching enabled=%d", m_weaver->isLateLatchingEnabled() ? 1 : 0);
+
+    // sRGB conversion: SR Loom uses sRGB-typed SRVs (capture is
+    // BGRA8_UNORM_SRGB) and an sRGB-typed RTV on the backbuffer, so the
+    // hardware handles BOTH the sample-time sRGB->linear conversion AND
+    // the write-time linear->sRGB conversion. Tell the weaver shader NOT
+    // to apply its own conversion -- otherwise we double-convert and the
+    // weave comes out subtly wrong (typically too dark / desaturated).
+    // Per IWeaverBase.h:59: "When input is already linear or set for
+    // hardware conversion, set read to false."
+    try { m_weaver->setShaderSRGBConversion(false, false); }
+    catch (...) { Log("setShaderSRGBConversion threw -- using defaults"); }
+
+    // ACT (Anti-Crosstalk): mode setter only lives on the deprecated
+    // PredictingDX11Weaver class; not yet ported to IDX11Weaver1. ACT is a
+    // LENS-HARDWARE property (one-mode-per-panel), not per-weaver state, so
+    // we briefly spin up a deprecated weaver instance JUST to set the mode
+    // to Dynamic (best optical quality per Leia user guidance), then
+    // destroy it. Our modern IDX11Weaver1 keeps doing the real weaving;
+    // the lens hardware retains the ACT setting.
+    try
+    {
+        ID3D11Device* device = nullptr;
+        immediateContext->GetDevice(&device);
+        if (device)
+        {
+            #pragma warning(push)
+            #pragma warning(disable: 4996)   // [[deprecated]] on PredictingDX11Weaver
+            SR::PredictingDX11Weaver actHelper(
+                *m_context, device, immediateContext, 1, 1, window);
+            actHelper.setACTMode(::WeaverACTMode::Dynamic);
+            const ::WeaverACTMode got = actHelper.getACTMode();
+            Log("ACT: requested Dynamic, runtime now reports mode=%d",
+                (int)got);
+            #pragma warning(pop)
+            device->Release();
+        }
+        else
+            Log("ACT: couldn't fetch device from immediate context -- skipped");
+    }
+    catch (std::exception& e) { Log("ACT: setACTMode threw: %s", e.what()); }
+    catch (...)               { Log("ACT: setACTMode threw (unknown)"); }
+
     // Subscribe to head-pose updates BEFORE initialize() -- the LeiaSR docs +
     // example apps create their trackers between context creation and
     // initialize(). Failure to start the tracker is non-fatal (the weaver still
@@ -142,7 +278,14 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
 
     // Finalize the SR context now that the weaver + tracker are registered.
     m_context->initialize();
-    Log("CreateWeaver OK (weaver=%p); SR context initialized", (void*)m_weaver);
+    // SwitchableLensHint: cooperative app-level control over the lens
+    // power state, separate from SR-session lifecycle. Lets us keep SR
+    // session up while temporarily backing off to plain 2D (Katanga arm).
+    // Owned by the SRContext per SDK docs.
+    try { m_lensHint = SR::SwitchableLensHint::create(*m_context); }
+    catch (...) { m_lensHint = nullptr; }
+    Log("CreateWeaver OK (weaver=%p, lensHint=%p); SR context initialized",
+        (void*)m_weaver, (void*)m_lensHint);
     return true;
 }
 
@@ -178,22 +321,12 @@ bool SRWeaver::GetHeadPose(double pos[3], double orient[3]) const
     return m_headListener->get(pos, orient);
 }
 
-bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
-                                      const char* path,
-                                      StereoFormat fmt,
-                                      DXGI_FORMAT texFormat)
+bool SRWeaver::SetStereoImageFromPixels(ID3D11Device* device,
+                                         const uint8_t* pixels,
+                                         int w, int h,
+                                         DXGI_FORMAT texFormat)
 {
-    // Loads the image into a texture; the weaver is not required here.
-    if (!device)
-        return false;
-
-    int w = 0, h = 0, channels = 0;
-    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
-    if (!pixels)
-    {
-        ShowError("Failed to load stereo test image.");
-        return false;
-    }
+    if (!device || !pixels || w <= 0 || h <= 0) return false;
 
     ReleaseViewTexture();
 
@@ -212,29 +345,35 @@ bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
     td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
 
     HRESULT hr = device->CreateTexture2D(&td, &init, &m_viewTex);
-    stbi_image_free(pixels);
-    if (FAILED(hr))
-    {
-        ShowError("Failed to create stereo texture.");
-        return false;
-    }
+    if (FAILED(hr)) { ShowError("Failed to create stereo texture."); return false; }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format                    = texFormat;
-    sd.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels       = 1;
+    sd.Format               = texFormat;
+    sd.ViewDimension        = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels  = 1;
     hr = device->CreateShaderResourceView(m_viewTex, &sd, &m_viewSRV);
-    if (FAILED(hr))
-    {
-        ShowError("Failed to create stereo shader resource view.");
-        return false;
-    }
+    if (FAILED(hr)) { ShowError("Failed to create stereo shader resource view."); return false; }
 
-    // Store the full image size; the converter consumes this as its source.
-    (void)fmt;
     m_imgW = w;
     m_imgH = h;
     return true;
+}
+
+bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
+                                      const char* path,
+                                      StereoFormat fmt,
+                                      DXGI_FORMAT texFormat)
+{
+    if (!device) return false;
+
+    int w = 0, h = 0, channels = 0;
+    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
+    if (!pixels) { ShowError("Failed to load stereo test image."); return false; }
+
+    const bool ok = SetStereoImageFromPixels(device, pixels, w, h, texFormat);
+    stbi_image_free(pixels);
+    (void)fmt;
+    return ok;
 }
 
 void SRWeaver::SetInputView(ID3D11ShaderResourceView* srv, int perEyeWidth,
@@ -258,6 +397,13 @@ void SRWeaver::StopSR()
     // Releasing the weaver and context lets the SR platform power down the
     // lenticular lens and eye-tracking camera. The image texture is preserved.
     StopHeadTracker();   // before the context goes away
+    // Window2 holds an SRContext reference -- release it before the context
+    // is torn down so the next IsWindowPartVisible() lazily rebuilds it
+    // against the fresh context.
+    m_window2.reset();
+    m_window2Hwnd = nullptr;
+    // SwitchableLensHint is owned by the SRContext; just drop our pointer.
+    m_lensHint = nullptr;
     if (m_weaver)
     {
         m_weaver->destroy();

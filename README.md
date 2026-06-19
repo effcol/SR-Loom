@@ -60,6 +60,15 @@ plus a light/dark theme toggle.
   SR Service must be running — it provides the `SimulatedReality*.dll`s and the
   eye-tracking). An out-of-date runtime can be missing the modern weaver API.
 
+**Note on primary monitor:** Samsung and Acer both tell users to make the SR
+display Windows-primary. That guidance exists because their *launchers*
+(Reality Hub, SpatialLabs Go / TrueGame) open games on whichever display
+Windows considers primary. **SR Loom does NOT need the SR display to be
+primary** — it self-targets the SR panel via the LeiaSR SDK's display rect, so
+you can run with the SR display as a secondary monitor (recommended on
+Windows 11). See `docs/sr-non-primary-research.md` for the full rationale and
+SDK-level evidence.
+
 ## Troubleshooting
 
 - **A "fullscreen" game shows a frozen 3D image / doesn't update / has no input.**

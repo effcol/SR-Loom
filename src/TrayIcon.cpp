@@ -1,6 +1,8 @@
 #include "TrayIcon.h"
 #include "resource.h"
 #include <shellapi.h>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 
 using namespace srw;
 
@@ -79,6 +81,16 @@ namespace
 
         const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
         if (ex & WS_EX_TOOLWINDOW)                 return TRUE;  // skip tool windows
+
+        // DWM-cloaked windows have WS_VISIBLE but DWM has hidden them: e.g.
+        // suspended UWP/PWA apps still loaded in the background, windows on
+        // an inactive virtual desktop, apps minimized to the tray that kept
+        // their phantom HWND around. Without this check the picker is full
+        // of Microsoft Edge, Settings, Mail etc. that the user can't see.
+        BOOL cloaked = FALSE;
+        if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+                                            &cloaked, sizeof(cloaked))) && cloaked)
+            return TRUE;
 
         ctx->list->push_back(hwnd);
         return TRUE;
@@ -230,8 +242,11 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     // Quilt: cols x rows grid of views; picks centre pair by default.
     addFmt(fmtMenu, StereoFormat::Quilt, "Quilt");
 
+    // StereoFormat::Katanga deliberately not exposed in the tray menu --
+    // see Common.h's StereoFormatList comment for why.
+
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap eyes");
+    AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap Eyes");
     AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fmtMenu), "3D format");
 
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);

@@ -1,6 +1,7 @@
 #include "Gui.h"
 #include "TrayIcon.h"   // ID_TRAY_* command ids (reused by the GUI)
 #include "AcerSpatialLabs.h"
+#include "UpdateChecker.h"   // user-forced check from the About popup
 #include "Settings.h"   // run-at-startup / start-in-tray persistence
 #include "resource.h"   // IDI_TRAY (app icon)
 
@@ -267,6 +268,13 @@ namespace
         auto* out = reinterpret_cast<std::vector<WinEntry>*>(lp);
         if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
         if (GetWindowLongPtrA(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+        // DWM-cloaked: suspended UWP/PWA apps, virtual-desktop-hidden, and
+        // some tray-only apps that keep a phantom HWND alive. Filters out
+        // Edge, Settings, Mail etc. that the user can't actually see.
+        BOOL cloaked = FALSE;
+        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED,
+                                            &cloaked, sizeof(cloaked))) && cloaked)
+            return TRUE;
         char title[160] = {};
         if (GetWindowTextA(h, title, (int)sizeof(title)) <= 0) return TRUE;
         char cls[64] = {};
@@ -640,7 +648,8 @@ bool Gui::Render(GuiState& state)
                 const ImVec2 ts = ImGui::CalcTextSize("i");
                 dl->AddText(ImVec2(ic.x - ts.x * 0.5f, ic.y - ts.y * 0.5f), col, "i");
 
-                // About popup: version, keyboard shortcuts, GitHub link.
+                // About popup: version, SR runtime version, keyboard
+                // shortcuts, GitHub + check-for-updates links.
                 if (ImGui::BeginPopup("About"))
                 {
                     ImGui::PushFont(m_fontLarge);
@@ -648,12 +657,24 @@ bool Gui::Render(GuiState& state)
                     ImGui::PopFont();
                     const float nameBottom = ImGui::GetItemRectMax().y;
                     ImGui::SameLine();
-                    // Sit "v1.0" on the title's baseline (align the text bottoms).
+                    // Sit "vX.Y" on the title's baseline (align the text bottoms).
                     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorScreenPos().x,
                                                      nameBottom - ImGui::GetTextLineHeight()));
                     ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
-                    ImGui::TextUnformatted("v1.6");
+                    char ver[32]; snprintf(ver, sizeof(ver), "v%s", kAppVersion);
+                    ImGui::TextUnformatted(ver);
                     ImGui::PopStyleColor();
+
+                    // SR Platform runtime version (Leia SR service that we
+                    // talk to). Useful for support diagnostics. Skipped if
+                    // we couldn't query it -- usually means the service isn't
+                    // installed / running.
+                    if (state.srPlatformVersion[0])
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
+                        ImGui::Text("SR Platform runtime: %s", state.srPlatformVersion);
+                        ImGui::PopStyleColor();
+                    }
 
                     Section("KEYBOARD SHORTCUTS");
                     auto sc = [&](const char* keys, const char* what) {
@@ -663,17 +684,83 @@ bool Gui::Render(GuiState& state)
                         ImGui::TextUnformatted(what);
                         ImGui::PopStyleColor();
                     };
-                    sc("Ctrl+Alt+W", "Toggle weaving");
-                    sc("Ctrl+Alt+F", "Fullscreen / windowed");
-                    sc("Ctrl+Alt+C", "Make active window 3D");
+                    sc("Ctrl+Alt+W", "Toggle Weaving");
+                    sc("Ctrl+Alt+F", "Fullscreen / Windowed");
+                    sc("Ctrl+Alt+C", "Make Active Window 3D");
 
                     ImGui::Dummy(ImVec2(0, 6 * m_dpiScale));
+                    // "Check for updates" link. Posts the result directly
+                    // to this window so we can show the outcome inline
+                    // instead of via a tray balloon (which the user can
+                    // miss). Stays open until the user dismisses it.
                     ImGui::PushStyleColor(ImGuiCol_Text, g_accent);
-                    if (ImGui::Selectable("Open on GitHub", false, 0,
-                                          ImGui::CalcTextSize("Open on GitHub")))
+                    const char* checkLabel = (m_updateCheck == UpdateCheck::Checking)
+                                             ? "Checking..." : "Check for updates";
+                    const bool checkDisabled = (m_updateCheck == UpdateCheck::Checking);
+                    if (checkDisabled) ImGui::BeginDisabled();
+                    // DontClosePopups keeps the About popup open after the
+                    // click so the inline result (Up To Date / failed) is
+                    // visible -- by default ImGui::Selectable auto-closes
+                    // any open popup on click, which dismissed our feedback.
+                    if (ImGui::Selectable(checkLabel, false,
+                                          ImGuiSelectableFlags_DontClosePopups,
+                                          ImGui::CalcTextSize(checkLabel)))
+                    {
+                        m_updateCheck = UpdateCheck::Checking;
+                        m_updateTag.clear();
+                        m_updateUrl.clear();
+                        UpdateChecker::StartAsync(m_hwnd, WM_APP_UPDATE_RESULT, true);
+                    }
+                    if (checkDisabled) ImGui::EndDisabled();
+                    ImGui::PopStyleColor();
+
+                    // Inline result of the most recent forced check. Green
+                    // tick for up-to-date, accent text for "update available"
+                    // (the new release page has already been opened in the
+                    // browser by the WndProc handler), red X for failure.
+                    // The tick/X glyphs come from the Segoe Fluent / MDL2
+                    // icon font we already load for the caption buttons
+                    // (E73E = CheckMark, E711 = Cancel/X). The default
+                    // font's glyph range doesn't cover U+2713 / U+2715.
+                    auto iconLine = [&](const char* iconUtf8, ImU32 col, const char* label) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, col);
+                        if (m_fontIcons)
+                        {
+                            ImGui::PushFont(m_fontIcons);
+                            ImGui::TextUnformatted(iconUtf8);
+                            ImGui::PopFont();
+                            ImGui::SameLine(0, 8.0f * m_dpiScale);
+                            ImGui::AlignTextToFramePadding();
+                        }
+                        ImGui::TextUnformatted(label);
+                        ImGui::PopStyleColor();
+                    };
+                    if (m_updateCheck == UpdateCheck::UpToDate)
+                        iconLine("\xEE\x9C\xBE", IM_COL32(94, 178, 110, 255), "Up To Date");
+                    else if (m_updateCheck == UpdateCheck::Available)
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, g_accent);
+                        ImGui::Text("Update available: %s -- opened in browser", m_updateTag.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                    else if (m_updateCheck == UpdateCheck::Failed)
+                        iconLine("\xEE\x9C\x91", IM_COL32(210, 105, 74, 255), "Check failed");
+
+                    ImGui::PushStyleColor(ImGuiCol_Text, g_accent);
+                    if (ImGui::Selectable("Open Github", false,
+                                          ImGuiSelectableFlags_DontClosePopups,
+                                          ImGui::CalcTextSize("Open Github")))
                         ShellExecuteA(nullptr, "open", kGithubUrl, nullptr, nullptr, SW_SHOWNORMAL);
                     ImGui::PopStyleColor();
                     ImGui::EndPopup();
+                }
+                else
+                {
+                    // Popup closed -- reset state so the next time it opens
+                    // we don't flash a stale "Up To Date" message that's
+                    // hours old.
+                    if (m_updateCheck != UpdateCheck::Checking)
+                        m_updateCheck = UpdateCheck::Idle;
                 }
             }
             ImGui::SetCursorScreenPos(ImVec2(win.x + winW - h - pad, win.y + rowY));
@@ -827,37 +914,26 @@ bool Gui::Render(GuiState& state)
             const char* dispLabel = "Other Displays";
             if (dispActive)
                 for (auto& m : mons) if (m.mon == state.captureMonitor) dispLabel = m.label;
+            const char* winLabel = (winActive && state.sourceName[0]) ? state.sourceName : "Window";
 
-            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
+            // Use BeginCombo so we get the same built-in dropdown arrow + list
+            // styling as the Stereo 3D Input combo above. Active source gets
+            // the accent palette so it visually matches the action buttons.
+            auto pushAccent = [&]() {
+                ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,       g_accent);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,g_accent);
+                ImGui::PushStyleColor(ImGuiCol_FrameBgActive, g_accent);
+                ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
+            };
+            auto popAccent  = []() { ImGui::PopStyleColor(7); };
 
             // -- Other display (left half) -----------------------------------
-            if (dispActive) {
-                ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
-                ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
-            }
-            if (ImGui::Button(dispLabel, ImVec2(half, 0)))
-                ImGui::OpenPopup("##srcdisp_popup");
-            if (dispActive) ImGui::PopStyleColor(4);
-
-            // -- Window (right half) -----------------------------------------
-            ImGui::SameLine(0, gap);
-            if (winActive) {
-                ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
-                ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
-            }
-            const char* winLabel = (winActive && state.sourceName[0]) ? state.sourceName : "Window";
-            if (ImGui::Button(winLabel, ImVec2(half, 0)))
-                ImGui::OpenPopup("##srcwin_popup");
-            if (winActive) ImGui::PopStyleColor(4);
-
-            ImGui::PopStyleVar();
-
-            // Popups (their own selectables, kept outside the centred-button styling).
-            if (ImGui::BeginPopup("##srcdisp_popup"))
+            if (dispActive) pushAccent();
+            ImGui::SetNextItemWidth(half);
+            if (ImGui::BeginCombo("##srcdisp", dispLabel, ImGuiComboFlags_HeightLargest))
             {
                 int shown = 0;
                 for (int i = 0; i < (int)mons.size(); ++i)
@@ -871,22 +947,29 @@ bool Gui::Render(GuiState& state)
                     ++shown;
                 }
                 if (shown == 0) ImGui::TextDisabled("No other displays");
-                ImGui::EndPopup();
+                ImGui::EndCombo();
             }
-            if (ImGui::BeginPopup("##srcwin_popup"))
+            if (dispActive) popAccent();
+
+            // -- Window (right half) -----------------------------------------
+            ImGui::SameLine(0, gap);
+            if (winActive) pushAccent();
+            ImGui::SetNextItemWidth(half);
+            if (ImGui::BeginCombo("##srcwin", winLabel, ImGuiComboFlags_HeightLargest))
             {
                 std::vector<WinEntry> wins;
                 EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&wins));
                 for (int i = 0; i < (int)wins.size(); ++i)
                 {
-                    ImGui::PushID(i);   // window titles can repeat → disambiguate the IDs
+                    ImGui::PushID(i);
                     if (ImGui::Selectable(wins[i].title, false))
                         PostMessageA(m_mainHwnd, WM_APP_GUI_CAPTURE_WINDOW, 0, reinterpret_cast<LPARAM>(wins[i].hwnd));
                     ImGui::PopID();
                 }
                 if (wins.empty()) ImGui::TextDisabled("No windows");
-                ImGui::EndPopup();
+                ImGui::EndCombo();
             }
+            if (winActive) popAccent();
 
             // Row 3: paired action buttons — "Load Image..." (left) and
             // "Make Active Window 3D" (right). Image load opens the standard
@@ -898,13 +981,18 @@ bool Gui::Render(GuiState& state)
 
         Section("STEREO 3D INPUT");
         {
-            // Category combo (whole list, no scroll). SBS / TAB / Interleaved expose a
-            // second "variant" combo (like anaglyph's) for Full|Half / Row|Column.
-            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_N };
+            // Category combo (whole list, no scroll). SBS / TAB / Interleaved /
+            // VR180 / VR360 expose a second "variant" combo for the layout.
+            // StereoFormat::Katanga deliberately not exposed (parked from
+            // the UI -- see Common.h's StereoFormatList comment). If the
+            // current format is Katanga (e.g. carried over from a saved
+            // state), catOf below maps it to C_SBS so the dropdown still
+            // has something coherent to display.
+            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_VR180, C_VR360, C_LFP, C_N };
             static const char* const kCat[C_N] = {
                 "Side-by-Side", "Top-and-Bottom", "Interleaved", "Checkerboard",
                 "Anaglyph", "Frame Sequential", "Pulfrich Effect", "Frame Packing",
-                "Quilt" };
+                "Quilt", "VR180", "VR360", "Lytro Light Field" };
             auto catOf = [](StereoFormat f) -> int {
                 switch (f) {
                 case StereoFormat::FullSBS: case StereoFormat::HalfSBS:        return C_SBS;
@@ -916,16 +1004,32 @@ bool Gui::Render(GuiState& state)
                 case StereoFormat::Pulfrich:        return C_PULF;
                 case StereoFormat::FramePacking:    return C_FP;
                 case StereoFormat::Quilt:           return C_QUILT;
+                case StereoFormat::VR180TAB: case StereoFormat::VR180SBS:    return C_VR180;
+                case StereoFormat::VR360TAB: case StereoFormat::VR360SBS:    return C_VR360;
+                case StereoFormat::LightField:      return C_LFP;
                 default:                            return C_SBS;
                 }
             };
             auto postFmt = [&](StereoFormat f) { post(ID_TRAY_FMT_BASE + (UINT)StereoFormatIndex(f)); };
             const int curCat = catOf(state.format);
 
+            // VR180/VR360 only make sense for a static SBS/TAB equirect source
+            // (loaded image / video); hide them when capturing live windows or
+            // monitors. State-only filter — main.cpp also flips the format to
+            // a sane non-VR default when the user switches away from the
+            // image/video source while a VR format is selected.
+            // VR180 / VR360 + Lytro Light Field only make sense for media
+            // (image / video) sources -- live capture has no equirectangular
+            // or plenoptic angular data.
+            const bool vrAvailable = (state.source == SourceKind::TestImage);
+            const bool lfpAvailable = (state.source == SourceKind::TestImage);
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::BeginCombo("##format", kCat[curCat], ImGuiComboFlags_HeightLargest))
             {
                 for (int c = 0; c < C_N; ++c)
+                {
+                    if (!vrAvailable && (c == C_VR180 || c == C_VR360)) continue;
+                    if (!lfpAvailable && c == C_LFP) continue;
                     if (ImGui::Selectable(kCat[c], c == curCat))
                     {
                         switch (c) {
@@ -938,8 +1042,12 @@ bool Gui::Render(GuiState& state)
                         case C_PULF:  postFmt(StereoFormat::Pulfrich); break;
                         case C_FP:    postFmt(StereoFormat::FramePacking); break;
                         case C_QUILT: postFmt(StereoFormat::Quilt); break;
+                        case C_VR180: postFmt(StereoFormat::VR180TAB); break;   // default TAB (YouTube convention)
+                        case C_VR360: postFmt(StereoFormat::VR360TAB); break;
+                        case C_LFP:   postFmt(StereoFormat::LightField); break;
                         }
                     }
+                }
                 ImGui::EndCombo();
             }
 
@@ -958,6 +1066,8 @@ bool Gui::Render(GuiState& state)
             if      (curCat == C_SBS) variant("##sbsv", "Full", "Half", StereoFormat::FullSBS, StereoFormat::HalfSBS);
             else if (curCat == C_TAB) variant("##tabv", "Full", "Half", StereoFormat::FullTAB, StereoFormat::HalfTAB);
             else if (curCat == C_IL)  variant("##ilv",  "Row",  "Column", StereoFormat::RowInterleaved, StereoFormat::ColumnInterleaved);
+            else if (curCat == C_VR180) variant("##vr180v", "Top-and-Bottom", "Side-by-Side", StereoFormat::VR180TAB, StereoFormat::VR180SBS);
+            else if (curCat == C_VR360) variant("##vr360v", "Top-and-Bottom", "Side-by-Side", StereoFormat::VR360TAB, StereoFormat::VR360SBS);
             else if (curCat == C_ANA)
             {
                 int modeN = 0; const AnaglyphModeEntry* modes = AnaglyphModeList(modeN);
@@ -1060,8 +1170,71 @@ bool Gui::Render(GuiState& state)
             }
         }
 
+        // VR viewer extras: only shown when a VR format is the active stereo
+        // input. Headlook is a toggle; the two buttons let the user snap the
+        // view direction / zoom back to defaults after dragging or scrolling.
+        if (IsVRFormat(state.format))
+        {
+            Section("VR VIEWER");
+            if (RowToggle("Head look", state.vrHeadLook))
+            {
+                state.vrHeadLook        = !state.vrHeadLook;
+                state.vrHeadLookChanged = true;
+            }
+            const float gap2  = ImGui::GetStyle().ItemSpacing.x;
+            const float half2 = (ImGui::GetContentRegionAvail().x - gap2) * 0.5f;
+            if (ImGui::Button("Reset view", ImVec2(half2, 0))) state.vrResetView = true;
+            ImGui::SameLine(0, gap2);
+            const bool zoomed = state.vrZoom < 0.99f || state.vrZoom > 1.01f;
+            ImGui::BeginDisabled(!zoomed);
+            if (ImGui::Button("Reset zoom", ImVec2(half2, 0))) state.vrResetZoom = true;
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Drag to look. Scroll to zoom.");
+        }
+
+        // Light-field parallax-scale slider: shown when LightField is the
+        // active format. The Lytro's aperture is physically tiny (~3.4mm
+        // F01, ~7mm Illum) vs ~62mm IPD, so true 1:1 mapping gives almost
+        // no usable head-tracked range. The slider lets the user pick how
+        // many millimetres of head-lean drive the aperture sample to its
+        // edge -- min = physical 1:1 (= aperture radius, tiny), default
+        // 30mm, max 100mm for an even bigger compressed range.
+        if (state.format == StereoFormat::LightField)
+        {
+            Section("LIGHT FIELD");
+            const float minLean = (std::max)(0.5f, state.lfpApertureMm * 0.5f);
+            const float startX = ImGui::GetCursorPosX();
+            const float labelCol = ImGui::CalcTextSize("Parallax scale").x + ImGui::GetStyle().ItemSpacing.x * 2;
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Head lean");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(startX + labelCol);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            float lean = state.lfpHeadLeanMm;
+            // Logarithmic feel so the low-mm "huge parallax" end has more granularity.
+            if (ImGui::SliderFloat("##lfpLean", &lean, minLean, 200.0f, "%.1f mm",
+                                    ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic))
+            {
+                state.lfpHeadLeanMm      = lean;
+                state.lfpHeadLeanChanged = true;
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(280.0f);
+                ImGui::TextUnformatted(
+                    "Head-lean distance that moves the aperture sample from "
+                    "centre to the edge. Smaller = more sensitive (huge "
+                    "parallax for tiny head movements). Lytro's physical "
+                    "baseline is around the slider's minimum -- 1:1 with "
+                    "your real head movement, but microscopic in range.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+        }
+
         Section("ADJUST");
-        if (RowToggle("Swap eyes", state.swapEyes)) post(ID_TRAY_SWAP_EYES);
+        if (RowToggle("Swap Eyes", state.swapEyes)) post(ID_TRAY_SWAP_EYES);
         // Two depth controls: convergence (zero-plane shift) + separation (depth scale).
         auto adjSlider = [&](const char* label, const char* id, float* v) -> bool {
             const float startX  = ImGui::GetCursorPosX();
@@ -1150,17 +1323,20 @@ bool Gui::Render(GuiState& state)
                 };
                 const float halfW = (ImGui::GetContentRegionAvail().x
                                      - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-                if (pairToggle("Focus",
+                // "Allow Looking Away": visual ON = looking away is allowed
+                // = Acer's Focus_Detection is OFF (detection=0). Inverts
+                // from the underlying registry value's natural sense.
+                if (pairToggle("Allow Looking Away",
                                "Acer turns weaving off when you look away from the screen. "
-                               "Turn this off to keep weaving on.",
-                               sls.focusDetection == 1, halfW))
+                               "Turn this on to keep weaving on when you look away.",
+                               sls.focusDetection != 1, halfW))
                     slWrite(AcerSpatialLabs::Setting::Focus, sls.focusDetection != 1);
                 ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
-                if (pairToggle("Fullscreen",
-                               "Lets SpatialLabs Go weave non-fullscreen content. "
-                               "May not work on non-Pro models.",
-                               sls.fullscreenDetection == 1, halfW))
-                    slWrite(AcerSpatialLabs::Setting::Fullscreen, sls.fullscreenDetection != 1);
+                if (pairToggle("Camera Notification",
+                               "Acer have Camera LEDs, and onscreen 'Camera On' "
+                               "notifications. This disables the on screen notification.",
+                               sls.cameraPopup == 1, halfW))
+                    slWrite(AcerSpatialLabs::Setting::CameraPopup, sls.cameraPopup != 1);
 
                 if (m_acerNeedsAdmin)
                 {
@@ -1230,13 +1406,13 @@ bool Gui::Render(GuiState& state)
             };
             const float halfW = (ImGui::GetContentRegionAvail().x
                                  - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-            if (pairToggle2("Run at startup", m_runAtStartup, halfW))
+            if (pairToggle2("Run At Startup", m_runAtStartup, halfW))
             {
                 m_runAtStartup = !m_runAtStartup;
                 Settings::WriteRunAtStartup(m_runAtStartup);
             }
             ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
-            if (pairToggle2("Start in tray", m_startInTray, halfW))
+            if (pairToggle2("Start In Tray", m_startInTray, halfW))
             {
                 m_startInTray = !m_startInTray;
                 Settings::WriteStartInTray(m_startInTray);
@@ -1367,6 +1543,39 @@ LRESULT CALLBACK Gui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                          SWP_NOZORDER | SWP_NOACTIVATE);
             g_gui->m_dpiScale = HIWORD(wParam) / 96.0f;
             g_gui->m_pendingRescale = true;   // rebuild fonts/style between frames
+        }
+        return 0;
+    case WM_APP_UPDATE_RESULT:
+        // User-forced check from the About popup landed here directly (we
+        // passed our own HWND to UpdateChecker::StartAsync). Stash the
+        // outcome so the popup can render an inline tick / "Up To Date"
+        // / "Update available" / "Check failed" line on the next frame.
+        if (g_gui && wParam)
+        {
+            auto* info = reinterpret_cast<ReleaseInfo*>(wParam);
+            switch (info->status)
+            {
+            case ReleaseInfo::Available:
+                g_gui->m_updateCheck = Gui::UpdateCheck::Available;
+                g_gui->m_updateTag   = info->tag;
+                g_gui->m_updateUrl   = info->url;
+                // Open the release page in the user's default browser too,
+                // since that's the actionable thing they want.
+                ShellExecuteA(nullptr, "open", info->url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                break;
+            case ReleaseInfo::UpToDate:
+                g_gui->m_updateCheck = Gui::UpdateCheck::UpToDate;
+                g_gui->m_updateTag   = info->tag;
+                g_gui->m_updateUrl.clear();
+                break;
+            case ReleaseInfo::Failed:
+            default:
+                g_gui->m_updateCheck = Gui::UpdateCheck::Failed;
+                g_gui->m_updateTag.clear();
+                g_gui->m_updateUrl.clear();
+                break;
+            }
+            delete info;
         }
         return 0;
     }

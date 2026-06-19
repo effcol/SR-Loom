@@ -8,6 +8,7 @@
 #include "Common.h"
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <string>
 
 struct ImFont;   // Dear ImGui (defined in imgui.h); only used by pointer here
 
@@ -35,6 +36,25 @@ namespace srw
         int          quiltCols      = 8;       // current quilt grid columns (1..12)
         int          quiltRows      = 6;       // current quilt grid rows    (1..9)
         bool         hasTestImage   = false;   // true once a TestImage has been loaded
+        // VR viewer (read+write): GUI shows Headlook toggle + Reset View /
+        // Reset Zoom buttons. Headlook toggles in place; reset buttons just
+        // set the respective flag so the main loop zeros the right field.
+        bool         vrHeadLook     = true;
+        float        vrZoom         = 1.0f;
+        bool         vrResetView    = false;
+        bool         vrResetZoom    = false;
+        bool         vrHeadLookChanged = false;
+        // SR Platform runtime version string (e.g. "1.34.10.17449"), shown in
+        // the About popup. Filled once at startup by main from
+        // SRWeaver::GetSRPlatformVersion(); empty if unavailable.
+        char         srPlatformVersion[80] = "";
+        // Light-field parallax-scale slider (mm of head-lean per full
+        // aperture sweep). The GUI shows + edits this when format is
+        // LightField. Main writes the initial value; GUI may change it
+        // and main reads it back each frame.
+        float        lfpHeadLeanMm   = 30.0f;
+        float        lfpApertureMm   = 0.0f;   // physical aperture diameter (for slider min)
+        bool         lfpHeadLeanChanged = false;
     };
 
     class Gui
@@ -84,6 +104,13 @@ namespace srw
         // read the registry per frame.
         bool                     m_runAtStartup = false;
         bool                     m_startInTray  = true;
+        // Inline state for the About popup's "Check for updates" link.
+        // Idle by default; switches to Checking on click, then settles to
+        // UpToDate / Available / Failed when WM_APP_UPDATE_RESULT lands.
+        enum class UpdateCheck { Idle, Checking, UpToDate, Available, Failed };
+        UpdateCheck              m_updateCheck    = UpdateCheck::Idle;
+        std::string              m_updateTag;        // populated for Available / UpToDate
+        std::string              m_updateUrl;        // populated for Available
         GuiState                 m_lastState;   // last rendered state (to repaint during a window drag)
         float                    m_sectionsH = 0.0f;   // measured height of the scrolling options
     };

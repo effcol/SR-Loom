@@ -27,6 +27,18 @@ namespace srw
     // currently-loaded test image and apply the result.
     constexpr UINT WM_APP_QUILT_AUTODETECT = WM_APP + 6;
 
+    // UpdateChecker worker thread -> main window: a check has completed.
+    // wParam = (WPARAM)(ReleaseInfo*) -- the main thread takes ownership and
+    // is responsible for deleting it. ReleaseInfo::status indicates whether
+    // a newer release was found, the build is up to date, or the check
+    // failed (the latter two are only posted for user-forced checks).
+    constexpr UINT WM_APP_UPDATE_RESULT = WM_APP + 7;
+
+    // GUI -> main window: kick off a user-forced update check (skips the
+    // 6-hour throttle, and the result is always posted back via
+    // WM_APP_UPDATE_RESULT so the user gets visual feedback either way).
+    constexpr UINT WM_APP_CHECK_UPDATES = WM_APP + 8;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {

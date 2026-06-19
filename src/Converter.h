@@ -46,6 +46,15 @@ namespace srw
         // the weaver scales to the panel.
         void SetTargetPaneSize(int w, int h) { m_targetPaneW = w; m_targetPaneH = h; }
 
+        // VR180 / VR360 viewer parameters. yaw / pitch in RADIANS. zoom: 1.0
+        // is ~90° horizontal FOV; higher = zoomed in. ipdScale shifts the
+        // stereo views laterally to approximate IPD parallax (small value,
+        // e.g. 0.02 of the sphere width).
+        void SetVRView(float yaw, float pitch, float zoom)
+        {
+            m_vrYaw = yaw; m_vrPitch = pitch; m_vrZoom = zoom;
+        }
+
         // Convert the source view into the internal SBS texture. Sets
         // outputResized=true when the SBS texture was (re)created (the caller
         // must then re-register OutputSRV() with the weaver).
@@ -140,6 +149,9 @@ namespace srw
         float        m_quiltRightBlend = 0.0f;          // 0..1 fade from rightIdx to rightIdx+1
         int          m_targetPaneW = 0;                 // SR panel per-eye dims (0 = unset)
         int          m_targetPaneH = 0;
+        float        m_vrYaw   = 0.0f;                   // VR viewer: yaw (radians)
+        float        m_vrPitch = 0.0f;                   // VR viewer: pitch (radians)
+        float        m_vrZoom  = 1.0f;                   // VR viewer: zoom (1=~90° HFOV)
         DXGI_FORMAT  m_format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     };
 }

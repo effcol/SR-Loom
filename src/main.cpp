@@ -6,6 +6,7 @@
 #include "Renderer.h"
 #include "SRWeaver.h"
 #include "TrayIcon.h"
+#include "UpdateChecker.h"
 #include "Capture.h"
 #include "CaptureDXGI.h"
 #include "Converter.h"
@@ -13,6 +14,9 @@
 #include "Gui.h"
 #include "Settings.h"
 #include "VideoSource.h"
+#include "KatangaSource.h"
+#include "LFPReader.h"
+#include "LFPRenderer.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -21,11 +25,43 @@
 #include <windowsx.h>
 #include <shellapi.h>      // DragAcceptFiles, DragQueryFile, DragFinish
 #include <cmath>
+#include <vector>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
 
 using namespace srw;
+
+// --- Undocumented NtQuerySystemInformation plumbing -----------------------
+// Used to identify the Katanga publishing process via shared-kernel-object
+// handle matching. Same technique Process Explorer / Handle.exe use. The
+// struct layout has been stable since Vista; the SystemExtendedHandle-
+// Information class returns 64-bit-safe PIDs/handles on Win64.
+extern "C" {
+    typedef LONG NTSTATUS;
+    #ifndef NT_SUCCESS
+    #define NT_SUCCESS(x) (((NTSTATUS)(x)) >= 0)
+    #endif
+    #ifndef STATUS_INFO_LENGTH_MISMATCH
+    #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+    #endif
+    typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+        PVOID     Object;
+        ULONG_PTR UniqueProcessId;
+        ULONG_PTR HandleValue;
+        ULONG     GrantedAccess;
+        USHORT    CreatorBackTraceIndex;
+        USHORT    ObjectTypeIndex;
+        ULONG     HandleAttributes;
+        ULONG     Reserved;
+    } SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
+    typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+        ULONG_PTR                          NumberOfHandles;
+        ULONG_PTR                          Reserved;
+        SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX  Handles[1];
+    } SYSTEM_HANDLE_INFORMATION_EX;
+}
+static constexpr int kSystemExtendedHandleInformation = 64;
 
 namespace
 {
@@ -49,7 +85,54 @@ namespace
         Detector     detector;
         Gui          gui;
         VideoSource  video;          // active video file source (mp4/mov/etc), if any
+        KatangaSource katanga;       // shared-texture receiver for Bo3b Katanga (Geo-11 etc.)
+        LFPRenderer  lfpRenderer;    // per-frame plenoptic SBS render (head-tracked aperture)
+                                     // Bound when format==Katanga; the render loop
+                                     // arms/engages based on receiver state. Game-exit
+                                     // detection lives in KatangaSource itself (it
+                                     // re-opens the named mapping each poll, so when
+                                     // the publishing process dies the kernel object
+                                     // is reclaimed and the next open fails).
+        // Main window of the Katanga-publishing game, discovered via
+        // NT-API handle-table lookup at reception start. Used to pin SR
+        // Loom's overlay specifically ABOVE the game in Z each frame, so
+        // games that self-set HWND_TOPMOST on activation can't pop above
+        // our weave. Null if discovery failed or no game is publishing.
+        HWND       katangaPublisherWnd = nullptr;
+
+        // VR180 / VR360 viewer state (used by the VR converter shader path).
+        // yaw / pitch in RADIANS; zoom in [0.2 .. 3.0] (1 = ~90° horizontal
+        // FOV, higher = zoomed in). headLook = head-position drives a small
+        // additional yaw shift so leaning to the side reveals a bit more of
+        // the panorama. vrDrag tracks an in-progress mouse drag-to-look.
+        // vrMouseDown / vrMoved distinguish click from drag: on LBUTTONUP
+        // without enough movement, fall through to the normal click handler
+        // so the user can still toggle the test-image overlays.
+        float        vrYaw          = 0.0f;
+        float        vrPitch        = 0.0f;
+        float        vrZoom         = 1.0f;
+        bool         vrHeadLook     = true;
+        bool         vrMouseDown    = false;
+        bool         vrMoved        = false;
+        int          vrDragStartX   = 0;
+        int          vrDragStartY   = 0;
+        int          vrDragLastX    = 0;
+        int          vrDragLastY    = 0;
+        // Accela-style velocity-aware filter state (one per axis). Tiny
+        // movements get heavy smoothing (kills jitter while head is still);
+        // large movements pass through near-instantly. Ported from VRto3D's
+        // accela_hamilton_runtime.h (BSD/ISC), simplified to single-axis.
+        struct AccelaAxis { double lastOutput = 0.0; DWORD lastTickMs = 0; bool init = false; };
+        AccelaAxis   vrYawFilter;
+        AccelaAxis   vrPitchFilter;
         float        convergence    = 0.0f;   // GUI convergence slider (-1..1)
+        // Light-field parallax-scale slider value (in mm of head-lean
+        // needed to drive the aperture sample to its edge). Lower =
+        // more sensitive, higher = closer to the physical camera baseline.
+        // Default 30 mm matches the v2 launch behaviour; minimum tracks
+        // the actual aperture radius (1:1 physical) and maximum lets the
+        // user crank parallax further (eg 10 mm head lean for huge effect).
+        float        lfpHeadLeanMm  = 30.0f;
         bool         weavingEnabled = true;
         OutputMode   mode           = OutputMode::Fullscreen;
         SourceKind   source         = SourceKind::CaptureMonitor;  // default: weave the screen (fullscreen SBS)
@@ -75,8 +158,11 @@ namespace
         // to one integer view, we cross-fade between the two nearest views in
         // the shader using the fractional position, which is what Looking Glass
         // does between physical lenticular columns -- no jagged step.
-        double       headXEMA          = 0.0;
+        double       headXEMA          = 0.0;   // legacy head-centre EMA (fallback)
         bool         headXEMAInit      = false;
+        double       leftEyeXEMA       = 0.0;   // smoothed left-eye-X from getPredictedEyePositions
+        double       rightEyeXEMA      = 0.0;
+        bool         eyesEMAInit       = false;
         float        quiltLeftBlend    = 0.0f;   // L pane: blend between quiltLeftIdx and the next view
         float        quiltRightBlend   = 0.0f;   // R pane: blend between quiltRightIdx and the next view
         double       srMmPerPx         = 0.0;    // SR display physical-to-pixel scale (mm/px), 0 = unknown
@@ -98,6 +184,12 @@ namespace
         bool       dxgiActive     = false;
         int        wgcStuck       = 0;     // consecutive iterations with no new WGC frame
         int        dxgiCheckCtr   = 0;     // polls the foreground-fullscreen state every ~30 ticks
+
+        // Update checker: URL of the latest GitHub release stashed when the
+        // worker thread finds one newer than kAppVersion. Used to open the
+        // release page when the user clicks the toast balloon.
+        std::string pendingUpdateUrl;
+        std::string pendingUpdateTag;
     };
 
     AppState* g_app = nullptr;
@@ -160,7 +252,15 @@ namespace
         {
         case OutputMode::WindowOverlay: return true;
         case OutputMode::LookingGlass:  return !app.loupeInteractive;
-        case OutputMode::Fullscreen:    return app.source == SourceKind::CaptureMonitor; // passthrough
+        case OutputMode::Fullscreen:
+            // Layered fullscreen for passthrough AND for Katanga: both put SR
+            // Loom over the entire SR display, both want the bit-blt swap
+            // chain. Switching between them then never recreates the swap
+            // chain -- which is critical because swap-chain recreation
+            // leaves the LeiaSR weaver in a state where its output never
+            // reaches the panel (root cause of the post-Katanga black bug).
+            return app.source == SourceKind::CaptureMonitor
+                || app.format == StereoFormat::Katanga;
         default:                        return false;
         }
     }
@@ -390,16 +490,18 @@ namespace
     constexpr int  kFsSetGap       = 8;
     constexpr int  kFsSetRadius    = 10;     // rounded-corner radius
     constexpr UINT kFsSetTimerId   = 8;
-    constexpr int  kFsSetBtnLoad   = 0;
-    constexpr int  kFsSetBtnFormat = 1;
-    constexpr int  kFsSetBtnCols   = 2;
-    constexpr int  kFsSetBtnRows   = 3;
-    constexpr int  kFsSetBtnAuto   = 4;
-    constexpr int  kFsSetWLoad     = 180;
-    constexpr int  kFsSetWFormat   = 250;
-    constexpr int  kFsSetWCols     = 140;
-    constexpr int  kFsSetWRows     = 140;
-    constexpr int  kFsSetWAuto     = 130;
+    constexpr int  kFsSetBtnLoad    = 0;
+    constexpr int  kFsSetBtnFormat  = 1;
+    constexpr int  kFsSetBtnCols    = 2;
+    constexpr int  kFsSetBtnRows    = 3;
+    constexpr int  kFsSetBtnAuto    = 4;
+    constexpr int  kFsSetBtnLfpLean = 5;   // LightField: Head-lean preset picker
+    constexpr int  kFsSetWLoad      = 180;
+    constexpr int  kFsSetWFormat    = 250;
+    constexpr int  kFsSetWCols      = 140;
+    constexpr int  kFsSetWRows      = 140;
+    constexpr int  kFsSetWAuto      = 130;
+    constexpr int  kFsSetWLfpLean   = 160;
     constexpr int  kQuiltColsMax   = 12;
     constexpr int  kQuiltRowsMax   = 9;
 
@@ -408,22 +510,40 @@ namespace
     DWORD g_fsSetLastUse  = 0;
     bool  g_fsSetTracking = false;
     int   g_fsSetBtnCount = 2;
-    RECT  g_fsSetRects[5] = {};
+    RECT  g_fsSetRects[6] = {};
     int   g_fsSetCalcW    = 0;
     int   g_fsSetCalcH    = 0;
+    // Light-field "head-lean" slider drag state (lives in the FS overlay).
+    bool  g_fsSetSliderDrag    = false;
+    constexpr float kLfpLeanMinMm = 1.0f;     // floor; clamped to aperture radius too
+    constexpr float kLfpLeanMaxMm = 200.0f;   // user request: bumped from 100 to 200
 
-    int FsSetBtnW(int i)
+    // Map a layout slot index (0..g_fsSetBtnCount) to the LOGICAL button
+    // id (kFsSetBtn*). Slot 0 + 1 are always Load + Format. Beyond that
+    // the meaning depends on the active format -- Quilt fills slots 2..4
+    // with Cols / Rows / Auto, LightField fills slot 2 with the Head-lean
+    // preset picker.
+    int FsSetSlotId(int slot)
     {
-        switch (i) {
-        case 0: return kFsSetWLoad;
-        case 1: return kFsSetWFormat;
-        case 2: return kFsSetWCols;
-        case 3: return kFsSetWRows;
-        case 4: return kFsSetWAuto;
+        if (slot < 2) return slot;   // Load / Format
+        const StereoFormat fmt = g_app ? g_app->format : StereoFormat::FullSBS;
+        if (fmt == StereoFormat::LightField) return kFsSetBtnLfpLean;
+        return slot;                  // Quilt: 2=Cols, 3=Rows, 4=Auto
+    }
+
+    int FsSetBtnW(int slot)
+    {
+        switch (FsSetSlotId(slot)) {
+        case kFsSetBtnLoad:    return kFsSetWLoad;
+        case kFsSetBtnFormat:  return kFsSetWFormat;
+        case kFsSetBtnCols:    return kFsSetWCols;
+        case kFsSetBtnRows:    return kFsSetWRows;
+        case kFsSetBtnAuto:    return kFsSetWAuto;
+        case kFsSetBtnLfpLean: return kFsSetWLfpLean;
         }
         return 60;
     }
-    const RECT& FsSetBtnRect(int i) { return g_fsSetRects[i]; }
+    const RECT& FsSetBtnRect(int slot) { return g_fsSetRects[slot]; }
 
     // Lay out the buttons into rows. If everything fits on one row inside the
     // given max width, that's used; otherwise buttons wrap to additional rows
@@ -556,17 +676,56 @@ namespace
                 RECT r = FsSetBtnRect(i);
                 FsPaintRoundButton(dc, r, i == g_fsSetHover ? kFsBtnHover : kFsBtnBg, kFsSetRadius);
 
-                wchar_t label[64];
-                switch (i)
+                const int id = FsSetSlotId(i);
+
+                // LightField "head-lean" slider: draw a horizontal track
+                // + handle on top of the rounded background, with the
+                // current value labelled.
+                if (id == kFsSetBtnLfpLean)
                 {
-                case kFsSetBtnLoad:   wcscpy_s(label, L"Load Media..."); break;
-                case kFsSetBtnFormat: swprintf_s(label, L"%hs", FsCurrentFormatLabel(fmt)); break;
-                case kFsSetBtnCols:   swprintf_s(label, L"%d cols", cols); break;
-                case kFsSetBtnRows:   swprintf_s(label, L"%d rows", rows); break;
-                case kFsSetBtnAuto:   wcscpy_s(label, L"Auto-detect"); break;
-                default:              label[0] = 0;
+                    const float val = g_app ? g_app->lfpHeadLeanMm : 30.0f;
+                    const float minV = kLfpLeanMinMm;
+                    const float maxV = kLfpLeanMaxMm;
+                    const float t    = (val - minV) / (maxV - minV);
+                    const float tClamp = t < 0 ? 0 : (t > 1 ? 1 : t);
+                    // Track: thin horizontal rect in the lower 1/3 of the button.
+                    const int trackInset = 14;
+                    const int trackY = (r.top + r.bottom) / 2 + 6;
+                    RECT trackR{ r.left + trackInset, trackY - 2,
+                                 r.right - trackInset, trackY + 2 };
+                    HBRUSH trackBr = CreateSolidBrush(kFsDim);
+                    FillRect(dc, &trackR, trackBr);
+                    DeleteObject(trackBr);
+                    // Handle: filled accent circle at the value position.
+                    const int handleR = 7;
+                    const int handleX = trackR.left + (int)(tClamp * (trackR.right - trackR.left));
+                    HBRUSH hb = CreateSolidBrush(kFsCloseHot);
+                    HPEN hp = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+                    HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
+                    Ellipse(dc, handleX - handleR, trackY - handleR,
+                                handleX + handleR + 1, trackY + handleR + 1);
+                    SelectObject(dc, ob);
+                    SelectObject(dc, hp);
+                    DeleteObject(hb);
+                    // Label above the track.
+                    wchar_t lbl[40]; swprintf_s(lbl, L"Lean: %.0f mm", val);
+                    RECT tr{ r.left + 16, r.top, r.right - 16, trackY - 6 };
+                    DrawTextW(dc, lbl, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    continue;   // skip generic button-text rendering
                 }
-                const bool hasChevron = (i == kFsSetBtnFormat || i == kFsSetBtnCols || i == kFsSetBtnRows);
+
+                wchar_t label[64];
+                switch (id)
+                {
+                case kFsSetBtnLoad:    wcscpy_s(label, L"Load Media..."); break;
+                case kFsSetBtnFormat:  swprintf_s(label, L"%hs", FsCurrentFormatLabel(fmt)); break;
+                case kFsSetBtnCols:    swprintf_s(label, L"%d cols", cols); break;
+                case kFsSetBtnRows:    swprintf_s(label, L"%d rows", rows); break;
+                case kFsSetBtnAuto:    wcscpy_s(label, L"Auto-detect"); break;
+                default:               label[0] = 0;
+                }
+                const bool hasChevron = (id == kFsSetBtnFormat || id == kFsSetBtnCols
+                                       || id == kFsSetBtnRows);
                 RECT tr = r;
                 tr.left  += 16;
                 tr.right -= hasChevron ? 26 : 16;
@@ -602,6 +761,25 @@ namespace
             const int hit = FsSetHit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             if (hit != g_fsSetHover) { g_fsSetHover = hit; InvalidateRect(hwnd, nullptr, FALSE); }
             g_fsSetLastUse = GetTickCount();
+            // Drag the LFP lean slider if started.
+            if (g_fsSetSliderDrag && g_app)
+            {
+                // Find the slider slot (LfpLean) -- it owns the drag.
+                for (int i = 0; i < g_fsSetBtnCount; ++i)
+                {
+                    if (FsSetSlotId(i) != kFsSetBtnLfpLean) continue;
+                    const RECT r = FsSetBtnRect(i);
+                    const int trackInset = 14;
+                    const int trackL = r.left + trackInset;
+                    const int trackR = r.right - trackInset;
+                    const int x = GET_X_LPARAM(lp);
+                    const float t = (float)(x - trackL) / (float)(trackR - trackL);
+                    const float tClamp = t < 0 ? 0 : (t > 1 ? 1 : t);
+                    g_app->lfpHeadLeanMm = kLfpLeanMinMm + tClamp * (kLfpLeanMaxMm - kLfpLeanMinMm);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    break;
+                }
+            }
             return 0;
         }
         case WM_MOUSELEAVE:
@@ -612,8 +790,9 @@ namespace
         {
             const int hit = FsSetHit(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             g_fsSetLastUse = GetTickCount();
-            if (!g_app) return 0;
-            switch (hit)
+            if (!g_app || hit < 0) return 0;
+            const int id = FsSetSlotId(hit);
+            switch (id)
             {
             case kFsSetBtnLoad:   OpenLoadTestImageDialog(*g_app); break;
             case kFsSetBtnFormat: FsOpenFormatMenu(); break;
@@ -623,9 +802,32 @@ namespace
                 AutoDetectQuiltOnCurrent(*g_app);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 break;
+            case kFsSetBtnLfpLean:
+            {
+                // Begin dragging the slider; jump to the clicked position.
+                g_fsSetSliderDrag = true;
+                SetCapture(hwnd);
+                const RECT r = FsSetBtnRect(hit);
+                const int trackInset = 14;
+                const int trackL = r.left + trackInset;
+                const int trackR = r.right - trackInset;
+                const int x = GET_X_LPARAM(lp);
+                const float t = (float)(x - trackL) / (float)(trackR - trackL);
+                const float tClamp = t < 0 ? 0 : (t > 1 ? 1 : t);
+                g_app->lfpHeadLeanMm = kLfpLeanMinMm + tClamp * (kLfpLeanMaxMm - kLfpLeanMinMm);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                break;
+            }
             }
             return 0;
         }
+        case WM_LBUTTONUP:
+            if (g_fsSetSliderDrag)
+            {
+                g_fsSetSliderDrag = false;
+                ReleaseCapture();
+            }
+            return 0;
         case WM_TIMER:
             if (wp == kFsSetTimerId &&
                 g_fsSetHover == -1 && (GetTickCount() - g_fsSetLastUse) > kFsCtrlHideMs)
@@ -662,8 +864,11 @@ namespace
     void ShowFsSetOverlay(const AppState& app)
     {
         if (!g_fsSet || !app.hwnd) return;
-        // Cols / Rows / Auto-detect only when Quilt is the active format.
-        g_fsSetBtnCount = (app.format == StereoFormat::Quilt) ? 5 : 2;
+        // Quilt gets Cols / Rows / Auto-detect; LightField gets a Head-lean
+        // preset picker; everything else just Load + Format.
+        if      (app.format == StereoFormat::Quilt)       g_fsSetBtnCount = 5;
+        else if (app.format == StereoFormat::LightField)  g_fsSetBtnCount = 3;
+        else                                              g_fsSetBtnCount = 2;
         // Layout limit: try to fit inside the window's client width minus margins,
         // wrap to additional rows when too wide. Falls back to a single row if
         // the window's somehow ridiculously narrow.
@@ -979,6 +1184,20 @@ namespace
         const HWND hwnd = app.hwnd;
         const bool ct = WantsClickThrough(app);
 
+        // If an LFP is loaded, the renderer's RT aspect depends on mode:
+        // Fullscreen wants SR-display aspect (so the renderer pillarboxes
+        // and we get aspect-correct fullscreen with side bars); other
+        // modes want CONTENT aspect (so the window can fit tightly with
+        // no bars). Looking-glass + Window-overlay also use content
+        // since they're framed by other windows / overlays.
+        if (app.lfpRenderer.HasData())
+        {
+            const float displayAspect = (dh > 0) ? (float)dw / (float)dh : 0.0f;
+            const float targetAspect  = (app.mode == OutputMode::Fullscreen)
+                                         ? displayAspect : 0.0f;   // 0 = content
+            app.lfpRenderer.SetTargetAspect(targetAspect);
+        }
+
         DWORD    style   = WS_POPUP;
         LONG_PTR exStyle = 0;
         RECT     rect    { d.left, d.top, d.left + dw, d.top + dh };
@@ -1005,80 +1224,84 @@ namespace
             break;
 
         case OutputMode::LookingGlass:
+        case OutputMode::Windowed:
+        default:
         {
-            // Normal window chrome (title bar + resize edges). Click-through on the
-            // glass by default; UpdateLoupeInteractivity makes it grabbable while the
-            // cursor is over the chrome or during a move/resize.
+            // Compute the per-eye content aspect for the current source +
+            // format. Used to size the initial window (so it matches the
+            // 3D content shape -- no letterbox bars around the inside).
+            // FullSBS crops to centre 50% vertical so per-eye is w/2 over
+            // h/2; HalfSBS per-eye is w/2 over h; TAB per-eye is w over
+            // h/2; etc.
+            auto computeAspect = [&]() -> double {
+                double aspect = 16.0 / 9.0;
+                int sw = 0, sh = 0;
+                if (app.source == SourceKind::TestImage)
+                {
+                    if (app.format == StereoFormat::LightField && app.lfpRenderer.HasData())
+                    {
+                        sw = app.lfpRenderer.OutputPerEyeWidth();
+                        sh = app.lfpRenderer.OutputHeight();
+                    }
+                    else if (app.video.IsOpen()) { sw = app.video.Width(); sh = app.video.Height(); }
+                    else                         { sw = app.weaver.SourceWidth(); sh = app.weaver.SourceHeight(); }
+                }
+                else
+                {
+                    // Live capture: source dims come from the active capture.
+                    if (app.dxgiActive)        { sw = app.captureDxgi.Width(); sh = app.captureDxgi.Height(); }
+                    else if (app.capture.IsActive()) { sw = app.capture.Width(); sh = app.capture.Height(); }
+                }
+                if (sw <= 0 || sh <= 0) return aspect;
+                double aw = (double)sw, ah = (double)sh;
+                switch (app.format)
+                {
+                case StereoFormat::Quilt:
+                    if (app.quiltCols > 0 && app.quiltRows > 0) {
+                        aw /= app.quiltCols; ah /= app.quiltRows;
+                    }
+                    break;
+                case StereoFormat::FullSBS:
+                    aw *= 0.5; ah *= 0.5; break;
+                case StereoFormat::HalfSBS:           aw *= 0.5; break;
+                case StereoFormat::FullTAB:
+                case StereoFormat::HalfTAB:
+                case StereoFormat::RowInterleaved:    ah *= 0.5; break;
+                case StereoFormat::ColumnInterleaved: aw *= 0.5; break;
+                default: break;
+                }
+                if (aw > 0 && ah > 0) aspect = aw / ah;
+                return aspect;
+            };
+
+            const bool isLG = (app.mode == OutputMode::LookingGlass);
             style   = WS_OVERLAPPEDWINDOW;
-            exStyle = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT;
-            zorder  = HWND_TOPMOST;
-            // Keep the position/size the user has set when already in loupe mode
-            // (e.g. re-applying on a format change); only centre on first entry.
-            // Use the FULL window rect (GetWindowRect) — VisibleWindowRect's DWM
-            // extended bounds exclude the invisible resize borders, so feeding it back
-            // in shrinks the loupe by those borders on every re-apply.
-            if (app.loupeActive)
+            zorder  = isLG ? HWND_TOPMOST : HWND_NOTOPMOST;
+            exStyle = isLG ? (WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT) : 0;
+
+            // LG: preserve user-set size after first entry; only size on
+            // initial open. Windowed: always re-size to content shape on
+            // mode change.
+            if (isLG && app.loupeActive)
             {
                 GetWindowRect(hwnd, &rect);
             }
             else
             {
-                const int w = 960, h = 600;
-                rect = { d.left + (dw - w) / 2, d.top + (dh - h) / 2,
-                         d.left + (dw - w) / 2 + w, d.top + (dh - h) / 2 + h };
-                app.loupeActive = true;
-            }
-            break;
-        }
-
-        case OutputMode::Windowed:
-        default:
-        {
-            // Default to a 16:9 1280x720 window. For test-image sources, size
-            // to the SOURCE's per-eye / per-view aspect so the visible 3D
-            // content fills the window instead of being letterboxed inside it.
-            int w = 1280, h = 720;
-            double aspect = 16.0 / 9.0;
-            if (app.source == SourceKind::TestImage)
-            {
-                int sw = 0, sh = 0;
-                if (app.video.IsOpen()) { sw = app.video.Width(); sh = app.video.Height(); }
-                else                    { sw = app.weaver.SourceWidth(); sh = app.weaver.SourceHeight(); }
-                if (sw > 0 && sh > 0)
-                {
-                    double aw = (double)sw, ah = (double)sh;
-                    switch (app.format)
-                    {
-                    case StereoFormat::Quilt:
-                        if (app.quiltCols > 0 && app.quiltRows > 0) {
-                            aw /= app.quiltCols; ah /= app.quiltRows;
-                        }
-                        break;
-                    case StereoFormat::FullSBS:
-                    case StereoFormat::HalfSBS:           aw *= 0.5; break;
-                    case StereoFormat::FullTAB:
-                    case StereoFormat::HalfTAB:
-                    case StereoFormat::RowInterleaved:    ah *= 0.5; break;
-                    case StereoFormat::ColumnInterleaved: aw *= 0.5; break;
-                    default: break;
-                    }
-                    if (aw > 0 && ah > 0) aspect = aw / ah;
-                }
-                // Aim for ~720 client height; clamp width so the window fits
-                // the SR display with comfortable margin.
-                h = 720;
-                w = (int)(h * aspect + 0.5);
+                const double aspect = computeAspect();
+                int h = isLG ? 600 : 720;
+                int w = (int)(h * aspect + 0.5);
                 const int maxW = (dw > 200) ? dw - 100 : 1280;
+                const int maxH = (dh > 200) ? dh - 100 : 720;
                 if (w > maxW) { w = maxW; h = (int)(w / aspect + 0.5); }
+                if (h > maxH) { h = maxH; w = (int)(h * aspect + 0.5); }
                 if (w < 320)  { w = 320; }
                 if (h < 240)  { h = 240; }
+                const int x = d.left + (dw - w) / 2;
+                const int y = d.top  + (dh - h) / 2;
+                rect = { x, y, x + w, y + h };
+                if (isLG) app.loupeActive = true;
             }
-            const int x = d.left + (dw - w) / 2;
-            const int y = d.top  + (dh - h) / 2;
-            style   = WS_OVERLAPPEDWINDOW;
-            exStyle = 0;
-            zorder  = HWND_NOTOPMOST;
-            rect    = { x, y, x + w, y + h };
             break;
         }
         }
@@ -1087,6 +1310,12 @@ namespace
         SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_VISIBLE);
         if (exStyle & WS_EX_LAYERED)
             SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);  // fully opaque
+        // WindowOverlay applies a rounded-rect region per-frame in
+        // UpdateOverlayTracking to match the source window's DWM corners; in
+        // every other mode the overlay is a plain rectangle, so clear any
+        // stale region left over from a prior WindowOverlay session.
+        if (app.mode != OutputMode::WindowOverlay)
+            SetWindowRgn(hwnd, nullptr, FALSE);
         UINT flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW;
         if (exStyle & WS_EX_NOACTIVATE) flags |= SWP_NOACTIVATE;
         SetWindowPos(hwnd, zorder, rect.left, rect.top,
@@ -1186,9 +1415,90 @@ namespace
         }
         if (!IsWindowVisible(app.hwnd))
             ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
+
+        // Match the source window's Windows-11 rounded corners. WGC captures
+        // the source as a rectangular pixel grid (the OS only rounds the
+        // display shape via DWM compositing, not the bitmap), so our opaque
+        // overlay shows the captured corner pixels as solid black squares
+        // by default. SetWindowRgn clips our overlay to a rounded-rect so
+        // the desktop shows through there -- matches what the user expects.
+        // Recompute only when the source's rect / corner-style changes; the
+        // OS reuses an identical region as a no-op.
+        DWM_WINDOW_CORNER_PREFERENCE srcCornerPref = DWMWCP_DEFAULT;
+        DwmGetWindowAttribute(src, DWMWA_WINDOW_CORNER_PREFERENCE,
+                              &srcCornerPref, sizeof(srcCornerPref));
+        const bool wantRound = (srcCornerPref != DWMWCP_DONOTROUND);
+        const int  w         = r.right - r.left;
+        const int  h         = r.bottom - r.top;
+        if (wantRound && w > 0 && h > 0)
+        {
+            // Win11 default rounded radius is 8 DIPs; ROUNDSMALL is 4 DIPs.
+            // Scale by the source window's DPI so the overlay matches what
+            // DWM actually drew, not what 100% scaling would have looked like.
+            const UINT dpi    = GetDpiForWindow(src);
+            const int  radDip = (srcCornerPref == DWMWCP_ROUNDSMALL) ? 4 : 8;
+            const int  rad    = radDip * (int)dpi / 96;
+            // CreateRoundRectRgn's ellipse args are *diameters*, not radii.
+            HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, rad * 2, rad * 2);
+            // SetWindowRgn takes ownership of rgn -- don't DeleteObject.
+            SetWindowRgn(app.hwnd, rgn, FALSE);
+        }
+        else
+        {
+            // Source has rounding disabled (DWMWCP_DONOTROUND) -- clear our
+            // region so the overlay is a plain rectangle again.
+            SetWindowRgn(app.hwnd, nullptr, FALSE);
+        }
     }
 
     void UsePassthrough(AppState& app);   // fwd decl: default weave is screen passthrough
+
+    // Velocity-aware Accela filter (one axis). Ported from VRto3D's
+    // accela_hamilton_runtime.h. dt is computed from GetTickCount() per call.
+    // - deadzone: angle (rad) below which we don't move at all -- kills the
+    //   "head still" tracker jitter regardless of its magnitude.
+    // - threshold: the magnitude that normalizes input to the gain curve;
+    //   tune so a comfortable head turn lands in the curve's responsive zone.
+    // The gain curve is the same piecewise-linear shape VRto3D uses for
+    // rotation: tiny normalized inputs => near-zero gain (almost no follow),
+    // moderate inputs => proportional follow, large inputs => instant follow.
+    double AccelaApply(AppState::AccelaAxis& a, double raw, double deadzone, double threshold)
+    {
+        static const struct { double x, y; } kGains[] = {
+            { 0.0, 0.0 }, { 0.5, 0.4  }, { 1.0, 1.5   }, { 1.5, 8.0   },
+            { 2.5, 35.0 }, { 5.0, 100.0 }, { 8.0, 200.0 }, { 9.0, 300.0 }
+        };
+        constexpr int kN = (int)(sizeof(kGains) / sizeof(kGains[0]));
+
+        const DWORD now = GetTickCount();
+        if (!a.init) { a.init = true; a.lastOutput = raw; a.lastTickMs = now; return raw; }
+        double dt = (now - a.lastTickMs) * 0.001;
+        a.lastTickMs = now;
+        if (dt < 1e-5) dt = 1e-5;
+        if (dt > 0.25) dt = 0.25;
+
+        const double delta    = raw - a.lastOutput;
+        const double absDelta = fabs(delta);
+        const double corrected = (absDelta > deadzone) ? (absDelta - deadzone) : 0.0;
+        const double normalized = corrected / (threshold > 1e-9 ? threshold : 1e-9);
+
+        double gain = kGains[kN - 1].y;
+        if (normalized <= kGains[0].x) gain = kGains[0].y;
+        else
+            for (int i = 1; i < kN; ++i)
+                if (normalized <= kGains[i].x)
+                {
+                    const double t = (normalized - kGains[i - 1].x) / (kGains[i].x - kGains[i - 1].x);
+                    gain = kGains[i - 1].y + (kGains[i].y - kGains[i - 1].y) * t;
+                    break;
+                }
+
+        double alpha = (absDelta > 1e-9) ? (dt * gain / absDelta) : 0.0;
+        if (alpha > 1.0) alpha = 1.0;
+        if (alpha < 0.0) alpha = 0.0;
+        a.lastOutput += alpha * delta;
+        return a.lastOutput;
+    }
 
     void SetWeaving(AppState& app, bool enable)
     {
@@ -1201,33 +1511,61 @@ namespace
                          enable ? HIGH_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
         if (enable)
         {
-            // Start the SR session (lens + eye-tracking) and show the output.
+            // Katanga arm (format = Katanga, no game publishing yet): leave the
+            // SR session alive but ask SwitchableLensHint to disable the lens.
+            // No StartSR/StopSR churn, no swap-chain recreation risk (that was
+            // the original source of the post-Katanga black bug). The SR
+            // session is always kept alive while weavingEnabled.
+            const bool katangaArmed = (app.format == StereoFormat::Katanga
+                                      && !app.katanga.IsReceiving());
             if (!app.weaver.HasWeaver())
                 app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+            if (katangaArmed) app.weaver.LensDisable();
+            else              app.weaver.LensEnable();
             // Default action: weave the screen (fullscreen SBS passthrough). If the
             // chosen source is the monitor but capture isn't running yet, start it.
             if (app.source == SourceKind::CaptureMonitor && !app.capture.IsActive())
                 UsePassthrough(app);
+            // Bind the Katanga receiver if we're (re-)enabling weaving with
+            // format == Katanga. Idempotent if already begun.
+            if (app.format == StereoFormat::Katanga && !app.katanga.IsActive())
+                app.katanga.Begin(app.renderer.Device());
             app.captureRebind = true;   // re-register the converter output
             ApplyMode(app);
-            ShowWindow(app.hwnd, SW_SHOW);
+            ShowWindow(app.hwnd, katangaArmed ? SW_HIDE : SW_SHOW);
         }
         else
         {
             // Hide and fully release SR so the lens and camera turn off.
             ShowWindow(app.hwnd, SW_HIDE);
             HideFsCtrlOverlay();
+            app.weaver.LensDisable();
             app.weaver.StopSR();
         }
         app.tray.SetTooltip(enable ? "SR Loom — weaving" : "SR Loom — paused (SR off)");
     }
 
     // Selecting a source or format turns weaving ON if it isn't already (so the 3D
-    // comes on automatically); if it already is, just re-apply the current mode.
+    // comes on automatically); if it already is, re-apply the current mode AND
+    // restart SR if it's been torn down (e.g. switching back out of Katanga arm,
+    // where the SR session was stopped while no game was publishing).
     void EnsureWeaving(AppState& app)
     {
-        if (app.weavingEnabled) ApplyMode(app);
-        else                    SetWeaving(app, true);
+        if (!app.weavingEnabled) { SetWeaving(app, true); return; }
+        const bool katangaArmed = (app.format == StereoFormat::Katanga
+                                  && !app.katanga.IsReceiving());
+        if (!app.weaver.HasWeaver())
+        {
+            app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+            app.captureRebind = true;
+        }
+        // Lens hint matches format state: lens off during Katanga arm
+        // (cooperative -- the lens still actually engages if any other SR
+        // app has it on); lens on for any active weave format.
+        if (katangaArmed) app.weaver.LensDisable();
+        else              app.weaver.LensEnable();
+        ApplyMode(app);
+        if (katangaArmed) ShowWindow(app.hwnd, SW_HIDE);
     }
 
     // Like EnsureWeaving, but for a stereo-format / decode-option change: it must NOT
@@ -1238,6 +1576,65 @@ namespace
     void EnsureWeavingFormatOnly(AppState& app)
     {
         if (!app.weavingEnabled) SetWeaving(app, true);
+    }
+
+    // Centralised format setter -- handles Katanga's lifecycle (it's the only
+    // format that owns external state: the shared-texture receiver, plus an
+    // arm-mode lens-off until a game starts publishing). All other formats
+    // are a plain pixel-interpretation change in the converter; nothing to
+    // tear down. Always sets captureRebind so the next frame re-registers
+    // the SRV at the new format. Re-applies the window mode iff Katanga is
+    // transitioning in or out -- WantsClickThrough's Fullscreen branch keys
+    // off format==Katanga, so the swap-chain mode (flip vs bit-blt) must be
+    // refreshed on those edges.
+    void ChangeFormat(AppState& app, StereoFormat newFmt)
+    {
+        const StereoFormat oldFmt = app.format;
+        const bool katangaEdge = (oldFmt == StereoFormat::Katanga)
+                              != (newFmt == StereoFormat::Katanga);
+        app.format = newFmt;
+        app.captureRebind = true;
+        // Invalidate the LookingGlass / Windowed "saved" size so the next
+        // ApplyMode call re-fits the window to the new format's content
+        // aspect (e.g. FullSBS 16:9 per-eye vs HalfSBS 8:9). Without this
+        // the window keeps its old shape and content gets pillarboxed or
+        // squished in the window for the rest of the session.
+        if (oldFmt != newFmt && app.mode == OutputMode::LookingGlass)
+        {
+            app.loupeActive = false;
+            ApplyMode(app);
+        }
+        if (newFmt == StereoFormat::Katanga && oldFmt != StereoFormat::Katanga)
+        {
+            // Entering Katanga: start the receiver, arm-mode (lens off, our
+            // window hidden) until a game publishes -- the render loop's
+            // Katanga branch flips them back on at the first received frame.
+            app.katanga.Begin(app.renderer.Device());
+            app.weaver.LensDisable();
+            ShowWindow(app.hwnd, SW_HIDE);
+        }
+        else if (oldFmt == StereoFormat::Katanga && newFmt != StereoFormat::Katanga)
+        {
+            // Leaving Katanga: stop the receiver, lens back on, show our
+            // window. The format change below will trigger the converter
+            // path with whichever Source is still bound.
+            app.katanga.End();
+            app.katangaPublisherWnd = nullptr;
+            app.weaver.LensEnable();
+            ShowWindow(app.hwnd, SW_SHOW);
+            // Drop topmost (set by the render-loop receive transition).
+            SetWindowPos(app.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if (katangaEdge) ApplyMode(app);   // refresh layered/swap-chain state
+
+        // LightField on-load means an LFP file is bound to the LFPRenderer.
+        // If the user picks a different format while in LightField, the
+        // user's effectively saying "stop using the loaded LFP" -- so
+        // release the GPU resources for it. (Selecting LightField without
+        // a loaded LFP is a no-op until the user loads one.)
+        if (oldFmt == StereoFormat::LightField && newFmt != StereoFormat::LightField)
+            app.lfpRenderer.Unload();
     }
 
     // Record the most recent "real" foreground window (not ours, the shell, or a
@@ -1258,9 +1655,28 @@ namespace
 
     // --- Source selection -------------------------------------------------
 
+    // VR180/VR360 and LightField only make sense for static / file-loaded
+    // sources (equirect images / 360° video, Lytro plenoptic photos);
+    // they're meaningless on a live screen-capture source. Called from
+    // each capture-source setter to drop the user back to Half SBS if
+    // they were on one of these formats when switching to a live source.
+    // Also tears down the LFP renderer so its stale RT doesn't keep
+    // shadowing the captured frames via the `if (lfpRenderer.HasData())`
+    // branch in the main render loop.
+    void DemoteVRFormatForLiveCapture(AppState& app)
+    {
+        if (IsVRFormat(app.format) || app.format == StereoFormat::LightField)
+        {
+            if (app.format == StereoFormat::LightField)
+                app.lfpRenderer.Unload();
+            ChangeFormat(app, StereoFormat::HalfSBS);
+        }
+    }
+
     // Capture a window and present it as an in-place 3D overlay tracking that window.
     void UseWindow(AppState& app, HWND target)
     {
+        DemoteVRFormatForLiveCapture(app);
         app.capture.SetCaptureCursor(false);   // overlay sits on the source; real cursor shows through
         if (target && app.capture.StartWindow(target))
         {
@@ -1348,6 +1764,7 @@ namespace
 
     void UsePassthrough(AppState& app)
     {
+        DemoteVRFormatForLiveCapture(app);
         app.sourceWindow = nullptr;
         app.capture.SetCaptureCursor(false);   // same screen as the real cursor → don't double it
         HMONITOR mon = SrMonitor(app);
@@ -1365,6 +1782,11 @@ namespace
     // pixel data here for image-content quilt-grid auto-detection.
     extern "C" unsigned char* stbi_load(char const* filename, int* x, int* y,
                                         int* channels_in_file, int desired_channels);
+    extern "C" unsigned char* stbi_load_from_memory(unsigned char const* buffer,
+                                                     int len, int* x, int* y,
+                                                     int* channels_in_file,
+                                                     int desired_channels);
+    typedef unsigned char stbi_uc;
     extern "C" void stbi_image_free(void* retval_from_stbi_load);
 
     // Image-content quilt-grid auto-detect. Tries the canonical LG grids and
@@ -1508,6 +1930,27 @@ namespace
     // image-content detection runs as a fallback -- so a quilt file without the
     // naming convention still works. Non-quilt images fall through and keep the
     // currently-selected format.
+    // True if the file extension (case-insensitive) matches a Lytro
+    // light-field container -- .lfp, .lfr, .lfx all use the same LFP
+    // container format and resolve through LFPLoadAsStereoSBS.
+    static bool IsLytroLightFieldFile(const char* path)
+    {
+        if (!path) return false;
+        const char* dot = strrchr(path, '.');
+        if (!dot) return false;
+        // Quick ASCII lowercase compare.
+        auto eqi = [](const char* a, const char* b) {
+            while (*a && *b) {
+                char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+                char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+                if (ca != cb) return false;
+                ++a; ++b;
+            }
+            return *a == 0 && *b == 0;
+        };
+        return eqi(dot, ".lfp") || eqi(dot, ".lfr") || eqi(dot, ".lfx");
+    }
+
     bool LoadTestImage(AppState& app, const char* path)
     {
         if (!path || !*path) return false;
@@ -1517,6 +1960,12 @@ namespace
         app.video.Close();
 
         const bool isVideo = VideoSource::IsVideoFile(path);
+        const bool isLFP   = IsLytroLightFieldFile(path);
+        const bool isEslf  = srw::IsLytroEslfPng(path);
+        // Tear down the LFPRenderer if a non-LFP source is loaded -- the
+        // render loop's `if (lfpRenderer.HasData())` branch would otherwise
+        // shadow the regular image / video path with the stale LFP RT.
+        if (!isLFP && !isEslf) app.lfpRenderer.Unload();
         if (isVideo)
         {
             wchar_t wpath[MAX_PATH] = {};
@@ -1529,6 +1978,64 @@ namespace
                           "or Windows Media Foundation not fully installed.");
                 return false;
             }
+        }
+        else if (isLFP)
+        {
+            // Lytro light-field photo: full plenoptic 3D path. The
+            // demosaic step inside LFPLoadDemosaicedSensor automatically
+            // histogram-matches our colour output against the embedded
+            // JPG preview (when present, which is every LFR/LFX) -- so
+            // we get 3D parallax AND Lytro's pipeline colour science.
+            std::vector<uint8_t> sensorRgb;
+            srw::LFPCalibration cal;
+            if (!srw::LFPLoadDemosaicedSensor(path, sensorRgb, cal))
+            {
+                ShowError("Failed to decode Lytro light-field file.\n\n"
+                          "See srweaver.log for details. Supports .lfp / .lfr / "
+                          ".lfx (Lytro cameras). The file must contain raw "
+                          "plenoptic sensor data + calibration metadata.");
+                return false;
+            }
+            const RECT& d = app.srDisplayRect;
+            const int dw = d.right - d.left;
+            const int dh = d.bottom - d.top;
+            const float displayAspect = (dh > 0) ? (float)dw / (float)dh : 1.0f;
+            if (!app.lfpRenderer.LoadFromMemory(sensorRgb, cal, displayAspect))
+            {
+                ShowError("Failed to upload Lytro sensor data to GPU.\n\n"
+                          "See srweaver.log for details.");
+                return false;
+            }
+            app.format = StereoFormat::LightField;
+        }
+        else if (isEslf)
+        {
+            // Lytro ESLF PNG: a colour-corrected microlens-array image
+            // exported from Lytro Desktop. Treats it as if it were our
+            // demosaiced sensor output and feeds it through the same
+            // LFPRenderer that handles raw LFRs -- so we get 3D
+            // parallax AND Lytro's colour science (the PNG is the
+            // result of their full render pipeline, baked in). The
+            // calibration is synthesised from Illum-typical defaults.
+            std::vector<uint8_t> sensorRgb;
+            srw::LFPCalibration cal;
+            if (!srw::LFPLoadEslfAsSensorRgb(path, sensorRgb, cal))
+            {
+                ShowError("Failed to load Lytro ESLF PNG.\n\n"
+                          "See srweaver.log for details.");
+                return false;
+            }
+            const RECT& d = app.srDisplayRect;
+            const int dw = d.right - d.left;
+            const int dh = d.bottom - d.top;
+            const float displayAspect = (dh > 0) ? (float)dw / (float)dh : 1.0f;
+            if (!app.lfpRenderer.LoadFromMemory(sensorRgb, cal, displayAspect))
+            {
+                ShowError("Failed to upload ESLF data to GPU.\n\n"
+                          "See srweaver.log for details.");
+                return false;
+            }
+            app.format = StereoFormat::LightField;
         }
         else
         {
@@ -1564,6 +2071,11 @@ namespace
         app.foreignDisplay = false;
         app.captureRebind = true;
         app.mode          = OutputMode::Fullscreen;
+        // A new test image's content aspect / dimensions almost certainly
+        // differ from whatever was last shown -- invalidate the LookingGlass
+        // saved size so the next LG entry re-fits the window to the new
+        // content instead of preserving the old shape.
+        app.loupeActive   = false;
         EnsureWeaving(app);
         return true;
     }
@@ -1577,8 +2089,9 @@ namespace
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner   = app.hwnd;
         ofn.lpstrFilter =
-            "Stereo media\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv\0"
+            "Stereo media\0*.png;*.jpg;*.jpeg;*.bmp;*.tga;*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv;*.lfp;*.lfr;*.lfx\0"
             "Images\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0"
+            "Lytro light field\0*.lfp;*.lfr;*.lfx;*_eslf.png;*_qs14x14*.png\0"
             "Videos\0*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv\0"
             "All files\0*.*\0";
         ofn.lpstrFile   = file;
@@ -1594,6 +2107,7 @@ namespace
     // crop, since the source isn't the screen we're drawing on, so there's no feedback).
     void UseDisplay(AppState& app, HMONITOR mon)
     {
+        DemoteVRFormatForLiveCapture(app);
         app.capture.SetCaptureCursor(true);   // show the pointer on the captured display
         if (!mon || !app.capture.StartMonitor(mon))
             return;
@@ -1660,19 +2174,144 @@ namespace
     // Analyze the current frame and switch to the detected stereo layout.
     void DetectFormat(AppState& app)
     {
+        // The detector only ever returns SBS/TAB/Anaglyph. If the user is
+        // on a format with its own input pipeline (Katanga shared texture,
+        // LFP plenoptic, VR equirect, Quilt, frame-packing, Pulfrich
+        // temporal) a "detection" would silently downgrade it -- skip.
+        switch (app.format)
+        {
+        case StereoFormat::Katanga:
+        case StereoFormat::LightField:
+        case StereoFormat::Quilt:
+        case StereoFormat::VR180TAB:
+        case StereoFormat::VR180SBS:
+        case StereoFormat::VR360TAB:
+        case StereoFormat::VR360SBS:
+        case StereoFormat::Pulfrich:
+        case StereoFormat::FramePacking:
+            return;
+        default:
+            break;
+        }
         ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0;
         if (!ResolveSource(app, srv, w, h)) return;
         StereoFormat f;
         if (app.detector.Detect(srv, w, h, f))
         {
-            app.format = f;
-            app.captureRebind = true;
+            ChangeFormat(app, f);
             app.tray.SetTooltip("SR Loom — detected a stereo layout");
         }
         else
         {
             app.tray.SetTooltip("SR Loom — no stereo layout detected");
         }
+    }
+
+    // Find the PID of the process publishing to Local\KatangaMappedFile via
+    // the kernel handle table: open the mapping ourselves, look up the
+    // kernel Object pointer behind our handle, then enumerate ALL handles
+    // in the system and return the first PID that isn't ours sharing the
+    // same Object. Same trick Process Explorer / Handle.exe use. Returns
+    // 0 on any failure -- caller should fall back to generic topmost.
+    DWORD FindKatangaPublisherPid()
+    {
+        using NtQSI_t = NTSTATUS (NTAPI*)(int, PVOID, ULONG, PULONG);
+        static auto pNtQSI = (NtQSI_t)GetProcAddress(
+            GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+        if (!pNtQSI)
+        {
+            Log("Katanga/publisher: NtQuerySystemInformation lookup failed");
+            return 0;
+        }
+
+        HANDLE myMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\KatangaMappedFile");
+        if (!myMap)
+        {
+            Log("Katanga/publisher: OpenFileMapping(myself) failed err=%lu", GetLastError());
+            return 0;
+        }
+        const DWORD myPid = GetCurrentProcessId();
+
+        // Buffer-grow loop. Typical handle-table size on a desktop is ~1-4 MB.
+        std::vector<uint8_t> buf(64 * 1024);
+        NTSTATUS st = STATUS_INFO_LENGTH_MISMATCH;
+        ULONG    retLen = 0;
+        for (int tries = 0; tries < 10 && st == STATUS_INFO_LENGTH_MISMATCH; ++tries)
+        {
+            st = pNtQSI(kSystemExtendedHandleInformation, buf.data(),
+                        (ULONG)buf.size(), &retLen);
+            if (st == STATUS_INFO_LENGTH_MISMATCH)
+                buf.resize(buf.size() * 2);
+        }
+        if (!NT_SUCCESS(st))
+        {
+            Log("Katanga/publisher: NtQSI status=0x%08X retLen=%lu bufSize=%zu",
+                (unsigned)st, retLen, buf.size());
+            CloseHandle(myMap);
+            return 0;
+        }
+        auto* info = reinterpret_cast<SYSTEM_HANDLE_INFORMATION_EX*>(buf.data());
+
+        // First pass: find our own entry to capture the kernel Object pointer.
+        PVOID    myObject = nullptr;
+        ULONG_PTR myCount = 0;   // how many of OUR handles to the mapping (sanity)
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i)
+        {
+            const auto& e = info->Handles[i];
+            if (e.UniqueProcessId == myPid
+                && e.HandleValue   == (ULONG_PTR)myMap)
+            {
+                myObject = e.Object;
+                ++myCount;
+            }
+        }
+        CloseHandle(myMap);
+        if (!myObject)
+        {
+            Log("Katanga/publisher: own handle not found in %llu-entry table (myPid=%lu myMap=%p)",
+                (unsigned long long)info->NumberOfHandles, myPid, (void*)myMap);
+            return 0;
+        }
+
+        // Second pass: find another PID with a handle to the same kernel object.
+        int otherMatches = 0;
+        DWORD firstOther = 0;
+        for (ULONG_PTR i = 0; i < info->NumberOfHandles; ++i)
+        {
+            const auto& e = info->Handles[i];
+            if (e.Object == myObject && e.UniqueProcessId != myPid)
+            {
+                ++otherMatches;
+                if (!firstOther) firstOther = (DWORD)e.UniqueProcessId;
+            }
+        }
+        Log("Katanga/publisher: table=%llu handles, ourMatches=%llu obj=%p otherMatches=%d firstOther=%lu",
+            (unsigned long long)info->NumberOfHandles,
+            (unsigned long long)myCount, myObject, otherMatches, firstOther);
+        return firstOther;
+    }
+
+    // Pick the largest visible top-level window owned by the given PID.
+    // Games sometimes have a small launcher window plus a big render window;
+    // largest-area is a reliable heuristic for the actual game window.
+    HWND FindMainWindowOfPid(DWORD pid)
+    {
+        struct Ctx { DWORD pid; HWND best; LONG bestArea; };
+        Ctx ctx{ pid, nullptr, 0 };
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            DWORD wpid = 0;
+            GetWindowThreadProcessId(h, &wpid);
+            if (wpid != c->pid) return TRUE;
+            if (!IsWindowVisible(h)) return TRUE;
+            if (GetWindow(h, GW_OWNER)) return TRUE;
+            RECT r{};
+            if (!GetWindowRect(h, &r)) return TRUE;
+            const LONG area = (r.right - r.left) * (r.bottom - r.top);
+            if (area > c->bestArea) { c->bestArea = area; c->best = h; }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return ctx.best;
     }
 
     void RenderFrame(AppState& app)
@@ -1687,6 +2326,51 @@ namespace
         {
             Sleep(10);
             return;
+        }
+
+        // WindowOverlay mode: another app can pop above our overlay and
+        // fully hide the woven output. Skip the weave + Present when the
+        // SR SDK's Window2 reports the overlay region is fully occluded --
+        // saves GPU work + avoids presenting frames the user can't see.
+        // (Fullscreen / Katanga modes are HWND_TOPMOST so don't get covered.)
+        //
+        // HYSTERESIS: during a window drag DWM transiently reports our
+        // overlay as not-visible while it catches up on the z-order, which
+        // would cause us to skip-then-render every few frames -- visible as
+        // flicker (especially in anaglyph where the converter path is more
+        // sensitive to frame skips than the identity-SBS fast path). Only
+        // actually pause after several consecutive occluded reports, and
+        // reset immediately on any "visible".
+        static int occludedFrames = 0;
+        if (app.mode == OutputMode::WindowOverlay)
+        {
+            RECT cr{}; GetClientRect(app.hwnd, &cr);
+            if (cr.right > cr.left && cr.bottom > cr.top)
+            {
+                if (app.weaver.IsWindowPartVisible(app.hwnd,
+                                                   cr.right - cr.left,
+                                                   cr.bottom - cr.top))
+                    occludedFrames = 0;
+                else
+                    ++occludedFrames;
+                // ~10 frames @ 60fps = ~166ms before we trust the "occluded"
+                // signal. Faster monitors will trip the threshold sooner in
+                // wall-clock terms, which is fine -- it's still well past
+                // any drag-induced transient.
+                if (occludedFrames >= 10)
+                {
+                    Sleep(10);
+                    return;
+                }
+            }
+            else
+            {
+                occludedFrames = 0;   // degenerate rect -> reset
+            }
+        }
+        else
+        {
+            occludedFrames = 0;   // mode change -> reset
         }
 
         // Pace to the display before grabbing the newest frame (lowest latency).
@@ -1793,6 +2477,95 @@ namespace
             }
         }
 
+        // External-source format override: Katanga publishes the woven SBS
+        // directly via its shared-texture handoff. Replace whatever the
+        // Source resolved to. Source/Mode still control PLACEMENT (which
+        // window the overlay tracks, fullscreen on the SR display, etc).
+        if (app.format == StereoFormat::Katanga)
+        {
+            const bool wasReceiving = (app.katanga.SRV() != nullptr);
+            const bool nowReceiving = app.katanga.Update();
+            if (nowReceiving != wasReceiving)
+            {
+                app.captureRebind = true;
+                if (nowReceiving)
+                {
+                    // Game just started publishing -- discover the
+                    // publisher's main window via the kernel handle table
+                    // so we can z-pin above it, re-engage the lens (SR
+                    // session has been alive the whole time, only the
+                    // SwitchableLensHint was disabled during arm), show the
+                    // window, and pin topmost so the game's own window
+                    // can't pop above the weave when focused. Fall back to
+                    // StartSR if the session was actually torn down.
+                    const DWORD pubPid = FindKatangaPublisherPid();
+                    app.katangaPublisherWnd = pubPid ? FindMainWindowOfPid(pubPid) : nullptr;
+                    // Fallback when NT-API discovery fails (publisher in
+                    // higher integrity level, protected process, etc.):
+                    // use lastForeground (filtered to never be us, the
+                    // shell, or a popup). Better than no Z-target at all.
+                    if (!app.katangaPublisherWnd
+                        && app.lastForeground && IsWindow(app.lastForeground))
+                    {
+                        app.katangaPublisherWnd = app.lastForeground;
+                        Log("Katanga: publisher discovery failed, falling back to lastForeground=%p",
+                            (void*)app.katangaPublisherWnd);
+                    }
+                    if (!app.weaver.HasWeaver())
+                        app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                    app.weaver.LensEnable();
+                    ShowWindow(app.hwnd, SW_SHOW);
+                    SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    Log("Katanga: reception started (%dx%d, publisher pid=%lu hwnd=%p)",
+                        app.katanga.Width(), app.katanga.Height(),
+                        pubPid, (void*)app.katangaPublisherWnd);
+                }
+                else
+                {
+                    // Game closed: drop back to arm-mode (lens off, window
+                    // hidden, non-topmost). Render loop keeps polling the
+                    // Katanga mapping so the next publishing game auto-
+                    // engages without the user touching anything. Clear the
+                    // backbuffer first so the panel doesn't briefly show the
+                    // last woven frame as the window vanishes.
+                    app.katangaPublisherWnd = nullptr;
+                    app.renderer.BindAndClearBackBuffer();
+                    app.renderer.Present(false);
+                    app.weaver.LensDisable();
+                    SetWindowPos(app.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    ShowWindow(app.hwnd, SW_HIDE);
+                    Log("Katanga: reception lost -> arm-mode (waiting for next game)");
+                    return;
+                }
+            }
+            srcSRV   = app.katanga.SRV();
+            srcW     = app.katanga.Width();
+            srcH     = app.katanga.Height();
+            gotFrame = nowReceiving;
+            // Pin SR Loom's overlay directly above the publishing game's
+            // main window each frame. Many DirectX games SetWindowPos
+            // HWND_TOPMOST on themselves when activated, which would pop
+            // them above us in the topmost band on a click-into-game --
+            // forcing the user to alt-tab to SR Loom to push the weave
+            // back up. Inserting just above the game's HWND specifically
+            // (not generic HWND_TOPMOST) wins regardless of which band
+            // the game is in. SWP_NOACTIVATE means we never steal focus.
+            if (nowReceiving && app.katangaPublisherWnd
+                && IsWindow(app.katangaPublisherWnd))
+            {
+                SetWindowPos(app.hwnd, app.katangaPublisherWnd, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            else if (nowReceiving)
+            {
+                // Fallback when publisher discovery failed: generic topmost.
+                SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+
         // FAST PATH: a live source already in side-by-side layout (full OR half SBS,
         // no eye swap, no convergence shift) is identical to what the converter would
         // output -- so feed the captured texture STRAIGHT to the weaver and skip the
@@ -1805,23 +2578,113 @@ namespace
         // A video test source is "live" too -- its texture's content changes
         // every frame even though source == TestImage, so the converter has to
         // re-run continuously.
-        const bool liveSource  = (app.source != SourceKind::TestImage) || app.video.IsOpen();
+        // Lytro Light Field: per-frame head-tracked plenoptic sampler.
+        // The LFPRenderer owns the SBS view -- the source pipeline below
+        // is skipped entirely. The user's eye-mm positions are scaled to
+        // make typical head leans cover the full (tiny) Lytro aperture --
+        // physically not 1:1 but perceptually MUCH more usable since the
+        // F01 aperture is just 3.4 mm vs ~62 mm IPD.
+        if (app.format == StereoFormat::LightField && app.lfpRenderer.HasData())
+        {
+            float l[3] = {}, r[3] = {};
+            float lu = 0, lv = 0, ru = 0, rv = 0;
+            if (app.weaver.GetPredictedEyePositions(l, r))
+            {
+                // Window-position-aware view angle: SR tracker reports
+                // eye position in mm relative to the SR display CENTRE.
+                // If we render the LFP in a windowed sub-rect (not full
+                // SR display), the user perceives the WINDOW centre, not
+                // the display centre, as the "reference point". Subtract
+                // the window-centre-to-display-centre offset so the
+                // captured scene shifts the way it would for a real
+                // window onto a real scene.
+                double windowOffsetMmX = 0.0, windowOffsetMmY = 0.0;
+                if (app.srMmPerPx > 0.0 && app.mode != OutputMode::Fullscreen)
+                {
+                    RECT wr{};
+                    if (GetWindowRect(app.hwnd, &wr))
+                    {
+                        const double winCxPx = 0.5 * (wr.left + wr.right);
+                        const double winCyPx = 0.5 * (wr.top  + wr.bottom);
+                        const double dispCxPx = 0.5 * (app.srDisplayRect.left + app.srDisplayRect.right);
+                        const double dispCyPx = 0.5 * (app.srDisplayRect.top  + app.srDisplayRect.bottom);
+                        windowOffsetMmX = (winCxPx - dispCxPx) * app.srMmPerPx;
+                        windowOffsetMmY = (winCyPx - dispCyPx) * app.srMmPerPx;
+                    }
+                }
+                const float eyeLX = l[0] - (float)windowOffsetMmX;
+                const float eyeLY = l[1] - (float)windowOffsetMmY;
+                const float eyeRX = r[0] - (float)windowOffsetMmX;
+                const float eyeRY = r[1] - (float)windowOffsetMmY;
+
+                const double apertureMmRadius =
+                    0.5 * app.lfpRenderer.ApertureDiameterMetres() * 1e3;
+                if (apertureMmRadius > 0.0)
+                {
+                    // GUI-tunable: head-lean distance (mm) that drives
+                    // the aperture sample to its edge. Min = aperture
+                    // radius (true physical 1:1, microscopic on F01),
+                    // default 30, larger = even more amplified parallax.
+                    // Note: V is negated -- SR tracker reports head y
+                    // positive = up; sensor / image y is positive = down.
+                    // So head-up should sample the upper part of the
+                    // aperture, which in image coords is negative.
+                    const double leanMm = (std::max)((double)app.lfpHeadLeanMm,
+                                                      apertureMmRadius);
+                    auto clampUnit = [](float v) { return v >  1.0f ? 1.0f
+                                                       : (v < -1.0f ? -1.0f : v); };
+                    lu = clampUnit((float)( eyeLX / leanMm));
+                    lv = clampUnit((float)(-eyeLY / leanMm));
+                    ru = clampUnit((float)( eyeRX / leanMm));
+                    rv = clampUnit((float)(-eyeRY / leanMm));
+                }
+            }
+            else
+            {
+                // No eye-track data yet: static L/R sub-aperture extremes
+                // so the user sees stereo immediately rather than 2 identical views.
+                lu = -0.7f; ru = +0.7f;
+            }
+            app.lfpRenderer.Run(lu, lv, ru, rv);
+            app.weaver.SetInputView(app.lfpRenderer.OutputSRV(),
+                                    app.lfpRenderer.OutputPerEyeWidth(),
+                                    app.lfpRenderer.OutputHeight(),
+                                    app.lfpRenderer.OutputFormat());
+            app.captureRebind = false;
+            goto skipSourcePipeline;
+        }
+
+        {
+        const bool liveSource  = (app.source != SourceKind::TestImage)
+                              || app.video.IsOpen()
+                              || app.format == StereoFormat::Katanga;
         // Quilt is included so the converter re-runs every frame even on a
         // static test image -- its L/R view indices follow the head position.
         const bool temporalFmt = (app.format == StereoFormat::Pulfrich ||
                                   app.format == StereoFormat::FrameSequential ||
                                   app.format == StereoFormat::Quilt);
         const bool noConv      = (app.convergence < 1e-4f && app.convergence > -1e-4f);
+        // HalfSBS is identity-passable (each source half = each eye, no
+        // transform). FullSBS now does a vertical centre-crop in the
+        // shader so a letterboxed 32:9 source projects correctly --
+        // can't skip the converter for it.
+        const bool halfSbsFmt  = (app.format == StereoFormat::HalfSBS);
         const bool sbsFmt      = (app.format == StereoFormat::FullSBS ||
                                   app.format == StereoFormat::HalfSBS);
-        const bool identitySBS = liveSource && sbsFmt && !app.swapEyes && noConv;
+        // Katanga always publishes FullSBS-layout pixels; route it through the
+        // identity fast path so the weaver's internal bilinear handles any
+        // scaling between the game's render res and the output window/display.
+        const bool katangaFmt  = (app.format == StereoFormat::Katanga);
+        const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !app.swapEyes && noConv;
 
         if (identitySBS)
         {
             if (srcSRV && srcW > 0 && srcH > 0 && (app.captureRebind || capSizeChanged))
             {
-                const DXGI_FORMAT srvFmt = app.dxgiActive ? app.captureDxgi.SRVFormat()
-                                                          : app.capture.SRVFormat();
+                DXGI_FORMAT srvFmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                if      (katangaFmt)     srvFmt = app.katanga.Format();
+                else if (app.dxgiActive) srvFmt = app.captureDxgi.SRVFormat();
+                else                     srvFmt = app.capture.SRVFormat();
                 app.weaver.SetInputView(srcSRV, srcW / 2, srcH, srvFmt);
                 app.captureRebind = false;
             }
@@ -1832,7 +2695,7 @@ namespace
         // setting changed (captureRebind). When the captured content is unchanged we
         // skip the convert and re-weave the cached SBS — the weave still tracks the
         // head every frame, but we don't burn GPU re-converting identical pixels.
-        else if (srcSRV && srcW > 0 && srcH > 0 && ((liveSource && gotFrame) || temporalFmt || app.captureRebind))
+        else if (srcSRV && srcW > 0 && srcH > 0 && ((liveSource && gotFrame) || temporalFmt || IsVRFormat(app.format) || app.captureRebind))
         {
             // Quilt: pick L/R view indices from the SR head-pose tracker. Each eye
             // gets the view whose virtual-camera horizontal position matches that
@@ -1848,27 +2711,90 @@ namespace
             // the eyes, which is the parallax that gives 3D depth).
             if (app.format == StereoFormat::Quilt)
             {
-                double hp[3] = {}, ho[3] = {};
-                if (app.weaver.GetHeadPose(hp, ho))
-                {
-                    const double HEAD_FULL_SWEEP_MM = 660.0;   // ±330mm covers all views
-                    const double IOD_MM             = 64.0;    // average interocular distance
-                    const double EMA_ALPHA          = 0.10;    // lower = smoother, slower
-                    const float  BLEND_SNAP         = 0.08f;   // shimmer-kill near integer boundaries
-                    const int    total              = app.quiltCols * app.quiltRows;
+                const double HEAD_FULL_SWEEP_MM = 660.0;   // ±330mm covers all views
+                // EMA is lighter than the legacy head-centre path because
+                // getPredictedEyePositions returns latency-corrected /
+                // already-filtered positions -- extra smoothing here just
+                // adds perceived lag. Fallback head-pose path still uses
+                // the heavier filter (alpha 0.10) under the same constant
+                // since head pose is noisier than weaver-predicted eyes.
+                const double EMA_ALPHA_EYES = 0.30;        // per-eye (predicted)
+                const double EMA_ALPHA_HEAD = 0.10;        // head-centre fallback
+                const float  BLEND_SNAP     = 0.08f;       // shimmer-kill near integer boundaries
+                const int    total              = app.quiltCols * app.quiltRows;
 
-                    // EMA on the raw head.x removes high-frequency tracker noise.
-                    if (!app.headXEMAInit) { app.headXEMA = hp[0]; app.headXEMAInit = true; }
-                    else app.headXEMA = EMA_ALPHA * hp[0] + (1.0 - EMA_ALPHA) * app.headXEMA;
+                // Prefer the weaver's predicted per-eye positions (latency-
+                // corrected, real IPD -- no need to assume a 64mm IOD).
+                // Falls back to head-centre +/- assumed-IOD if for any reason
+                // the weaver isn't ready.
+                float lEye[3] = {}, rEye[3] = {};
+                double leftEyeX = 0.0, rightEyeX = 0.0;
+                bool haveEyes = false;
+                bool fromPredicted = false;
+                if (app.weaver.GetPredictedEyePositions(lEye, rEye))
+                {
+                    leftEyeX  = (double)lEye[0];
+                    rightEyeX = (double)rEye[0];
+                    haveEyes  = true;
+                    fromPredicted = true;
+                }
+                else
+                {
+                    double hp[3] = {}, ho[3] = {};
+                    if (app.weaver.GetHeadPose(hp, ho))
+                    {
+                        const double IOD_MM_DEFAULT = 64.0;
+                        leftEyeX  = hp[0] - IOD_MM_DEFAULT * 0.5;
+                        rightEyeX = hp[0] + IOD_MM_DEFAULT * 0.5;
+                        haveEyes  = true;
+                    }
+                }
+
+                if (haveEyes)
+                {
+                    // EMA per eye -- kills tracker noise without flattening
+                    // real IPD differences (which now flow straight through).
+                    // Predicted positions are already filtered upstream, so a
+                    // higher alpha (less smoothing) keeps response snappy.
+                    const double ema = fromPredicted ? EMA_ALPHA_EYES : EMA_ALPHA_HEAD;
+                    if (!app.eyesEMAInit)
+                    {
+                        app.leftEyeXEMA  = leftEyeX;
+                        app.rightEyeXEMA = rightEyeX;
+                        app.eyesEMAInit  = true;
+                    }
+                    else
+                    {
+                        app.leftEyeXEMA  = ema * leftEyeX  + (1.0 - ema) * app.leftEyeXEMA;
+                        app.rightEyeXEMA = ema * rightEyeX + (1.0 - ema) * app.rightEyeXEMA;
+                    }
+
+                    // Diagnostic: log the predicted eye positions + measured
+                    // IPD ~once a second so we can confirm the runtime is
+                    // returning sensible values + tell whether the user's
+                    // tracked IPD differs from the 64mm fallback assumption.
+                    if (fromPredicted)
+                    {
+                        static DWORD lastEyeLogTick = 0;
+                        const DWORD now = GetTickCount();
+                        if (now - lastEyeLogTick > 1000)
+                        {
+                            lastEyeLogTick = now;
+                            const float ipd = rEye[0] - lEye[0];
+                            Log("Quilt eyes: L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) "
+                                "IPD=%.1fmm (smoothed L.x=%.1f R.x=%.1f)",
+                                lEye[0], lEye[1], lEye[2],
+                                rEye[0], rEye[1], rEye[2], ipd,
+                                app.leftEyeXEMA, app.rightEyeXEMA);
+                        }
+                    }
 
                     // Window-position perspective shift: when SR Loom is windowed
                     // on the SR display, the user's "looking toward" the window's
                     // SCREEN POSITION, not the panel centre. Subtract the window's
-                    // centre-relative-to-panel-centre offset (in mm) from the
-                    // head.x so a head centred ON the window picks view N/2,
-                    // regardless of where the window sits on the panel. Skipped
-                    // when we don't know the panel's mm/px scale or weren't
-                    // given a sensible window position.
+                    // centre-relative-to-panel-centre offset (in mm) from each
+                    // eye-x so a head centred ON the window picks views around
+                    // N/2 regardless of where the window sits on the panel.
                     double windowOffsetMm = 0.0;
                     if (app.srMmPerPx > 0.0 && app.hwnd)
                     {
@@ -1877,7 +2803,6 @@ namespace
                         const int panCenterX  = (app.srDisplayRect.left + app.srDisplayRect.right) / 2;
                         windowOffsetMm = (double)(winCenterX - panCenterX) * app.srMmPerPx;
                     }
-                    const double effectiveHeadX = app.headXEMA - windowOffsetMm;
 
                     auto mapEyeXToFrac = [&](double x) -> double {
                         double n = x / HEAD_FULL_SWEEP_MM;     // -0.5..+0.5 typical
@@ -1893,15 +2818,13 @@ namespace
                         outIdx   = lo;
                         outBlend = (float)(frac - (double)lo);
                     };
-                    // Each eye gets the camera position offset by ±IOD/2 from the
-                    // smoothed head centre; +x = right of display. The shader
-                    // cross-fades between view[idx] and view[idx+1] by the
-                    // fractional component -- so motion across a view boundary
-                    // is continuous, the way Looking Glass interpolates between
-                    // its physical lenticular columns.
-                    fracToIdxBlend(mapEyeXToFrac(effectiveHeadX - IOD_MM * 0.5),
+                    // Each eye picks its own view from its OWN absolute
+                    // position (no IOD assumption needed). Shader cross-fades
+                    // between view[idx] and view[idx+1] by the fractional
+                    // component for continuous motion across view boundaries.
+                    fracToIdxBlend(mapEyeXToFrac(app.leftEyeXEMA  - windowOffsetMm),
                                    app.quiltLeftIdx,  app.quiltLeftBlend);
-                    fracToIdxBlend(mapEyeXToFrac(effectiveHeadX + IOD_MM * 0.5),
+                    fracToIdxBlend(mapEyeXToFrac(app.rightEyeXEMA - windowOffsetMm),
                                    app.quiltRightIdx, app.quiltRightBlend);
                     // Anti-shimmer near integer boundaries: snap tiny residual
                     // blend to 0 (still head -> locked to single view -> no
@@ -1936,6 +2859,48 @@ namespace
             app.converter.SetQuilt(app.quiltCols, app.quiltRows,
                                    app.quiltLeftIdx, app.quiltRightIdx,
                                    app.quiltLeftBlend, app.quiltRightBlend);
+            // VR view -- if Headlook is on, fold the user's head ORIENTATION
+            // (not position) into the view direction. LeiaSR ho[] mapping
+            // (matches leia-track-app-XYZ's track_pipeline.h):
+            //   ho[0] = pitch (rad), ho[1] = yaw (rad), ho[2] = roll (ignored)
+            // EMA-smooth at alpha 0.15 (~60ms time constant @60fps) to kill
+            // SR-tracker jitter without adding much perceived lag. Roll is
+            // intentionally never applied -- it makes 360 viewing nauseating.
+            float vrYawEffective   = app.vrYaw;
+            float vrPitchEffective = app.vrPitch;
+            if (IsVRFormat(app.format) && app.vrHeadLook)
+            {
+                double hp[3] = {}, ho[3] = {};
+                if (app.weaver.GetHeadPose(hp, ho))
+                {
+                    // Velocity-aware Accela filter, tuned for SR head tracker
+                    // jitter (which is bigger than VRto3D's typical input):
+                    //   deadzone  = 0.018 rad (~1.0°) -- fully eats the
+                    //               "head still" tracker noise without
+                    //               feeling sticky for real movements.
+                    //   threshold = 0.025 rad (~1.4°) -- comfortable head
+                    //               turns produce per-frame deltas of
+                    //               ~0.04-0.08 rad, landing well into the
+                    //               steep-gain zone for instant follow.
+                    constexpr double kDeadzone  = 0.018;
+                    constexpr double kThreshold = 0.025;
+                    const double yawF   = AccelaApply(app.vrYawFilter,   ho[1], kDeadzone, kThreshold);
+                    const double pitchF = AccelaApply(app.vrPitchFilter, ho[0], kDeadzone, kThreshold);
+                    // Negate so "head right -> view right" (raw yaw/pitch
+                    // are opposite the viewer's expected direction; matches
+                    // leia-track-app's invert_yaw default).
+                    vrYawEffective   -= (float)yawF;
+                    vrPitchEffective -= (float)pitchF;
+                }
+            }
+            else
+            {
+                // Reset the filters so the next enable seeds fresh instead
+                // of snapping the view from a stale "last output".
+                app.vrYawFilter.init   = false;
+                app.vrPitchFilter.init = false;
+            }
+            app.converter.SetVRView(vrYawEffective, vrPitchEffective, app.vrZoom);
             // Pane = SWAP CHAIN size, not SR panel size. The weaver samples
             // the SBS pane at the output's UV, so a pane that doesn't match
             // the swap-chain aspect gets squeezed when the weaver writes its
@@ -1957,7 +2922,9 @@ namespace
                 app.captureRebind = false;
             }
         }
+        }   // matches the "{" introduced before the liveSource block by the LFPRenderer branch
 
+        skipSourcePipeline:
         app.renderer.BindAndClearBackBuffer();
         app.weaver.Weave();
         app.renderer.Present(false);   // no-vsync: lowest latency (VRR absorbs tearing)
@@ -1982,7 +2949,71 @@ namespace
             {
                 app->gui.Toggle();   // left-click opens/closes the control panel
             }
+            else if (app && LOWORD(lParam) == NIN_BALLOONUSERCLICK
+                          && !app->pendingUpdateUrl.empty())
+            {
+                // User clicked the "update available" toast -> open the release page.
+                ShellExecuteA(nullptr, "open", app->pendingUpdateUrl.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
+            }
             return 0;
+
+        case WM_APP_UPDATE_RESULT:
+            if (app && wParam)
+            {
+                auto* info = reinterpret_cast<ReleaseInfo*>(wParam);
+                char title[128], body[256];
+                DWORD infoFlags = NIIF_INFO;
+                switch (info->status)
+                {
+                case ReleaseInfo::Available:
+                    app->pendingUpdateUrl = info->url;
+                    app->pendingUpdateTag = info->tag;
+                    _snprintf_s(title, _TRUNCATE, "SR Loom update available");
+                    _snprintf_s(body, _TRUNCATE,
+                                "Version %s is out (you have %s). Click to open the release page.",
+                                info->tag.c_str(), kAppVersion);
+                    Log("UpdateChecker: notified -- latest %s, current %s",
+                        info->tag.c_str(), kAppVersion);
+                    break;
+                case ReleaseInfo::UpToDate:
+                    app->pendingUpdateUrl.clear();
+                    app->pendingUpdateTag.clear();
+                    _snprintf_s(title, _TRUNCATE, "SR Loom is up to date");
+                    _snprintf_s(body, _TRUNCATE,
+                                "You're on the latest release (%s).", kAppVersion);
+                    Log("UpdateChecker: user-checked, already up to date");
+                    break;
+                case ReleaseInfo::Failed:
+                default:
+                    app->pendingUpdateUrl.clear();
+                    app->pendingUpdateTag.clear();
+                    _snprintf_s(title, _TRUNCATE, "Update check failed");
+                    _snprintf_s(body, _TRUNCATE,
+                                "Couldn't reach the update server. Check your network and try again.");
+                    infoFlags = NIIF_WARNING;
+                    Log("UpdateChecker: user-checked, fetch failed");
+                    break;
+                }
+                NOTIFYICONDATAA nid{ sizeof(nid) };
+                nid.hWnd   = hwnd;
+                nid.uID    = 1;
+                nid.uFlags = NIF_INFO;
+                nid.dwInfoFlags = infoFlags;
+                _snprintf_s(nid.szInfoTitle, _TRUNCATE, "%s", title);
+                _snprintf_s(nid.szInfo,      _TRUNCATE, "%s", body);
+                Shell_NotifyIconA(NIM_MODIFY, &nid);
+                delete info;
+            }
+            return 0;
+
+        case WM_APP_CHECK_UPDATES:
+            // User-forced update check from the About popup. Skips the
+            // 6-hour throttle and always posts a WM_APP_UPDATE_RESULT so
+            // the user sees a balloon either way.
+            UpdateChecker::StartAsync(hwnd, WM_APP_UPDATE_RESULT, true);
+            return 0;
+
 
         case WM_APP_GUI_CAPTURE_WINDOW:   // GUI window-picker chose a window to make 3D
             if (app) UseWindow(*app, reinterpret_cast<HWND>(lParam));
@@ -2019,6 +3050,19 @@ namespace
             return 0;
 
         case WM_LBUTTONDOWN:
+            // VR viewer: record the press but don't commit to "drag" yet --
+            // any movement past the threshold turns it into a drag-to-look;
+            // a release within the threshold falls through to the overlay
+            // toggle so the user can still pop the test-image controls.
+            if (app && app->source == SourceKind::TestImage && IsVRFormat(app->format))
+            {
+                app->vrMouseDown  = true;
+                app->vrMoved      = false;
+                app->vrDragStartX = app->vrDragLastX = GET_X_LPARAM(lParam);
+                app->vrDragStartY = app->vrDragLastY = GET_Y_LPARAM(lParam);
+                SetCapture(hwnd);
+                return 0;
+            }
             // Test-image overlays: settings (left) appears in both modes;
             // window-controls (right) only in fullscreen (windowed already has
             // native chrome with min/max/close); video transport (bottom)
@@ -2049,6 +3093,83 @@ namespace
                 }
             }
             return 0;
+
+        case WM_MOUSEMOVE:
+            if (app && app->vrMouseDown && (wParam & MK_LBUTTON))
+            {
+                const int x = GET_X_LPARAM(lParam);
+                const int y = GET_Y_LPARAM(lParam);
+                if (!app->vrMoved)
+                {
+                    const int dx = x - app->vrDragStartX;
+                    const int dy = y - app->vrDragStartY;
+                    // 5-pixel drag threshold separates an accidental jitter
+                    // (= still a click) from an intentional drag-to-look.
+                    if (dx * dx + dy * dy > 25) app->vrMoved = true;
+                }
+                if (app->vrMoved)
+                {
+                    // px-to-radians: 1800 px ~= 180° -- comfortable viewer
+                    // feel, scales down further at higher zoom.
+                    const float kPxToRad = 3.14159265f / 1800.0f;
+                    const float zoomDiv = (app->vrZoom > 0.1f) ? app->vrZoom : 0.1f;
+                    app->vrYaw   -= (x - app->vrDragLastX) * kPxToRad / zoomDiv;
+                    app->vrPitch -= (y - app->vrDragLastY) * kPxToRad / zoomDiv;
+                    if (app->vrPitch >  1.5f) app->vrPitch =  1.5f;
+                    if (app->vrPitch < -1.5f) app->vrPitch = -1.5f;
+                    app->vrDragLastX = x;
+                    app->vrDragLastY = y;
+                    app->captureRebind = true;
+                }
+                return 0;
+            }
+            return 0;
+
+        case WM_LBUTTONUP:
+            if (app && app->vrMouseDown)
+            {
+                const bool wasClick = !app->vrMoved;
+                app->vrMouseDown = false;
+                app->vrMoved     = false;
+                ReleaseCapture();
+                if (!wasClick) return 0;   // real drag -- consume
+                // Quick click on the SR Loom window: toggle the test-image
+                // overlays the same way the non-VR click path does.
+                const bool anyVisible =
+                    (g_fsCtrl && IsWindowVisible(g_fsCtrl)) ||
+                    (g_fsSet  && IsWindowVisible(g_fsSet))  ||
+                    (g_fsVid  && IsWindowVisible(g_fsVid));
+                if (anyVisible)
+                {
+                    HideFsCtrlOverlay();
+                    HideFsSetOverlay();
+                    HideFsVidOverlay();
+                }
+                else
+                {
+                    if (app->mode == OutputMode::Fullscreen) ShowFsCtrlOverlay(*app);
+                    if (app->mode == OutputMode::Fullscreen ||
+                        app->mode == OutputMode::Windowed)
+                    {
+                        ShowFsSetOverlay(*app);
+                        if (app->video.IsOpen()) ShowFsVidOverlay(*app);
+                    }
+                }
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEWHEEL:
+            if (app && app->source == SourceKind::TestImage && IsVRFormat(app->format))
+            {
+                const float delta = (float)GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+                app->vrZoom *= powf(1.12f, delta);   // ~12% per notch
+                if (app->vrZoom < 0.2f) app->vrZoom = 0.2f;
+                if (app->vrZoom > 3.0f) app->vrZoom = 3.0f;
+                app->captureRebind = true;
+                return 0;
+            }
+            break;
 
         case WM_MOVE:
             // Keep the floating overlays glued to the window's corners.
@@ -2108,7 +3229,7 @@ namespace
                 int n = 0;
                 const StereoFormatEntry* fmts = StereoFormatList(n);
                 const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
-                if (idx < n) { app->format = fmts[idx].fmt; app->captureRebind = true; EnsureWeavingFormatOnly(*app); }
+                if (idx < n) { ChangeFormat(*app, fmts[idx].fmt); EnsureWeavingFormatOnly(*app); }
                 // Re-show the test-image settings overlay so Quilt's cols/rows
                 // buttons appear (or vanish) immediately on a format change.
                 if (g_fsSet && IsWindowVisible(g_fsSet)) ShowFsSetOverlay(*app);
@@ -2118,8 +3239,7 @@ namespace
             if (cmd >= ID_TRAY_ANA_COMBO_BASE && cmd <= ID_TRAY_ANA_COMBO_MAX)
             {
                 app->anaglyphCombo = (int)(cmd - ID_TRAY_ANA_COMBO_BASE);
-                app->format = StereoFormat::Anaglyph;
-                app->captureRebind = true;
+                ChangeFormat(*app, StereoFormat::Anaglyph);
                 EnsureWeavingFormatOnly(*app);
                 return 0;
             }
@@ -2128,8 +3248,7 @@ namespace
                 int n = 0; const AnaglyphModeEntry* modes = AnaglyphModeList(n);
                 const int idx = (int)(cmd - ID_TRAY_ANA_MODE_BASE);
                 if (idx < n) app->anaglyphMode = modes[idx].value;   // menu index -> shader mode value
-                app->format = StereoFormat::Anaglyph;
-                app->captureRebind = true;
+                ChangeFormat(*app, StereoFormat::Anaglyph);
                 EnsureWeavingFormatOnly(*app);
                 return 0;
             }
@@ -2143,16 +3262,14 @@ namespace
                 else
                     app->pulfrichMode = (cmd == ID_TRAY_PULF_MODE_BASE) ? PulfrichMode::TimeDelay
                                                                         : PulfrichMode::NDFilter;
-                app->format = StereoFormat::Pulfrich;
-                app->captureRebind = true;
+                ChangeFormat(*app, StereoFormat::Pulfrich);
                 EnsureWeavingFormatOnly(*app);
                 return 0;
             }
             if (cmd >= ID_TRAY_FP_BASE && cmd <= ID_TRAY_FP_MAX)
             {
                 app->framePackMode = (int)(cmd - ID_TRAY_FP_BASE);
-                app->format = StereoFormat::FramePacking;
-                app->captureRebind = true;
+                ChangeFormat(*app, StereoFormat::FramePacking);
                 EnsureWeavingFormatOnly(*app);
                 return 0;
             }
@@ -2254,6 +3371,88 @@ namespace
             return 0;
         }
 
+        case WM_SIZING:
+        {
+            // Lock the windowed aspect when displaying a test image with a
+            // known per-eye aspect (LFP, video, image). Without this the
+            // user could resize the window to a random shape and the
+            // image would stretch / leave large bars. Adjust the rect on
+            // the EDGE the user is dragging so it feels natural.
+            if (!app || app->mode != OutputMode::Windowed
+                || app->source != SourceKind::TestImage)
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+
+            // Compute the same per-eye aspect ApplyMode uses.
+            int sw = 0, sh = 0;
+            if (app->format == StereoFormat::LightField && app->lfpRenderer.HasData())
+            { sw = app->lfpRenderer.OutputPerEyeWidth(); sh = app->lfpRenderer.OutputHeight(); }
+            else if (app->video.IsOpen()) { sw = app->video.Width(); sh = app->video.Height(); }
+            else                          { sw = app->weaver.SourceWidth(); sh = app->weaver.SourceHeight(); }
+            if (sw <= 0 || sh <= 0)
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+            double aw = (double)sw, ah = (double)sh;
+            switch (app->format)
+            {
+            case StereoFormat::Quilt:
+                if (app->quiltCols > 0 && app->quiltRows > 0)
+                { aw /= app->quiltCols; ah /= app->quiltRows; }
+                break;
+            case StereoFormat::FullSBS:
+            case StereoFormat::HalfSBS:           aw *= 0.5; break;
+            case StereoFormat::FullTAB:
+            case StereoFormat::HalfTAB:
+            case StereoFormat::RowInterleaved:    ah *= 0.5; break;
+            case StereoFormat::ColumnInterleaved: aw *= 0.5; break;
+            default: break;
+            }
+            if (aw <= 0 || ah <= 0)
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+            const double aspect = aw / ah;
+
+            // We're adjusting the WINDOW rect, not the client rect. Subtract
+            // the chrome (frame + caption) so the *client* keeps the
+            // correct aspect, then re-add.
+            RECT* r = reinterpret_cast<RECT*>(lParam);
+            RECT chrome{};
+            ::AdjustWindowRectEx(&chrome, (DWORD)GetWindowLongPtr(hwnd, GWL_STYLE),
+                                 FALSE, (DWORD)GetWindowLongPtr(hwnd, GWL_EXSTYLE));
+            const int chromeW = chrome.right  - chrome.left;
+            const int chromeH = chrome.bottom - chrome.top;
+            const int curW = (r->right  - r->left) - chromeW;
+            const int curH = (r->bottom - r->top)  - chromeH;
+            if (curW <= 0 || curH <= 0)
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+
+            // wParam tells us which edge / corner is being dragged. Width-
+            // adjusts override (drag left/right edge), height-adjusts on
+            // top/bottom, corners follow whichever side has more change.
+            const WPARAM edge = wParam;
+            const bool widthEdge  = (edge == WMSZ_LEFT || edge == WMSZ_RIGHT);
+            const bool heightEdge = (edge == WMSZ_TOP  || edge == WMSZ_BOTTOM);
+            int targetW = curW, targetH = curH;
+            if (widthEdge)        targetH = (int)(targetW / aspect + 0.5);
+            else if (heightEdge)  targetW = (int)(targetH * aspect + 0.5);
+            else { /* corner: use the larger relative change */
+                const double byW = (double)targetW / aspect;   // implied H from W
+                const double byH = (double)targetH * aspect;   // implied W from H
+                if (std::abs(byW - targetH) < std::abs(byH - targetW))
+                    targetH = (int)(targetW / aspect + 0.5);
+                else
+                    targetW = (int)(targetH * aspect + 0.5);
+            }
+
+            // Apply the new rect, anchoring on the dragged edge.
+            if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT)
+                r->left  = r->right  - (targetW + chromeW);
+            else
+                r->right = r->left   + (targetW + chromeW);
+            if (edge == WMSZ_TOP  || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT)
+                r->top    = r->bottom - (targetH + chromeH);
+            else
+                r->bottom = r->top    + (targetH + chromeH);
+            return TRUE;
+        }
+
 
 
 
@@ -2325,7 +3524,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Install the crash handler first so any later init failure that
     // segfaults / access-violates leaves a useful trail in srweaver.log.
     SetUnhandledExceptionFilter(SrLoomCrashHandler);
-    Log("WinMain: SR Loom v1.6 starting");
+    Log("WinMain: SR Loom v%s starting", kAppVersion);
+    {
+        const char* sr = SRWeaver::GetSRPlatformVersion();
+        Log("WinMain: SR Platform runtime version=%s", (sr && *sr) ? sr : "(unknown)");
+    }
 
     // Per-Monitor-Aware v2: unlike v1, Windows auto-scales the NON-CLIENT area
     // (title bar) per monitor — so the GUI's title bar no longer stays huge when
@@ -2342,6 +3545,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     AppState app;
     g_app = &app;
 
+    // Pipe SR runtime logs into our own log directory at MediumVerbosity
+    // (errors + warnings -- support-debug useful, not noisy). MUST be called
+    // before the first SRContext is constructed.
+    SRWeaver::InitSRLog(ExePath("").c_str(), "srloom-sr-");
+
     // Connect to the SR service.
     if (!app.weaver.CreateContext(10.0))
     {
@@ -2352,6 +3560,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     // Decide where the output window lives (the SR display if available).
     app.srDisplayRect = ResolveTargetRect(app.weaver);
+
+    // Diagnostic snapshot: what does the runtime report for the SR display,
+    // and is it Windows' primary monitor? Lets us verify whether SR Loom
+    // works on a non-primary SR display setup (the runtime + getLocation()
+    // pattern should support it on Windows 11; see docs/sr-non-primary-research.md).
+    {
+        const RECT& d = app.srDisplayRect;
+        const POINT p{ (d.left + d.right) / 2, (d.top + d.bottom) / 2 };
+        HMONITOR mon = MonitorFromPoint(p, MONITOR_DEFAULTTONULL);
+        MONITORINFOEXA mi{}; mi.cbSize = sizeof(mi);
+        const bool gotMi = mon && GetMonitorInfoA(mon, &mi);
+        const bool isPrimary = gotMi && (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        Log("WinMain: SR display rect=(%ld,%ld %ld,%ld) %ldx%ld",
+            d.left, d.top, d.right, d.bottom,
+            d.right - d.left, d.bottom - d.top);
+        Log("WinMain: SR display monitor=%p name='%s' primary=%d",
+            (void*)mon, gotMi ? mi.szDevice : "(unknown)", isPrimary ? 1 : 0);
+        if (!isPrimary)
+            Log("WinMain: SR display is NOT Windows primary -- testing non-primary support."
+                " If weave doesn't engage, see docs/sr-non-primary-research.md.");
+    }
 
     // Register window class.
     WNDCLASSEXA wc{};
@@ -2427,6 +3656,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 7;
     }
     Log("WinMain: converter.Initialize OK");
+    // LFPRenderer is optional -- only used when an LFP file is loaded.
+    // If shader compile fails, log and continue without the feature.
+    if (!app.lfpRenderer.Initialize(app.renderer.Device(), app.renderer.Context()))
+        Log("WinMain: lfpRenderer.Initialize FAILED (LFP files will fall back to CPU SBS)");
+    else
+        Log("WinMain: lfpRenderer.Initialize OK");
     // Wrap detector / gui / tray init in begin/end + try/catch -- one of these
     // dying silently between converter.Initialize OK and tray.Add was the
     // failure mode reported by the first user, and "begin" / "end" pairs plus
@@ -2488,6 +3723,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     const int hk2 = RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     const int hk3 = RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
     Log("WinMain: hotkeys W=%d F=%d C=%d", hk1, hk2, hk3);
+
+    // Kick off a once-per-launch (throttled to once per 6h) background poll of
+    // GitHub Releases. If a newer tag than kAppVersion exists the worker
+    // PostMessages WM_APP_UPDATE_RESULT so the WndProc can pop a balloon
+    // (auto-check is silent on up-to-date / failure -- only the user-
+    // forced check from the About popup yields balloons for those).
+    UpdateChecker::StartAsync(app.hwnd, WM_APP_UPDATE_RESULT, false);
     // RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D'); // auto-detect disabled
 
     // Start idle: release the SR session used to query the display rect so the
@@ -2535,6 +3777,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 gs.quiltCols     = app.quiltCols;
                 gs.quiltRows     = app.quiltRows;
                 gs.hasTestImage  = !app.lastTestImagePath.empty();
+                gs.vrHeadLook        = app.vrHeadLook;
+                gs.vrZoom            = app.vrZoom;
+                gs.vrResetView       = false;
+                gs.vrResetZoom       = false;
+                gs.vrHeadLookChanged = false;
+                // SR Platform runtime version (e.g. "1.34.10.17449") for
+                // the About popup. Static helper; pull it fresh each frame
+                // so a runtime hot-swap (rare) updates the GUI display.
+                const char* sr = SRWeaver::GetSRPlatformVersion();
+                strncpy_s(gs.srPlatformVersion, sr ? sr : "", _TRUNCATE);
+                // Light-field parallax-scale state for the GUI slider.
+                gs.lfpHeadLeanMm      = app.lfpHeadLeanMm;
+                gs.lfpApertureMm      = (float)(app.lfpRenderer.ApertureDiameterMetres() * 1e3);
+                gs.lfpHeadLeanChanged = false;
                 // What's being weaved, for the GUI's collapsed summary line.
                 if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
                 {
@@ -2548,6 +3804,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     app.convergence   = gs.convergence;
                     app.captureRebind = true;   // re-run the conversion with the new convergence
                 }
+                // VR controls.
+                if (gs.vrHeadLookChanged)
+                {
+                    app.vrHeadLook = gs.vrHeadLook;
+                    app.captureRebind = true;
+                }
+                if (gs.lfpHeadLeanChanged)
+                {
+                    app.lfpHeadLeanMm = gs.lfpHeadLeanMm;
+                }
+                if (gs.vrResetView)
+                {
+                    app.vrYaw   = 0.0f;
+                    app.vrPitch = 0.0f;
+                    app.captureRebind = true;
+                }
+                if (gs.vrResetZoom)
+                {
+                    app.vrZoom = 1.0f;
+                    app.captureRebind = true;
+                }
             }
         }
     }
@@ -2560,6 +3837,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.gui.Shutdown();
     app.detector.Shutdown();
     app.video.Close();
+    app.katanga.End();
+    app.lfpRenderer.Shutdown();
     app.converter.Shutdown();
     app.capture.Shutdown();
     app.weaver.Shutdown();

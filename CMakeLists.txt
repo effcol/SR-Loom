@@ -89,6 +89,14 @@ add_executable(SRLoom WIN32
     src/AcerSpatialLabs.cpp
     src/Settings.cpp
     src/VideoSource.cpp
+    src/UpdateChecker.cpp
+    src/UpdateChecker.h
+    src/KatangaSource.cpp
+    src/KatangaSource.h
+    src/LFPReader.cpp
+    src/LFPReader.h
+    src/LFPRenderer.cpp
+    src/LFPRenderer.h
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h

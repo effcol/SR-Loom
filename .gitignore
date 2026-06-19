@@ -45,3 +45,6 @@ tools/sweep_*/
 /*.avi
 /*.m4v
 /*.wmv
+
+# Local-only release-notes draft; not shipped in repo.
+/CHANGELOG.md

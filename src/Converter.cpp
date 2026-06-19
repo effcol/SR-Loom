@@ -48,8 +48,14 @@ cbuffer Params : register(b0)
     float g_paneH;         // SBS pane height in px
     float g_quiltLBlend;   // L pane: cross-fade from view[leftIdx]  to view[leftIdx+1]
     float g_quiltRBlend;   // R pane: cross-fade from view[rightIdx] to view[rightIdx+1]
-    float _pad_b;
+    float g_vrYaw;         // VR viewer: yaw (radians, 0 = looking forward)
+    float g_vrPitch;       // VR viewer: pitch (radians, 0 = level)
+    float g_vrZoom;        // VR viewer: zoom (1 = ~90° HFOV)
+    int   g_vrIs360;       // VR: 0 = 180° hemisphere, 1 = 360° sphere
+    int   g_vrIsSBS;       // VR: 0 = top-and-bottom packing, 1 = side-by-side
     float _pad_c;
+    float _pad_d;
+    float _pad_e;
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -644,9 +650,71 @@ float4 PSMain(VSOut i) : SV_Target
         }
         return float4(result, 1);
     }
+)HLSL"
+R"HLSL(
+    else if (g_format == 10)  // VR180 / VR360 equirectangular projection
+    {
+        // Build a per-eye perspective view from an equirectangular source:
+        //   1. The output pane represents a flat camera with horizontal FOV
+        //      controlled by g_vrZoom (zoom = 1 -> ~90° HFOV).
+        //   2. Compute the 3D ray direction for this output pixel through
+        //      that virtual camera.
+        //   3. Rotate the ray by the viewer's yaw + pitch to "look around".
+        //   4. Project the rotated ray to spherical (lat, lon) and read the
+        //      equirect texel. For VR180 we limit longitude to ±90° so the
+        //      back hemisphere never samples.
+        //   5. Stereo: the source packs L+R either Top-and-Bottom or
+        //      Side-by-Side; pick the right half based on the output eye.
+
+        // Camera frame: tan(half-FOV) sets the field of view.
+        // zoom in [0.2..3], 1 -> ~half-tan 1 (so HFOV ~90°).
+        float halfTan   = 1.0 / max(0.05, g_vrZoom);
+        float paneAR    = (g_paneH > 0.0) ? (g_paneW / max(1.0, g_paneH)) : 1.0;
+        float2 ndc      = float2((e.x * 2.0 - 1.0) * halfTan,
+                                 (1.0 - e.y * 2.0) * (halfTan / max(0.0001, paneAR)));
+        float3 ray      = normalize(float3(ndc.x, ndc.y, 1.0));
+
+        // Apply pitch (X axis) then yaw (Y axis).
+        float cp = cos(g_vrPitch), sp = sin(g_vrPitch);
+        float3 r1 = float3(ray.x, cp * ray.y - sp * ray.z, sp * ray.y + cp * ray.z);
+        float cy = cos(g_vrYaw),   sy = sin(g_vrYaw);
+        float3 r2 = float3(cy * r1.x + sy * r1.z, r1.y, -sy * r1.x + cy * r1.z);
+
+        // Spherical projection. lon = atan2(x, z) in [-pi..pi]; lat = asin(y)
+        // in [-pi/2..pi/2]. Convert to UVs of the FULL sphere.
+        float lon = atan2(r2.x, r2.z);
+        float lat = asin(clamp(r2.y, -1.0, 1.0));
+        const float PI = 3.14159265358979;
+
+        // VR180: behind-the-camera samples return black instead of wrapping.
+        if (g_vrIs360 == 0 && (lon < -0.5 * PI || lon > 0.5 * PI))
+            return float4(0, 0, 0, 1);
+
+        // u in [0..1] over either the full 360° (VR360) or the front 180° (VR180).
+        float u = (g_vrIs360 == 1) ? (lon / (2.0 * PI) + 0.5)
+                                   : (lon /        PI  + 0.5);
+        float v = 0.5 - lat / PI;        // 0 at the top (+pi/2), 1 at the bottom
+
+        // Stereo packing: select the half of the source for this eye.
+        // Source layout: TAB -> top half = L, bottom half = R (the YouTube /
+        // most-content convention). SBS -> left half = L, right half = R.
+        float2 uv;
+        if (g_vrIsSBS == 1)
+            uv = float2((right ? 0.5 + u * 0.5 : u * 0.5), v);
+        else
+            uv = float2(u, (right ? 0.5 + v * 0.5 : v * 0.5));
+
+        return float4(srcTex.SampleLevel(samp, uv, 0).rgb, 1);
+    }
 
     // Default: side-by-side. left=left half, right=right half.
-    float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, e.y);
+    // FullSBS (format 11) additionally crops the source vertically to the
+    // centre 50%, where 32:9 letterboxed Full-SBS content lives when
+    // displayed on a 16:9 source (screen capture or aspect-fit video).
+    // HalfSBS (format 0) treats the whole source as already-shaped SBS.
+    float vy = e.y;
+    if (g_format == 11) vy = e.y * 0.5 + 0.25;
+    float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, vy);
     return srcTex.Sample(samp, s);
 }
 )HLSL";
@@ -665,7 +733,12 @@ float4 PSMain(VSOut i) : SV_Target
         case StereoFormat::FramePacking:      return 7;
         case StereoFormat::FrameSequential:   return 8;
         case StereoFormat::Quilt:             return 9;
-        default:                              return 0;  // SBS (and unimplemented)
+        case StereoFormat::VR180TAB:
+        case StereoFormat::VR180SBS:
+        case StereoFormat::VR360TAB:
+        case StereoFormat::VR360SBS:          return 10;  // VR equirect (sub-mode via cbuffer)
+        case StereoFormat::FullSBS:           return 11;  // SBS + crop source to centre vertical 50%
+        default:                              return 0;   // HalfSBS / unimplemented (sample source as-is)
         }
     }
 
@@ -677,25 +750,43 @@ float4 PSMain(VSOut i) : SV_Target
         switch (f)
         {
         case StereoFormat::FullSBS:
+            // FullSBS now means "32:9 letterboxed content in the source":
+            // the shader crops to the centre 50% vertical strip, and the
+            // output texture is sized to that strip (h/2). Each eye ends
+            // up at the source's natural per-eye aspect (16:9 from a
+            // 16:9 source) instead of being stretched into Half-SBS
+            // shape -- so downstream weaver / LG window samples it 1:1
+            // and the content doesn't get anisotropic distortion.
+            ew = w / 2; eh = h / 2; break;
         case StereoFormat::HalfSBS:           ew = w / 2; eh = h;     break;
         case StereoFormat::FullTAB:
         case StereoFormat::HalfTAB:
         case StereoFormat::RowInterleaved:    ew = w;     eh = h / 2; break;
         case StereoFormat::ColumnInterleaved: ew = w / 2; eh = h;     break;
+        case StereoFormat::VR180TAB:
+        case StereoFormat::VR180SBS:
+        case StereoFormat::VR360TAB:
+        case StereoFormat::VR360SBS:
+            // VR produces a synthesized perspective view per eye; size is
+            // governed by the caller-supplied target pane (panel native dims),
+            // not the equirect input. Fall through to "full size per eye"
+            // here -- the Convert() path overrides via SetTargetPaneSize.
+            ew = w; eh = h; break;
         default:                              ew = w;     eh = h;     break; // anaglyph/checker/pulfrich/quilt
         }
         if (ew < 1) ew = 1;
         if (eh < 1) eh = 1;
     }
 
-    // 28 x 4 bytes = 112 (7 rows of 16); cbuffer ByteWidth must be a multiple of 16.
+    // 32 x 4 bytes = 128 (8 rows of 16); cbuffer ByteWidth must be a multiple of 16.
     struct CB { int format; int swap; float srcW; float srcH;
                int anaCombo; int anaMode; int pulfMode; int pulfEye;
                float ndTrans; float fpEyeFrac; float fpGapFrac; float convergence;
                float dispMaxUV; float coarseW; float coarseH; float propStride;
                float fpEyeAlign; int quiltCols; int quiltRows; int quiltLeftIdx;
                int quiltRightIdx; float paneW; float paneH; float quiltLBlend;
-               float quiltRBlend; float _pad_b; float _pad_c; float _pad_d; };
+               float quiltRBlend; float vrYaw; float vrPitch; float vrZoom;
+               int vrIs360; int vrIsSBS; float _pad_c; float _pad_d; };
 
     // ---- Shader bytecode disk cache --------------------------------------------
     // First launch: compile every PS via D3DCompile (slow, the FXC optimizer's
@@ -996,6 +1087,23 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             eh = srcHeight / qr;
         }
     }
+    if (IsVRFormat(m_fmt))
+    {
+        // VR synthesises a perspective view per eye -- size the output to the
+        // SR panel's per-eye pane (passed in via SetTargetPaneSize) so the
+        // weaver samples 1:1. If we don't have those dims, fall back to a
+        // sane 16:9 output sized off the source so we at least render.
+        if (m_targetPaneW > 0 && m_targetPaneH > 0)
+        {
+            ew = m_targetPaneW;
+            eh = m_targetPaneH;
+        }
+        else
+        {
+            ew = 1920;
+            eh = 1080;
+        }
+    }
     if (ew < 1) ew = 1;
     if (eh < 1) eh = 1;
     outputResized = EnsureOutput(ew * 2, eh);
@@ -1037,7 +1145,10 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                dispMaxUV, coarseW, coarseH, 0,
                m_fpEyeAlign, m_quiltCols, m_quiltRows, m_quiltLeftIdx,
                m_quiltRightIdx, (float)ew, (float)eh, m_quiltLeftBlend,
-               m_quiltRightBlend, 0, 0, 0 };
+               m_quiltRightBlend,
+               m_vrYaw, m_vrPitch, m_vrZoom,
+               IsVR360(m_fmt) ? 1 : 0, IsVRSBS(m_fmt) ? 1 : 0,
+               0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
 
@@ -1099,7 +1210,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             CB pcb{ 0, 0, (float)srcWidth, (float)srcHeight, 0, 0, 0, 0,
                     0, 0, 0, 0, dispMaxUV, 0, 0, v,
                     0, 0, 0, 0, 0, 0, 0, 0,
-                    0, 0, 0, 0 };
+                    0, 0, 0, 0, 0, 0, 0, 0 };
             m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &pcb, 0, 0);
         };
         ID3D11ShaderResourceView* nul = nullptr;
@@ -1142,7 +1253,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                    m_ndTrans, m_fpEyeFrac, m_fpGapFrac, 0,
                    dispMaxUV, 0, 0, 0,
                    0, 0, 0, 0, 0, 0, 0, 0,
-                   0, 0, 0, 0 };
+                   0, 0, 0, 0, 0, 0, 0, 0 };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &copyCb, 0, 0);
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)m_histW; vp.Height = (FLOAT)m_histH; vp.MaxDepth = 1.0f;

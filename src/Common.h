@@ -16,6 +16,14 @@
 
 namespace srw
 {
+    // Current SR Loom version. Compared (after stripping any leading 'v') to
+    // the GitHub Releases latest-tag by the update checker. Bump in lockstep
+    // with the git tag for new releases.
+    constexpr const char* kAppVersion = "1.6";
+
+    // GitHub repo path for the update checker + "About" links.
+    constexpr const char* kRepoSlug = "effcol/SR-Loom";
+
     // How the woven output window is presented.
     enum class OutputMode
     {
@@ -25,7 +33,9 @@ namespace srw
         LookingGlass    // movable see-through loupe weaving the screen beneath it
     };
 
-    // What the weaver is currently weaving.
+    // What the weaver is currently weaving. Katanga used to live here as a
+    // 4th source kind; it moved to StereoFormat (an "external stereo input"
+    // format) so it composes with any source/placement.
     enum class SourceKind
     {
         TestImage,        // bundled static SBS image
@@ -49,8 +59,41 @@ namespace srw
         FrameSequential,    // alternating frames over time
         Pulfrich,           // mono source -> depth via per-eye delay or ND darkening
         FramePacking,       // HDMI 1.4: top eye, blanking gap, bottom eye
-        Quilt               // Looking Glass quilt: cols x rows grid of views; pick a pair as L/R
+        Quilt,              // Looking Glass quilt: cols x rows grid of views; pick a pair as L/R
+        VR180TAB,           // 180° equirectangular hemisphere, L over R packing
+        VR180SBS,           // 180° equirectangular hemisphere, L | R packing
+        VR360TAB,           // 360° equirectangular sphere, L over R packing
+        VR360SBS,           // 360° equirectangular sphere, L | R packing
+        Katanga,            // external SBS handed over by Bo3b's Katanga shared
+                            // texture (Geo-11 stereo game mods etc.). Bypasses the
+                            // Source's captured pixels -- the Source only governs
+                            // placement (which window/display the weave sits on).
+        LightField          // Lytro plenoptic (.lfp/.lfr/.lfx). LFPRenderer samples
+                            // per output pixel from the user's actual eye aperture
+                            // position each frame. Auto-set when an LFP loads.
     };
+
+    inline bool IsVRFormat(StereoFormat f)
+    {
+        return f == StereoFormat::VR180TAB || f == StereoFormat::VR180SBS
+            || f == StereoFormat::VR360TAB || f == StereoFormat::VR360SBS;
+    }
+    // True if the format gets its SBS from an external publisher (shared
+    // texture / IPC) rather than the Source's captured pixels. Today this
+    // is just Katanga; future external feeds (OpenXR mirror, virtual
+    // display, etc.) would slot in alongside it.
+    inline bool IsExternalSourceFormat(StereoFormat f)
+    {
+        return f == StereoFormat::Katanga;
+    }
+    inline bool IsVR360(StereoFormat f)
+    {
+        return f == StereoFormat::VR360TAB || f == StereoFormat::VR360SBS;
+    }
+    inline bool IsVRSBS(StereoFormat f)
+    {
+        return f == StereoFormat::VR180SBS || f == StereoFormat::VR360SBS;
+    }
 
     // HDMI 1.4 frame packing. The 720p (1280x1470) and 1080p (1920x2205) variants
     // share the same proportions (eye 48.98%, gap 2.04% of the squeezed capture
@@ -136,6 +179,16 @@ namespace srw
             { StereoFormat::Pulfrich,          "Pulfrich" },
             { StereoFormat::FramePacking,      "Frame packing" },
             { StereoFormat::Quilt,             "Quilt" },
+            { StereoFormat::VR180TAB,          "VR180 (Top-and-Bottom)" },
+            { StereoFormat::VR180SBS,          "VR180 (Side-by-Side)" },
+            { StereoFormat::VR360TAB,          "VR360 (Top-and-Bottom)" },
+            { StereoFormat::VR360SBS,          "VR360 (Side-by-Side)" },
+            // StereoFormat::Katanga intentionally omitted -- the feature
+            // is implemented end-to-end but parked from the UI until the
+            // remaining UX issues (cursor on weave, focus/Z-pin via
+            // publisher discovery) are properly sorted. Re-add this entry
+            // to expose it again.
+            { StereoFormat::LightField,        "Lytro Light Field" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));
         return list;
