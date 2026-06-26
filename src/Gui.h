@@ -39,7 +39,7 @@ namespace srw
         // VR viewer (read+write): GUI shows Headlook toggle + Reset View /
         // Reset Zoom buttons. Headlook toggles in place; reset buttons just
         // set the respective flag so the main loop zeros the right field.
-        bool         vrHeadLook     = true;
+        bool         vrHeadLook     = false;
         float        vrZoom         = 1.0f;
         bool         vrResetView    = false;
         bool         vrResetZoom    = false;

@@ -17,6 +17,7 @@
 #include "KatangaSource.h"
 #include "LFPReader.h"
 #include "LFPRenderer.h"
+#include "../third_party/one_euro_filter.h"
 #include "resource.h"
 
 #include <shellscalingapi.h>
@@ -111,20 +112,39 @@ namespace
         float        vrYaw          = 0.0f;
         float        vrPitch        = 0.0f;
         float        vrZoom         = 1.0f;
-        bool         vrHeadLook     = true;
+        // Default OFF for v1.6 -- the SR head-tracker step rate (~60Hz
+        // raw poses) shows up as visible per-frame jitter at the 165Hz
+        // render rate that no amount of LP/Accela filtering can fully
+        // hide without adding lag. Mouse-drag look-around works great;
+        // users can opt in to head-look via the GUI toggle and accept
+        // the trade. v1.7 plan: replace GetHeadPose() with a late-
+        // latched predicted pose from the SDK.
+        bool         vrHeadLook     = false;
         bool         vrMouseDown    = false;
         bool         vrMoved        = false;
         int          vrDragStartX   = 0;
         int          vrDragStartY   = 0;
         int          vrDragLastX    = 0;
         int          vrDragLastY    = 0;
-        // Accela-style velocity-aware filter state (one per axis). Tiny
-        // movements get heavy smoothing (kills jitter while head is still);
-        // large movements pass through near-instantly. Ported from VRto3D's
-        // accela_hamilton_runtime.h (BSD/ISC), simplified to single-axis.
+        // Two-stage VR head-tracking filter, one per axis:
+        //   1. OneEuro adaptive low-pass smooths the SR-tracker stream.
+        //      Run at a fixed 60 Hz constructor freq -- we don't pass a
+        //      timestamp at call time because GetTickCount has 15 ms
+        //      granularity on Windows, which makes OneEuro's auto-freq
+        //      estimate (1/dt) wildly unstable at the 165 Hz render
+        //      rate (some frames see dt=0, others dt=15ms).
+        //   2. Accela velocity-gain on top with deadzone=0 -- soft
+        //      damping of tiny residual inputs via the gain curve
+        //      (near-zero gain at small normalised values), no hard
+        //      threshold that would cause "still still SNAP" stair-
+        //      stepping. Real head turns hit the steep part of the
+        //      curve and snap instantly.
+        OneEuroFilter vrYawOneEuro    { 60.0f, 1.0f, 0.3f };
+        OneEuroFilter vrPitchOneEuro  { 60.0f, 1.0f, 0.3f };
         struct AccelaAxis { double lastOutput = 0.0; DWORD lastTickMs = 0; bool init = false; };
-        AccelaAxis   vrYawFilter;
-        AccelaAxis   vrPitchFilter;
+        AccelaAxis    vrYawAccela;
+        AccelaAxis    vrPitchAccela;
+        bool          vrFilterInit    = false;
         float        convergence    = 0.0f;   // GUI convergence slider (-1..1)
         // Light-field parallax-scale slider value (in mm of head-lean
         // needed to drive the aperture sample to its edge). Lower =
@@ -1453,16 +1473,15 @@ namespace
 
     void UsePassthrough(AppState& app);   // fwd decl: default weave is screen passthrough
 
-    // Velocity-aware Accela filter (one axis). Ported from VRto3D's
-    // accela_hamilton_runtime.h. dt is computed from GetTickCount() per call.
-    // - deadzone: angle (rad) below which we don't move at all -- kills the
-    //   "head still" tracker jitter regardless of its magnitude.
-    // - threshold: the magnitude that normalizes input to the gain curve;
-    //   tune so a comfortable head turn lands in the curve's responsive zone.
-    // The gain curve is the same piecewise-linear shape VRto3D uses for
-    // rotation: tiny normalized inputs => near-zero gain (almost no follow),
-    // moderate inputs => proportional follow, large inputs => instant follow.
-    double AccelaApply(AppState::AccelaAxis& a, double raw, double deadzone, double threshold)
+    // Velocity-aware Accela filter (one axis). Stage 2 of the VR head-
+    // tracking chain (stage 1 = OneEuro). Piecewise gain curve takes
+    // raw deltas to a follow-rate -- small inputs ride a near-zero gain
+    // (soft damping of tracker noise), real head turns hit the steep
+    // part and snap. We DON'T use Accela's deadzone here because the
+    // hard "no movement below threshold" cutoff caused visible jumps
+    // when input crossed the boundary. The gain curve's own first
+    // segment provides the damping smoothly.
+    double AccelaApply(AppState::AccelaAxis& a, double raw, double threshold)
     {
         static const struct { double x, y; } kGains[] = {
             { 0.0, 0.0 }, { 0.5, 0.4  }, { 1.0, 1.5   }, { 1.5, 8.0   },
@@ -1479,8 +1498,7 @@ namespace
 
         const double delta    = raw - a.lastOutput;
         const double absDelta = fabs(delta);
-        const double corrected = (absDelta > deadzone) ? (absDelta - deadzone) : 0.0;
-        const double normalized = corrected / (threshold > 1e-9 ? threshold : 1e-9);
+        const double normalized = absDelta / (threshold > 1e-9 ? threshold : 1e-9);
 
         double gain = kGains[kN - 1].y;
         if (normalized <= kGains[0].x) gain = kGains[0].y;
@@ -2863,9 +2881,11 @@ namespace
             // (not position) into the view direction. LeiaSR ho[] mapping
             // (matches leia-track-app-XYZ's track_pipeline.h):
             //   ho[0] = pitch (rad), ho[1] = yaw (rad), ho[2] = roll (ignored)
-            // EMA-smooth at alpha 0.15 (~60ms time constant @60fps) to kill
-            // SR-tracker jitter without adding much perceived lag. Roll is
-            // intentionally never applied -- it makes 360 viewing nauseating.
+            // Two-stage filter: OneEuro low-pass first, then Accela's
+            // gain curve (deadzone=0) on top for soft sub-degree damping
+            // without the "still still SNAP" jumps a hard deadzone gives.
+            // Roll is intentionally never applied -- it makes 360 viewing
+            // nauseating.
             float vrYawEffective   = app.vrYaw;
             float vrPitchEffective = app.vrPitch;
             if (IsVRFormat(app.format) && app.vrHeadLook)
@@ -2873,19 +2893,18 @@ namespace
                 double hp[3] = {}, ho[3] = {};
                 if (app.weaver.GetHeadPose(hp, ho))
                 {
-                    // Velocity-aware Accela filter, tuned for SR head tracker
-                    // jitter (which is bigger than VRto3D's typical input):
-                    //   deadzone  = 0.018 rad (~1.0°) -- fully eats the
-                    //               "head still" tracker noise without
-                    //               feeling sticky for real movements.
-                    //   threshold = 0.025 rad (~1.4°) -- comfortable head
-                    //               turns produce per-frame deltas of
-                    //               ~0.04-0.08 rad, landing well into the
-                    //               steep-gain zone for instant follow.
-                    constexpr double kDeadzone  = 0.018;
-                    constexpr double kThreshold = 0.025;
-                    const double yawF   = AccelaApply(app.vrYawFilter,   ho[1], kDeadzone, kThreshold);
-                    const double pitchF = AccelaApply(app.vrPitchFilter, ho[0], kDeadzone, kThreshold);
+                    // Stage 1: OneEuro (no timestamp -> uses fixed 60Hz
+                    // constructor freq, more stable than GetTickCount's
+                    // 15ms granularity at 165Hz render rate).
+                    const float yaw1   = app.vrYawOneEuro  .filter((float)ho[1]);
+                    const float pitch1 = app.vrPitchOneEuro.filter((float)ho[0]);
+                    // Stage 2: Accela gain curve, threshold 0.025 rad
+                    // (~1.4°). Tiny inputs sit in the curve's near-zero
+                    // first segment (soft damping); real head turns
+                    // exceed normalised 1.0 and hit the steep snap zone.
+                    const double yawF   = AccelaApply(app.vrYawAccela,   yaw1,   0.025);
+                    const double pitchF = AccelaApply(app.vrPitchAccela, pitch1, 0.025);
+                    app.vrFilterInit = true;
                     // Negate so "head right -> view right" (raw yaw/pitch
                     // are opposite the viewer's expected direction; matches
                     // leia-track-app's invert_yaw default).
@@ -2893,12 +2912,13 @@ namespace
                     vrPitchEffective -= (float)pitchF;
                 }
             }
-            else
+            else if (app.vrFilterInit)
             {
-                // Reset the filters so the next enable seeds fresh instead
-                // of snapping the view from a stale "last output".
-                app.vrYawFilter.init   = false;
-                app.vrPitchFilter.init = false;
+                app.vrYawOneEuro  .reset();
+                app.vrPitchOneEuro.reset();
+                app.vrYawAccela  .init = false;
+                app.vrPitchAccela.init = false;
+                app.vrFilterInit = false;
             }
             app.converter.SetVRView(vrYawEffective, vrPitchEffective, app.vrZoom);
             // Pane = SWAP CHAIN size, not SR panel size. The weaver samples
