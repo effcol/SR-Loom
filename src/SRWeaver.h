@@ -37,11 +37,6 @@ namespace srw
         // logs + the "About" surface for support diagnostics.
         static const char* GetSRPlatformVersion();
 
-        // Redirect the SR runtime's own log into a file in `logDir` with the
-        // given prefix. Must be called BEFORE the first SRContext is
-        // constructed (per the SDK docs). Safe to call multiple times.
-        static void InitSRLog(const char* logDir, const char* filePrefix);
-
         // Returns true if the (0,0,w,h) region of `hwnd` is at least partially
         // visible (not fully occluded by other windows). Backed by the SR
         // SDK's Window2 (lazily created per HWND). Defaults to true on any

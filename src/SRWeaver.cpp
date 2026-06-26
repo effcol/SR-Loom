@@ -148,17 +148,6 @@ bool SRWeaver::IsWindowPartVisible(HWND hwnd, int width, int height)
     }
 }
 
-void SRWeaver::InitSRLog(const char* logDir, const char* filePrefix)
-{
-    try
-    {
-        SR::Log::initializeToFile(SR::MediumVerbosity,
-                                  logDir ? logDir : "",
-                                  filePrefix ? filePrefix : "sr-");
-    }
-    catch (...) { /* Already initialized or runtime too old -- ignore */ }
-}
-
 const char* SRWeaver::GetSRPlatformVersion()
 {
     try

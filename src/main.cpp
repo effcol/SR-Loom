@@ -3545,11 +3545,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     AppState app;
     g_app = &app;
 
-    // Pipe SR runtime logs into our own log directory at MediumVerbosity
-    // (errors + warnings -- support-debug useful, not noisy). MUST be called
-    // before the first SRContext is constructed.
-    SRWeaver::InitSRLog(ExePath("").c_str(), "srloom-sr-");
-
     // Connect to the SR service.
     if (!app.weaver.CreateContext(10.0))
     {
