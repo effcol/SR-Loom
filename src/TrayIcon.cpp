@@ -24,20 +24,41 @@ TrayIcon::~TrayIcon()
     Remove();
 }
 
+// UTF-8 source strings -> wide (UTF-16) for the W tray API. Source files store
+// non-ASCII glyphs like the em-dash as UTF-8, but Shell_NotifyIconA with the
+// ANSI struct interprets szTip as the system code page, so the em-dash bytes
+// land as garbled multi-byte glyphs. Convert through the W form instead.
+static void Utf8ToWide(const char* in, wchar_t* out, int outChars)
+{
+    const char* src = in ? in : "SR Loom";
+    int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, out, outChars);
+    if (n == 0)
+    {
+        out[0] = L'\0';
+        // Last-resort fallback: copy ASCII bytes 1:1 (will lose any non-ASCII).
+        for (int i = 0; src[i] && i < outChars - 1; ++i) out[i] = (wchar_t)(unsigned char)src[i];
+        out[outChars - 1] = L'\0';
+    }
+    else if (n > outChars)
+    {
+        out[outChars - 1] = L'\0';
+    }
+}
+
 bool TrayIcon::Add(HWND hwnd, const char* tooltip)
 {
     m_hwnd = hwnd;
 
-    NOTIFYICONDATAA nid{};
+    NOTIFYICONDATAW nid{};
     nid.cbSize           = sizeof(nid);
     nid.hWnd             = hwnd;
     nid.uID              = kIconId;
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon            = LoadTrayIcon();
-    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Loom", (int)ARRAYSIZE(nid.szTip));
+    Utf8ToWide(tooltip, nid.szTip, (int)ARRAYSIZE(nid.szTip));
 
-    m_added = Shell_NotifyIconA(NIM_ADD, &nid) != FALSE;
+    m_added = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
     return m_added;
 }
 
@@ -45,11 +66,11 @@ void TrayIcon::Remove()
 {
     if (!m_added) return;
 
-    NOTIFYICONDATAA nid{};
+    NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd   = m_hwnd;
     nid.uID    = kIconId;
-    Shell_NotifyIconA(NIM_DELETE, &nid);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
     m_added = false;
 }
 
@@ -57,13 +78,13 @@ void TrayIcon::SetTooltip(const char* tooltip)
 {
     if (!m_added) return;
 
-    NOTIFYICONDATAA nid{};
+    NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd   = m_hwnd;
     nid.uID    = kIconId;
     nid.uFlags = NIF_TIP;
-    lstrcpynA(nid.szTip, tooltip ? tooltip : "SR Loom", (int)ARRAYSIZE(nid.szTip));
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    Utf8ToWide(tooltip, nid.szTip, (int)ARRAYSIZE(nid.szTip));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 namespace
@@ -248,6 +269,46 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap Eyes");
     AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(fmtMenu), "3D format");
+
+    // Head Tracking submenu: master on/off toggle + protocol checks +
+    // output-mode radios. The compact panel and expanded HEADTRACKING
+    // section also drive these, so this is just a third surface for the
+    // same state -- handy when the GUI window is closed.
+    {
+        HMENU htMenu = CreatePopupMenu();
+        const bool htAnyOn = s.htOpenTrack || s.htFreeTrack || s.htTrackIR;
+        AppendMenuA(htMenu, MF_STRING | (htAnyOn ? MF_CHECKED : MF_UNCHECKED),
+                    ID_TRAY_HT_TOGGLE, "Tracking enabled");
+        AppendMenuA(htMenu, MF_SEPARATOR, 0, nullptr);
+        // Protocols submenu. Each checkable independently; if all are
+        // unchecked the master toggle's checkmark reflects "off".
+        HMENU htProto = CreatePopupMenu();
+        AppendMenuA(htProto, MF_STRING | (s.htOpenTrack ? MF_CHECKED : 0),
+                    ID_TRAY_HT_PROTO_OT,  "OpenTrack UDP");
+        AppendMenuA(htProto, MF_STRING | (s.htFreeTrack ? MF_CHECKED : 0),
+                    ID_TRAY_HT_PROTO_FT,  "FreeTrack 2.0");
+        AppendMenuA(htProto, MF_STRING | (s.htTrackIR ? MF_CHECKED : 0),
+                    ID_TRAY_HT_PROTO_TIR, "TrackIR");
+        AppendMenuA(htMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(htProto), "Protocols");
+        // Output-mode submenu. Radio-style (one checked at a time).
+        // Labels mirror the HEADTRACKING dropdown for visual consistency.
+        HMENU htMode = CreatePopupMenu();
+        static const struct { int mode; const char* label; } kHTModes[] = {
+            { 1, "X, Y, Z, Yaw, Pitch" },
+            { 2, "X, Y, Z" },
+            { 3, "Yaw, Pitch" },
+            { 4, "X, Y, Z, Yaw, Pitch, Roll" },
+            { 5, "Yaw, Pitch, Roll" },
+        };
+        for (int i = 0; i < (int)ARRAYSIZE(kHTModes); ++i)
+        {
+            AppendMenuA(htMode,
+                        MF_STRING | (s.htOutputMode == kHTModes[i].mode ? MF_CHECKED : 0),
+                        ID_TRAY_HT_MODE_BASE + (UINT)i, kHTModes[i].label);
+        }
+        AppendMenuA(htMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(htMode), "Output");
+        AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(htMenu), "Head Tracking");
+    }
 
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");

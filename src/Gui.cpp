@@ -438,15 +438,42 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // Scale everything (font + style + window) to the monitor the window is on, so
     // the panel is the same perceptual size on a 4K/150% display and a 1440p/100%
     // one. WM_DPICHANGED re-applies this when it's dragged between monitors.
-    m_dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_hwnd);
-    ApplyScaling();
-    // Centre on the primary monitor's work area (CW_USEDEFAULT doesn't position a
-    // WS_POPUP window); FitHeightToContent later adjusts the height in place.
-    const int w0 = (int)(460 * m_dpiScale), h0 = (int)(820 * m_dpiScale);
-    RECT wa{}; SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
-    const int x0 = wa.left + ((wa.right - wa.left) - w0) / 2;
-    const int y0 = wa.top  + ((wa.bottom - wa.top) - h0) / 2;
-    SetWindowPos(m_hwnd, nullptr, x0, y0, w0, h0, SWP_NOZORDER | SWP_NOACTIVATE);
+    // Step-by-step logging here (a Win10 19045 crash report -- IsPepsiOk --
+    // landed somewhere between "imgui ready" and the next log line at WinMain;
+    // these breadcrumbs pinpoint it on the next run, and the try/catch keeps
+    // a crash in any of these steps from killing the whole process. We still
+    // return true even on ApplyScaling failure -- ImGui has working defaults
+    // for everything, so the GUI will draw, just with un-scaled fonts.
+    try
+    {
+        Log("Gui::Init: ImGui_ImplWin32_GetDpiScaleForHwnd");
+        m_dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_hwnd);
+        if (m_dpiScale <= 0.0f || m_dpiScale > 8.0f)
+        {
+            Log("Gui::Init: clamping bogus dpiScale=%.2f to 1.0", m_dpiScale);
+            m_dpiScale = 1.0f;
+        }
+        Log("Gui::Init: dpiScale=%.2f -> ApplyScaling", m_dpiScale);
+        ApplyScaling();
+        Log("Gui::Init: ApplyScaling done -> SystemParametersInfo");
+        // Centre on the primary monitor's work area (CW_USEDEFAULT doesn't position a
+        // WS_POPUP window); FitHeightToContent later adjusts the height in place.
+        const int w0 = (int)(460 * m_dpiScale), h0 = (int)(820 * m_dpiScale);
+        RECT wa{}; SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+        const int x0 = wa.left + ((wa.right - wa.left) - w0) / 2;
+        const int y0 = wa.top  + ((wa.bottom - wa.top) - h0) / 2;
+        SetWindowPos(m_hwnd, nullptr, x0, y0, w0, h0, SWP_NOZORDER | SWP_NOACTIVATE);
+        Log("Gui::Init: SetWindowPos done");
+    }
+    catch (std::exception& e)
+    {
+        Log("Gui::Init: post-imgui scaling threw: %s -- continuing with defaults", e.what());
+    }
+    catch (...)
+    {
+        Log("Gui::Init: post-imgui scaling threw unknown exception -- continuing with defaults");
+    }
+    Log("Gui::Init: returning true");
     return true;
 }
 
@@ -469,23 +496,41 @@ void Gui::ApplyScaling()
     // then the built-in font if the bundled files are missing.
     // Bake Inter from the fonts embedded in the exe (no external files). The memory is
     // resource-owned, so FontDataOwnedByAtlas=false keeps ImGui from trying to free it.
-    auto addEmbedded = [&](int resId, float px) -> ImFont* {
+    // Body font range: Latin + a tiny slice of the Arrows block so the
+    // "Launch OpenTrack ↗" button can show the launch arrow inline.
+    // Range includes U+2197 (NORTH EAST ARROW) which Inter ships.
+    static const ImWchar bodyRange[] = {
+        0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
+        0x2190, 0x21FF,   // Arrows (we use U+2197)
+        0,
+    };
+    auto addEmbedded = [&](int resId, float px, const ImWchar* ranges = nullptr) -> ImFont* {
         size_t sz = 0; const void* data = EmbeddedResource(resId, sz);
         if (!data || sz == 0) return nullptr;
         ImFontConfig cfg; cfg.FontDataOwnedByAtlas = false;
-        return io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int)sz, px, &cfg);
+        return io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int)sz, px, &cfg, ranges);
     };
-    m_fontRegular = addEmbedded(IDR_FONT_REGULAR, 17.0f * s);
-    if (!m_fontRegular) m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s);
+    m_fontRegular = addEmbedded(IDR_FONT_REGULAR, 17.0f * s, bodyRange);
+    if (!m_fontRegular) m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s, nullptr, bodyRange);
     if (!m_fontRegular) m_fontRegular = io.Fonts->AddFontDefault();
     ImFont* big = addEmbedded(IDR_FONT_SEMIBOLD, 23.0f * s);
     if (!big)      big = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 23.0f * s);
     m_fontLarge = big ? big : m_fontRegular;
-    // Windows' own caption-button glyphs: Segoe Fluent Icons (Win11) → Segoe MDL2
-    // Assets (Win10). Baked at the native ~10px so the min/max/close look like the OS's.
+    // Windows' own caption-button glyphs: Segoe Fluent Icons (Win11) -> Segoe
+    // MDL2 Assets (Win10). Baked at the native ~10px so the min/max/close
+    // look like the OS's. If BOTH font files fail to load (e.g. corrupted
+    // system fonts directory) we leave m_fontIcons = nullptr -- CaptionButton
+    // and the About popup both null-check it and fall back to drawn glyphs.
     static const ImWchar iconRange[] = { 0xE700, 0xE9FF, 0 };
     m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegoeIcons.ttf", 10.0f * s, nullptr, iconRange);
-    if (!m_fontIcons) m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segmdl2.ttf", 10.0f * s, nullptr, iconRange);
+    if (m_fontIcons) Log("Gui::ApplyScaling: icon font = SegoeIcons.ttf (Win11)");
+    if (!m_fontIcons)
+    {
+        m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segmdl2.ttf", 10.0f * s, nullptr, iconRange);
+        if (m_fontIcons) Log("Gui::ApplyScaling: icon font = segmdl2.ttf (Win10 fallback)");
+    }
+    if (!m_fontIcons)
+        Log("Gui::ApplyScaling: icon font UNAVAILABLE (both SegoeIcons.ttf and segmdl2.ttf failed) -- using drawn-glyph fallback");
     io.Fonts->Build();
     io.FontDefault = m_fontRegular;
     ImGui_ImplDX11_InvalidateDeviceObjects();      // recreate the font texture next frame
@@ -773,7 +818,10 @@ bool Gui::Render(GuiState& state)
     }
 
     // Hero weaving toggle — centred: big "Loom Weaver"/"Loom Weaving" label + switch.
-    ImGui::Dummy(ImVec2(0, 2 * m_dpiScale));
+    // Top gap is collapsed in compact mode so the three status lines below have
+    // real breathing room without the panel overflowing. Expanded mode keeps
+    // the original spacing since vertical space isn't as tight there.
+    ImGui::Dummy(ImVec2(0, (m_expanded ? 2.0f : 0.0f) * m_dpiScale));
     {
         const float winW = ImGui::GetWindowSize().x;
         const char* title = state.weaving ? "Loom Weaving" : "Loom Weaver";
@@ -782,13 +830,18 @@ bool Gui::Render(GuiState& state)
         ImGui::TextUnformatted(title);
         ImGui::PopFont();
 
-        ImGui::Dummy(ImVec2(0, 4 * m_dpiScale));
+        // Title->switch gap: 4px in expanded, 2px in compact (compresses by 2px
+        // to free more room for the status lines below).
+        ImGui::Dummy(ImVec2(0, (m_expanded ? 4.0f : 2.0f) * m_dpiScale));
         const float sw = ImGui::GetFrameHeight() * 1.7f * 1.8f;   // switch width (heightScale 1.7)
         ImGui::SetCursorPosX((winW - sw) * 0.5f);
         if (ToggleSwitch("##weaving", state.weaving, 1.7f)) post(ID_TRAY_TOGGLE_WEAVE);
     }
 
-    // Compact view: two centred lines — the display mode, then the stereo input format.
+    // Compact view: centred status lines -- display mode, stereo input format,
+    // and (when active) "OpenTrack". Each line is dim and centred. We tighten
+    // ItemSpacing for this block + drop the surrounding Dummys when the third
+    // line is shown so the compact panel doesn't visibly grow.
     if (!m_expanded)
     {
         const float winW = ImGui::GetWindowSize().x;
@@ -796,6 +849,29 @@ bool Gui::Render(GuiState& state)
                          : (state.mode == OutputMode::LookingGlass) ? "Looking Glass"
                          : (state.sourceName[0] ? state.sourceName : "Window");
         const char* fmt  = FormatCatLabel(state.format);
+        // Compact-view label for the tracking row. Toggle conveys
+        // on/off, so we never say "On". The label describes WHAT is
+        // being tracked based on the output mode:
+        //   1 (XYZ+YP) / 4 (6DOF)  -> "Head Tracking" (both pos + rot)
+        //   2 (XYZ)               -> "Head Position Tracking"
+        //   3 (YP) / 5 (YPR)      -> "Head Rotation Tracking"
+        // OFF state stays as plain "Head Tracking" so the toggle still
+        // labels itself clearly when greyed.
+        const bool tirShown = state.trackIREnabled && state.trackIRAvailable;
+        const bool  showOt  = state.openTrackEnabled
+                            || state.freeTrackEnabled
+                            || tirShown;
+        const char* trackLabel = "Head Tracking";
+        if (showOt)
+        {
+            switch (state.openTrackMode)
+            {
+                case 2: trackLabel = "Head Position Tracking"; break;
+                case 3:
+                case 5: trackLabel = "Head Rotation Tracking"; break;
+                default: trackLabel = "Head Tracking"; break;
+            }
+        }
         // Truncate an over-long window title to "beginning..." so it fits the panel
         // instead of overflowing off both sides when centred.
         const float avail = winW - 2.0f * ImGui::GetStyle().WindowPadding.x;
@@ -808,14 +884,65 @@ bool Gui::Render(GuiState& state)
         }
         ImGui::Dummy(ImVec2(0, 2 * m_dpiScale));
         ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
+        // Default ItemSpacing.y here -- the hero block above is compressed
+        // in compact mode (Dummy(0) before title, Dummy(2) between title +
+        // toggle) so the three status lines get to breathe at normal
+        // inter-line spacing without the panel overflowing.
         ImGui::SetCursorPosX((winW - ImGui::CalcTextSize(dispS.c_str()).x) * 0.5f);
         ImGui::TextUnformatted(dispS.c_str());
         ImGui::SetCursorPosX((winW - ImGui::CalcTextSize(fmt).x) * 0.5f);
         ImGui::TextUnformatted(fmt);
+        // Head-tracking line: small toggle on the left + protocol summary
+        // text. Toggle is ALWAYS visible (replacing the previous "show only
+        // when active" behaviour) so users can quickly turn tracking off
+        // without diving into the dropdown -- important because while
+        // tracking is on, the SR camera is engaged. Click = enable all 3
+        // protocols (resets to the everything-on default). Click while
+        // on = disable all 3, which tears the bridge listener down and
+        // releases the camera. Per-protocol fine-tuning still lives in the
+        // expanded HEADTRACKING section.
+        {
+            // OFF: just "Head Tracking" (toggle's off-state colour conveys
+            // the state, no need for the "Off" suffix).
+            const char* ot = showOt ? trackLabel : "Head Tracking";
+            const float th  = ImGui::GetTextLineHeight();
+            const float swH = ImGui::GetFrameHeight() * 0.55f;   // toggle height
+            const float swW = swH * 1.8f;                        // toggle width
+            const float gap = 0.45f * th;
+            const float textW = ImGui::CalcTextSize(ot).x;
+            const float groupW = swW + gap + textW;
+            const float startX = (winW - groupW) * 0.5f;
+            const float startY = ImGui::GetCursorPosY();
+            // Toggle on the left, vertically centred against the text line.
+            ImGui::SetCursorPos(ImVec2(startX, startY + (th - swH) * 0.5f));
+            if (ToggleSwitch("##ht_compact", showOt, 0.55f))
+            {
+                if (showOt)
+                {
+                    // Was on -> turn everything off.
+                    state.openTrackEnabled = false;
+                    state.freeTrackEnabled = false;
+                    state.trackIREnabled   = false;
+                }
+                else
+                {
+                    // Was off -> enable everything (TrackIR included since
+                    // the embedded NPClient.dll is always available now).
+                    state.openTrackEnabled = true;
+                    state.freeTrackEnabled = true;
+                    state.trackIREnabled   = true;
+                }
+                state.openTrackChanged = true;
+            }
+            // Text sits to the right of the toggle on the same baseline.
+            ImGui::SameLine(0, gap);
+            ImGui::SetCursorPosY(startY);
+            ImGui::TextUnformatted(ot);
+        }
         ImGui::PopStyleColor();
     }
 
-    ImGui::Dummy(ImVec2(0, 4 * m_dpiScale));
+    ImGui::Dummy(ImVec2(0, (m_expanded ? 4 : 2) * m_dpiScale));
 
     // Expand/collapse control. Collapsed by default → the panel is just the on/off
     // toggle (defaulting to fullscreen SBS); expand to reveal output + conversion.
@@ -1233,7 +1360,11 @@ bool Gui::Render(GuiState& state)
             }
         }
 
-        Section("ADJUST");
+        // Swap Eyes + Convergence used to live under their own ADJUST heading;
+        // for v2.0 they roll up into the surrounding STEREO 3D INPUT (or
+        // VR VIEWER / LIGHT FIELD when those conditional sections render),
+        // since they're adjustments to the input rather than a category of
+        // their own. Saves a heading + a few pixels in the panel.
         if (RowToggle("Swap Eyes", state.swapEyes)) post(ID_TRAY_SWAP_EYES);
         // Two depth controls: convergence (zero-plane shift) + separation (depth scale).
         auto adjSlider = [&](const char* label, const char* id, float* v) -> bool {
@@ -1253,6 +1384,203 @@ bool Gui::Render(GuiState& state)
             return ch;
         };
         if (adjSlider("Convergence", "##conv", &state.convergence)) convChanged = true;
+
+        // HEADTRACKING section -- non-collapsible, sits right after ADJUST.
+        // OpenTrack UDP toggle + mode buttons + Calibrate + Launch OpenTrack.
+        // Defaults ON whenever an SR session is active; user toggle overrides
+        // for the rest of that session (cleared on session end).
+        Section("HEADTRACKING");
+        {
+            // Protocol picker: checkbox-combo over OpenTrack UDP +
+            // FreeTrack 2.0 Enhanced. Either, both, or none can be active;
+            // the bridge fans the same filtered pose to whichever are on.
+            // Preview text reflects the active set so a glance reads what's
+            // running without opening the menu.
+            const float avail = ImGui::GetContentRegionAvail().x;
+            const float gap   = ImGui::GetStyle().ItemSpacing.x;
+            {
+                // Build preview text from the active set. TrackIR included
+                // only when both selected AND available; if the user has it
+                // ticked but OpenTrack is no longer detected, we treat it
+                // as off for preview purposes.
+                const bool tirActive = state.trackIREnabled && state.trackIRAvailable;
+                std::string previewBuf;
+                auto add = [&](const char* s) {
+                    if (!previewBuf.empty()) previewBuf += " + ";
+                    previewBuf += s;
+                };
+                if (state.openTrackEnabled) add("OpenTrack UDP");
+                if (state.freeTrackEnabled) add("FreeTrack 2.0");
+                if (tirActive)              add("TrackIR");
+                if (previewBuf.empty())     previewBuf = "Off";
+
+                ImGui::SetNextItemWidth(avail);
+                if (ImGui::BeginCombo("##otprotos", previewBuf.c_str()))
+                {
+                    if (ImGui::Checkbox("OpenTrack UDP", &state.openTrackEnabled))
+                        state.openTrackChanged = true;
+                    if (ImGui::Checkbox("FreeTrack 2.0", &state.freeTrackEnabled))
+                        state.openTrackChanged = true;
+                    // TrackIR row. The NPClient DLL is now embedded in
+                    // SRLoom.exe and extracted at first launch, so this
+                    // checkbox is always live -- no install hint needed.
+                    if (ImGui::Checkbox("TrackIR", &state.trackIREnabled))
+                        state.openTrackChanged = true;
+                    ImGui::EndCombo();
+                }
+            }
+            // Axis mask dropdown. The pipeline always tracks 6DOF; this
+            // just gates which axes go out on the wire so games that
+            // misbehave on (e.g.) translation can be restricted to rotation.
+            // Two labels per mode: a terse "axes" preview (shown when the
+            // combo is closed) and a longer explainer (shown only in the
+            // open list) carried over from the original SR OpenTrack Bridge.
+            // Two-tone labels: terse axis list + dim parenthetical. The
+            // parenthetical only shows in the open list; the closed combo
+            // preview stays short. Strings split so we can render them in
+            // different colours below.
+            static const struct { int mode; const char* preview; const char* axes; const char* note; } kModes[] = {
+                { 1, "X, Y, Z, Yaw, Pitch",       "X, Y, Z, Yaw, Pitch",       "(Head Position + Head Rotation aka 6DOF)" },
+                { 2, "X, Y, Z",                   "X, Y, Z",                   "(Head Position)" },
+                { 3, "Yaw, Pitch",                "Yaw, Pitch",                "(Head Rotation aka 3DOF)" },
+                { 4, "X, Y, Z, Yaw, Pitch, Roll", "X, Y, Z, Yaw, Pitch, Roll", "(Roll Unnecessary, Not Recommended)" },
+                { 5, "Yaw, Pitch, Roll",          "Yaw, Pitch, Roll",          "(Roll Unnecessary, Not Recommended)" },
+            };
+            // Any protocol on -> section is "live". When all are off, grey
+            // out the mode / invert / calibrate controls (they're config for
+            // a pipeline that isn't running). TrackIR only counts if the
+            // OpenTrack install is detected -- ticked-but-unavailable is
+            // effectively off.
+            const bool  ena   = state.openTrackEnabled
+                              || state.freeTrackEnabled
+                              || (state.trackIREnabled && state.trackIRAvailable);
+            if (!ena) ImGui::BeginDisabled();
+            int curIdx = 0;
+            for (int i = 0; i < (int)IM_ARRAYSIZE(kModes); ++i)
+                if (kModes[i].mode == state.openTrackMode) { curIdx = i; break; }
+            ImGui::SetNextItemWidth(avail);
+            if (ImGui::BeginCombo("##otmode", kModes[curIdx].preview))
+            {
+                const ImU32 colNorm = ImGui::GetColorU32(ImGuiCol_Text);
+                const ImU32 colDim  = ImGui::GetColorU32(g_dim);
+                const float gapBetween = ImGui::CalcTextSize(" ").x;
+                for (int i = 0; i < (int)IM_ARRAYSIZE(kModes); ++i)
+                {
+                    const bool sel = (i == curIdx);
+                    // Selectable owns the click + hover highlight. The
+                    // hidden label keeps each item unique; we overlay the
+                    // visible two-tone text after via the drawlist so the
+                    // parenthetical can be dimmed without dimming the axes.
+                    ImGui::PushID(i);
+                    const ImVec2 rowTL = ImGui::GetCursorScreenPos();
+                    if (ImGui::Selectable("##sel", sel))
+                    {
+                        state.openTrackMode    = kModes[i].mode;
+                        state.openTrackChanged = true;
+                    }
+                    if (sel) ImGui::SetItemDefaultFocus();
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const float rowH = ImGui::GetItemRectSize().y;
+                    const float th   = ImGui::GetTextLineHeight();
+                    const float ty   = rowTL.y + (rowH - th) * 0.5f;
+                    const float xPad = ImGui::GetStyle().ItemSpacing.x * 0.5f;
+                    dl->AddText(ImVec2(rowTL.x + xPad, ty), colNorm, kModes[i].axes);
+                    const float axesW = ImGui::CalcTextSize(kModes[i].axes).x;
+                    dl->AddText(ImVec2(rowTL.x + xPad + axesW + gapBetween, ty),
+                                colDim, kModes[i].note);
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+
+            // Invert axes -- checkbox-combo. Preview text lists the axes
+            // currently inverted (or "None"), so a glance at the closed
+            // combo tells the user what's flipped. Open it to flip
+            // individual axes without it closing on click.
+            struct InvAxis { const char* label; bool* flag; };
+            const InvAxis kAxes[] = {
+                { "X",     &state.openTrackInvertX     },
+                { "Y",     &state.openTrackInvertY     },
+                { "Z",     &state.openTrackInvertZ     },
+                { "Yaw",   &state.openTrackInvertYaw   },
+                { "Pitch", &state.openTrackInvertPitch },
+                { "Roll",  &state.openTrackInvertRoll  },
+            };
+            std::string preview = "Invert: ";
+            bool anyInv = false;
+            for (const auto& a : kAxes)
+            {
+                if (*a.flag)
+                {
+                    if (anyInv) preview += ", ";
+                    preview += a.label;
+                    anyInv = true;
+                }
+            }
+            if (!anyInv) preview += "None";
+            ImGui::SetNextItemWidth(avail);
+            if (ImGui::BeginCombo("##otinvert", preview.c_str()))
+            {
+                for (const auto& a : kAxes)
+                {
+                    // Keep the combo open across clicks so the user can
+                    // toggle several axes in one session.
+                    if (ImGui::Checkbox(a.label, a.flag))
+                        state.openTrackChanged = true;
+                }
+                ImGui::EndCombo();
+            }
+
+            // Calibrate + Launch OpenTrack on a third row, half-and-half.
+            const float halfBw = (avail - gap) * 0.5f;
+            if (ImGui::Button("Calibrate", ImVec2(halfBw, 0)))
+                state.openTrackCalibrate = true;
+            if (!ena) ImGui::EndDisabled();
+            ImGui::SameLine(0, gap);
+            const bool hasExe = state.openTrackExePath[0] != '\0';
+            // U+2197 NORTH EAST ARROW = the standard "external launch"
+            // glyph used across the OS. Custom render: empty Button takes
+            // the click; we draw "Launch OpenTrack" + arrow ourselves so
+            // there's no inter-glyph gap and the arrow can be nudged up to
+            // sit on the cap line (Inter's U+2197 baseline-aligns low). If
+            // OpenTrack is installed we launch it; otherwise we open the
+            // project page so the user can download it.
+            const ImVec2 btnTL = ImGui::GetCursorScreenPos();
+            const bool clicked = ImGui::Button("##launchot", ImVec2(halfBw, 0));
+            if (clicked)
+            {
+                if (hasExe)
+                    ShellExecuteA(nullptr, "open", state.openTrackExePath,
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+                else
+                    ShellExecuteA(nullptr, "open",
+                                  "https://github.com/opentrack/opentrack",
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip(hasExe ? "Launch OpenTrack"
+                                         : "OpenTrack not installed -- open the project page");
+            }
+            {
+                const char* lbl = "Launch OpenTrack";
+                const char* arr = "\xE2\x86\x97";
+                const ImVec2 lblSz = ImGui::CalcTextSize(lbl);
+                const ImVec2 arrSz = ImGui::CalcTextSize(arr);
+                const float totalW = lblSz.x + arrSz.x;
+                const float btnH = ImGui::GetItemRectSize().y;
+                const float baseY = btnTL.y + (btnH - lblSz.y) * 0.5f;
+                const float startX = btnTL.x + (halfBw - totalW) * 0.5f;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddText(ImVec2(startX, baseY), col, lbl);
+                // Nudge the arrow up so its visual centre matches the cap
+                // line of the surrounding text. ~10% of line height is the
+                // typical ascender offset for arrows in body fonts.
+                const float arrYAdj = -0.10f * lblSz.y;
+                dl->AddText(ImVec2(startX + lblSz.x, baseY + arrYAdj), col, arr);
+            }
+        }
 
         // Acer SpatialLabs: surface Acer's auto-detect registry toggles when an
         // Acer display is present. Those auto-detects tend to fight SR Loom (auto-

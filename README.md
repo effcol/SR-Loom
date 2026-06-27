@@ -11,8 +11,9 @@ panels). Point it at your screen, a window, or a floating "looking glass," pick
 the stereo format your content is in, and it converts and weaves it with
 head-tracked depth — no glasses.
 
-> **v1.3** — single self-contained `SRLoom.exe`. Requires a Simulated Reality
-> display and the SR Platform runtime installed.
+> **v2.0** — single self-contained `SRLoom.exe`. Adds head-tracking output
+> for PC games (OpenTrack UDP + FreeTrack 2.0 + TrackIR via embedded NPClient).
+> Requires a Simulated Reality display and the SR Platform runtime installed.
 
 ## What it does
 
@@ -40,6 +41,51 @@ capture (screen / window)  ->  convert any stereo format to SBS  ->  weave  ->  
 - **Make active window 3D** — weave whatever window you're using (Ctrl+Alt+C).
 - **Looking Glass** — a floating, draggable/resizable 3D viewport.
 
+### Head tracking output to games
+
+SR Loom forwards the SR display's head pose to PC games as head-look input, so
+flight sims, racing titles, and any TrackIR/freetrack/OpenTrack-aware game gets
+free head tracking from the SR camera — no extra hardware. Three output
+protocols co-broadcast by default:
+
+- **OpenTrack UDP** (`127.0.0.1:4242`) — modern indie sims (some MSFS plugins,
+  flight sims that support OpenTrack natively).
+- **FreeTrack 2.0 Enhanced** — DCS World, Falcon BMS, IL-2, MSFS, X-Plane,
+  Project CARS, Elite Dangerous, Star Citizen, etc.
+- **TrackIR (NaturalPoint NPClient)** — iRacing, FSX/P3D, ArmA, Codemasters
+  racers, every "serious sim". The NPClient.dll is embedded in SRLoom.exe and
+  extracted to `%LOCALAPPDATA%\SRLoom\NPClient\` on first launch; no OpenTrack
+  install required. If OpenTrack is already installed and its registry entry
+  points at its own NPClient, SR Loom defers to it.
+
+The pipeline: filtered SR eye-pair midpoint (position) + SR head pose
+orientation → OneEuro + OpenTrack-style Accela on rotation → per-axis
+sensitivity / invert / offset → output fan-out. Pose is also masked to the
+user's chosen DOF set (XYZ + Yaw/Pitch / XYZ-only / Yaw/Pitch / 6DOF /
+Yaw/Pitch/Roll).
+
+**Default mode is XYZ + Yaw/Pitch** — position + look direction, the format
+the broadest range of titles consume (sims, racing, action games with
+head-look). Position data is sourced from the SR runtime's *filtered*
+eye-pair stream (`SR::EyeTracker::create()`) rather than the raw head-pose
+tracker — the same data SR-native head-tracked titles (*The First Berserker:
+Khazan*, *Lies of P*, *Stellar Blade*, *Hell is Us*) consume, so the
+smoothness matches.
+
+There's a tiny inherent quirk: because the eye-pair midpoint sits a few cm
+in front of the head's rotation pivot, turning your head produces a small
+position drift as the midpoint traces an arc. This is geometric — the same
+artifact SR-native games exhibit — and not something we can cleanly subtract
+without re-introducing rotation noise. The XYZ-only mode (option 2) is there
+for the rare case where this matters.
+
+Right-click the tray icon → **Head Tracking** to toggle the master, pick
+individual protocols, and pick output mode. The compact GUI panel has a small
+on/off toggle for one-click "release the camera" — when all outputs are off,
+SR Loom's SR context is destroyed entirely and the head-pose camera goes
+off (unless the weaver itself is running, which keeps the camera engaged
+for its own late-latching).
+
 ## Controls
 
 Left-click the tray icon for the control panel; right-click for a quick menu.
@@ -47,6 +93,7 @@ Left-click the tray icon for the control panel; right-click for a quick menu.
 - **Ctrl+Alt+W** — toggle weaving on/off
 - **Ctrl+Alt+F** — switch Fullscreen ⇄ Looking Glass
 - **Ctrl+Alt+C** — make the active window 3D (press again to turn it off)
+- **Ctrl+Alt+R** — recenter head tracking (snap the current head pose to neutral)
 
 The panel has a compact mode (just the on/off switch + a status line) and an
 expanded mode with the display, stereo-input, and depth (convergence) controls,

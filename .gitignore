@@ -48,3 +48,9 @@ tools/sweep_*/
 
 # Local-only release-notes draft; not shipped in repo.
 /CHANGELOG.md
+
+# NPClient64.dll is rebuilt from third_party/npclient/npclient.c every CMake
+# build (POST_BUILD copy into this dir so the RC compiler can embed it). The
+# DLL is an artifact of the build, not a source file -- keep the source dir
+# clean.
+/assets/npclient/NPClient64.dll

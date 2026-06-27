@@ -81,6 +81,16 @@ namespace srw
     constexpr UINT ID_TRAY_FP_BASE = 43200;
     constexpr UINT ID_TRAY_FP_MAX  = 43219;
 
+    // Head tracking submenu. Master toggle, per-protocol checks,
+    // per-output-mode radios. Bases keep room for future protocols /
+    // output modes without shifting later ranges.
+    constexpr UINT ID_TRAY_HT_TOGGLE     = 43300;
+    constexpr UINT ID_TRAY_HT_PROTO_OT   = 43301; // OpenTrack UDP
+    constexpr UINT ID_TRAY_HT_PROTO_FT   = 43302; // FreeTrack 2.0
+    constexpr UINT ID_TRAY_HT_PROTO_TIR  = 43303; // TrackIR (NPClient)
+    constexpr UINT ID_TRAY_HT_MODE_BASE  = 43310; // +0..+4 -> outputMode 1..5
+    constexpr UINT ID_TRAY_HT_MODE_MAX   = 43319;
+
     // State the context menu reflects (checkmarks).
     struct MenuState
     {
@@ -95,6 +105,13 @@ namespace srw
         int          pulfrichDelay;   // 1..4
         int          pulfrichNd;      // index into PulfrichNdLevels
         int          framePackMode;   // index into FramePackPresets
+        // Head-tracking state -- exposed here so the right-click tray menu
+        // shows live checkmarks for the master toggle, per-protocol output
+        // selection, and the axis-mask (output mode) chosen.
+        bool         htOpenTrack;     // OpenTrack UDP active?
+        bool         htFreeTrack;     // FreeTrack 2.0 active?
+        bool         htTrackIR;       // TrackIR (NPClient) active?
+        int          htOutputMode;    // 1..5 -- see opentrack_pipeline.h
     };
 
     class TrayIcon

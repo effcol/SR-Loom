@@ -55,6 +55,46 @@ namespace srw
         float        lfpHeadLeanMm   = 30.0f;
         float        lfpApertureMm   = 0.0f;   // physical aperture diameter (for slider min)
         bool         lfpHeadLeanChanged = false;
+        // OpenTrack bridge state (read+write). enabled = on/off toggle.
+        // sensYaw/Pitch/Roll = per-axis multiplier (degrees out per degree
+        // tracked). outputMode = 1..5 per Bridge convention. calibrateNow
+        // is a transient request flag the GUI sets when the user clicks
+        // Calibrate; main clears it after applying. sentPackets is a
+        // diagnostic read-only counter shown under "Status".
+        bool         openTrackEnabled   = false;
+        // FreeTrack 2.0 Enhanced co-broadcast. Independent of OpenTrack
+        // UDP -- both can be on at once and games will only receive
+        // pose via whichever protocol they're built to read.
+        bool         freeTrackEnabled   = false;
+        // TrackIR via OpenTrack's NPClient.dll. Shares FT_SharedMem with
+        // FreeTrack (NPClient is just a second consumer over the same
+        // mapping). Only available when OpenTrack is installed -- main
+        // probes the NaturalPoint registry + DLL files at startup and
+        // sets trackIRAvailable. When unavailable, the dropdown entry
+        // is greyed with a "(Please install OpenTrack)" hint.
+        bool         trackIREnabled     = false;
+        bool         trackIRAvailable   = false;
+        float        openTrackSensYaw   = 1.0f;
+        float        openTrackSensPitch = 1.0f;
+        float        openTrackSensRoll  = 1.0f;
+        int          openTrackMode      = 1;
+        // Per-axis invert flags. Defaults match OpenTrack's left-handed
+        // convention (X + Yaw inverted) so the toggle works out-of-box
+        // for the typical game; the other four are user-tweakable for
+        // titles that mirror an axis the wrong way.
+        bool         openTrackInvertX     = true;
+        bool         openTrackInvertY     = false;
+        bool         openTrackInvertZ     = false;
+        bool         openTrackInvertYaw   = true;
+        bool         openTrackInvertPitch = false;
+        bool         openTrackInvertRoll  = false;
+        bool         openTrackChanged   = false;
+        bool         openTrackCalibrate = false;
+        uint64_t     openTrackSentPackets = 0;
+        // Launch-OpenTrack convenience: filled by main at startup with the
+        // detected opentrack.exe path (empty if not installed). GUI shows
+        // an "Open OpenTrack" button when non-empty.
+        char         openTrackExePath[260] = "";
     };
 
     class Gui
@@ -100,6 +140,7 @@ namespace srw
         bool                     m_acerNeedsAdmin = false;  // last Acer SpatialLabs write was ACCESS_DENIED
         bool                     m_acerSectionOpen = false; // ACER SPATIALLABS section expanded?
         bool                     m_startupSectionOpen = false; // STARTUP section expanded?
+        bool                     m_openTrackSectionOpen = false; // OPENTRACK section expanded?
         // STARTUP-section state, cached from HKCU at Init() so toggling doesn't
         // read the registry per frame.
         bool                     m_runAtStartup = false;

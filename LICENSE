@@ -35,6 +35,25 @@ Bundled third-party components (all permissive / MIT-compatible):
     assets/fonts/Inter-OFL.txt.
   - third_party/stb_image.h : public domain / MIT (Sean Barrett), used for
     image loading.
+  - third_party/one_euro_filter.h : "1 Euro Filter" -- speed-adaptive
+    low-pass filter by Gery Casiez, Nicolas Roussel, Daniel Vogel
+    (CHI 2012). Original BSD 3-Clause License (Casiez/Roussel 2019).
+    Used in the VR head-tracked viewer and the OpenTrack pipeline.
+  - SR OpenTrack Bridge (https://github.com/effcol/leia-track-app-XYZ) :
+    MIT License. The OpenTrack UDP sender (third_party/opentrack_udp.h)
+    and the head-pose -> OneEuro -> OpenTrack mapping pipeline
+    (third_party/opentrack_pipeline.h, src/OpenTrackBridge.{h,cpp}) are
+    ported from this project.
+  - NPClient.dll (TrackIR consumer API) : MIT License. Original author
+    "uglyDwarf" via the Linuxtrack project
+    (https://github.com/uglyDwarf/linuxtrack), subsequently maintained
+    in OpenTrack's contrib/npclient
+    (https://github.com/opentrack/opentrack). Vendored verbatim into
+    third_party/npclient/npclient.c (apart from an added attribution
+    header), built as a free-standing Windows DLL by CMake and embedded
+    into SRLoom.exe as RCDATA. Extracted at first launch to
+    %LOCALAPPDATA%\SRLoom\NPClient\ so TrackIR-compatible games can
+    load it without users installing OpenTrack separately.
 
 Attribution:
   - The HDMI 1.4 frame-packing decode in src/Converter.cpp was informed by

@@ -7,3 +7,9 @@ IDI_TRAY ICON "../assets/sr_weaver.ico"
 // resources at runtime so no font files need to ship beside the executable.
 IDR_FONT_REGULAR  RCDATA "../assets/fonts/Inter-Regular.ttf"
 IDR_FONT_SEMIBOLD RCDATA "../assets/fonts/Inter-SemiBold.ttf"
+
+// NPClient.dll (x64) — TrackIR consumer DLL games load to receive head pose.
+// Built by CMake from third_party/npclient/npclient.c (MIT, OpenTrack contrib)
+// and copied here by the NPClient64 POST_BUILD step. Extracted on first launch
+// to %LOCALAPPDATA%\SRLoom\NPClient\NPClient64.dll.
+IDR_NPCLIENT64    RCDATA "../assets/npclient/NPClient64.dll"

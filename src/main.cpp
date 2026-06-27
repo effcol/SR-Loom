@@ -17,6 +17,7 @@
 #include "KatangaSource.h"
 #include "LFPReader.h"
 #include "LFPRenderer.h"
+#include "OpenTrackBridge.h"
 #include "../third_party/one_euro_filter.h"
 #include "resource.h"
 
@@ -25,13 +26,33 @@
 #include <commdlg.h>
 #include <windowsx.h>
 #include <shellapi.h>      // DragAcceptFiles, DragQueryFile, DragFinish
+#include <shlobj.h>        // SHGetKnownFolderPath, SHCreateDirectoryExW (NPClient extract)
 #include <cmath>
 #include <vector>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "advapi32.lib")  // RegOpenKeyEx / RegCreateKeyEx / RegSetValueEx
 
 using namespace srw;
+
+namespace {
+    // Lookup an embedded RCDATA resource (e.g. NPClient64.dll) by id ->
+    // pointer + size. Module-owned memory, valid for the process lifetime.
+    // Duplicated from Gui.cpp's anonymous-namespace helper to avoid
+    // making EmbeddedResource a public srw:: symbol just for one call site.
+    const void* LookupEmbeddedResource(int id, size_t& size)
+    {
+        size = 0;
+        HMODULE mod = GetModuleHandleA(nullptr);
+        HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(id), (LPCSTR)RT_RCDATA);
+        if (!res) return nullptr;
+        HGLOBAL h = LoadResource(mod, res);
+        if (!h) return nullptr;
+        size = SizeofResource(mod, res);
+        return LockResource(h);
+    }
+}
 
 // --- Undocumented NtQuerySystemInformation plumbing -----------------------
 // Used to identify the Katanga publishing process via shared-kernel-object
@@ -68,10 +89,11 @@ namespace
 {
     constexpr char  kWindowClass[] = "SRWeaverWindow";
     constexpr char  kWindowTitle[] = "SR Loom";
-    constexpr int   kHotkeyToggle  = 1;   // Ctrl+Alt+W : enable/disable weaving
-    constexpr int   kHotkeyMode    = 2;   // Ctrl+Alt+F : fullscreen/windowed
-    constexpr int   kHotkeyCapture = 3;   // Ctrl+Alt+C : make active window 3D
-    constexpr int   kHotkeyDetect  = 5;   // Ctrl+Alt+D : auto-detect stereo format
+    constexpr int   kHotkeyToggle    = 1;   // Ctrl+Alt+W : enable/disable weaving
+    constexpr int   kHotkeyMode      = 2;   // Ctrl+Alt+F : fullscreen/windowed
+    constexpr int   kHotkeyCapture   = 3;   // Ctrl+Alt+C : make active window 3D
+    constexpr int   kHotkeyDetect    = 5;   // Ctrl+Alt+D : auto-detect stereo format
+    constexpr int   kHotkeyCalibrate = 6;   // Ctrl+Alt+R : recenter head tracking
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     struct AppState
@@ -88,6 +110,20 @@ namespace
         VideoSource  video;          // active video file source (mp4/mov/etc), if any
         KatangaSource katanga;       // shared-texture receiver for Bo3b Katanga (Geo-11 etc.)
         LFPRenderer  lfpRenderer;    // per-frame plenoptic SBS render (head-tracked aperture)
+        OpenTrackBridge openTrack;   // SR head-pose -> OneEuro -> OpenTrack UDP. Off by default.
+        std::string  openTrackExePath; // detected opentrack.exe path (empty if not installed)
+        // NaturalPoint registry says where NPClient.dll/NPClient64.dll live.
+        // When set + both DLLs exist, OpenTrack's NPClient stack is usable
+        // and SR Loom enables TrackIR output by writing the same
+        // FT_SharedMem the DLL reads from. Empty when not detected; GUI
+        // greys the TrackIR checkbox + shows "(Please install OpenTrack)".
+        std::string  npClientDir;
+        // Auto-enable policy: OpenTrack turns on with each SR session and off when it
+        // ends. The user toggle in ADJUST can override -- if the user disables it mid-
+        // session we set openTrackUserDisabled, then suppress the auto-enable on the
+        // next session start. The flag clears whenever a session ends, so the auto-on
+        // behaviour resumes from the next fresh weave.
+        bool         openTrackUserDisabled = false;
                                      // Bound when format==Katanga; the render loop
                                      // arms/engages based on receiver state. Game-exit
                                      // detection lives in KatangaSource itself (it
@@ -1551,9 +1587,23 @@ namespace
             app.captureRebind = true;   // re-register the converter output
             ApplyMode(app);
             ShowWindow(app.hwnd, katangaArmed ? SW_HIDE : SW_SHOW);
+            // Opportunistic Enable on weave-start, in case the initial
+            // Enable at app launch failed (e.g. SR Platform service was
+            // still spinning up). Skipped if the user explicitly disabled
+            // tracking via the GUI toggle. Bridge owns its own SRContext,
+            // so this neither creates nor depends on the weaver context.
+            // We re-apply the launch-time output set (OT + FT, plus TIR if
+            // NPClient was detected) so a startup-failed TrackIR can come
+            // online once SR Platform is up.
+            if (!app.openTrackUserDisabled && !app.openTrack.IsEnabled())
+                app.openTrack.SetOutputs(true, true, !app.npClientDir.empty());
         }
         else
         {
+            // OpenTrack stays running across weave-stop: tracking is an
+            // always-on background service, the weave is the on-demand
+            // foreground. The user's GUI toggle is the only thing that
+            // turns the bridge off.
             // Hide and fully release SR so the lens and camera turn off.
             ShowWindow(app.hwnd, SW_HIDE);
             HideFsCtrlOverlay();
@@ -2962,7 +3012,11 @@ namespace
                 MenuState ms{ app->weavingEnabled, app->mode, app->source,
                               app->format, app->swapEyes, app->anaglyphCombo, app->anaglyphMode,
                               app->pulfrichMode, app->pulfrichDelay, app->pulfrichNd,
-                              app->framePackMode };
+                              app->framePackMode,
+                              app->openTrack.IsOpenTrackEnabled(),
+                              app->openTrack.IsFreeTrackEnabled(),
+                              app->openTrack.IsTrackIREnabled(),
+                              app->openTrack.GetConfig().outputMode };
                 app->tray.ShowContextMenu(hwnd, ms);
             }
             else if (app && LOWORD(lParam) == WM_LBUTTONUP)
@@ -3328,6 +3382,44 @@ namespace
                 EnsureWeaving(*app);
                 return 0;
             case ID_TRAY_EXIT: DestroyWindow(hwnd); return 0;
+            case ID_TRAY_HT_TOGGLE:
+            {
+                // Master tracking toggle: any on -> all off; all off ->
+                // restore the everything-on default. Same semantics as
+                // the small toggle in the compact GUI panel; openTrack-
+                // UserDisabled is updated by the SetOutputs result so
+                // the auto-on-on-weave-start path respects this choice.
+                const bool anyOn = app->openTrack.IsEnabled();
+                app->openTrack.SetOutputs(!anyOn, !anyOn, !anyOn);
+                app->openTrackUserDisabled = anyOn;   // "anyOn" was true -> we just turned off
+                return 0;
+            }
+            case ID_TRAY_HT_PROTO_OT:
+            case ID_TRAY_HT_PROTO_FT:
+            case ID_TRAY_HT_PROTO_TIR:
+            {
+                bool ot  = app->openTrack.IsOpenTrackEnabled();
+                bool ft  = app->openTrack.IsFreeTrackEnabled();
+                bool tir = app->openTrack.IsTrackIREnabled();
+                if (cmd == ID_TRAY_HT_PROTO_OT)  ot  = !ot;
+                if (cmd == ID_TRAY_HT_PROTO_FT)  ft  = !ft;
+                if (cmd == ID_TRAY_HT_PROTO_TIR) tir = !tir;
+                app->openTrack.SetOutputs(ot, ft, tir);
+                app->openTrackUserDisabled = !(ot || ft || tir);
+                return 0;
+            }
+            }
+            // Head-tracking output-mode radios (range).
+            if (cmd >= ID_TRAY_HT_MODE_BASE && cmd <= ID_TRAY_HT_MODE_MAX)
+            {
+                const int idx = (int)(cmd - ID_TRAY_HT_MODE_BASE);
+                // Map menu index (0..4) -> pipeline mode value (1..5) --
+                // they're aligned 1:1 in the kHTModes order in TrayIcon.cpp.
+                const int mode = idx + 1;
+                auto cfg = app->openTrack.GetConfig();
+                cfg.outputMode = mode;
+                app->openTrack.SetConfig(cfg);
+                return 0;
             }
             break;
         }
@@ -3353,6 +3445,14 @@ namespace
                     CaptureForeground(*app);
             }
             // else if (wParam == kHotkeyDetect)  DetectFormat(*app); // auto-detect disabled
+            else if (wParam == kHotkeyCalibrate)
+            {
+                // Recenter head tracking: snap the current head pose to
+                // "neutral" so games see (0,0,0) / (0,0,0) at the user's
+                // current position + orientation. No-op if the bridge
+                // isn't enabled (no listener => no last pose to snap from).
+                app->openTrack.CalibrateNeutral();
+            }
             return 0;
 
         case WM_SIZE:
@@ -3692,6 +3792,213 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     Log("WinMain: detector.Initialize done");
     app.captureRebind = true;   // bind the weaver to the converter output on the first frame
 
+    // Entire post-detector block is wrapped in try/catch so a failure anywhere
+    // here (Win32 registry, FS, SR context creation) degrades head tracking
+    // instead of taking the whole app down. Multiple bug reports landed
+    // (issue #1, IsPepsiOk's report) with Samsung Odyssey + Win10 22H2 silently
+    // exiting somewhere in this window -- without the catch the process dies
+    // before reaching the tray, leaving the user with no UI surface at all.
+    try
+    {
+    Log("WinMain: head-tracking bootstrap begin");
+
+    // Best-effort detection of opentrack.exe so the GUI's "Open OpenTrack"
+    // button can launch it directly. Looks in common install locations;
+    // empty string if not found (button just hidden).
+    {
+        const char* paths[] = {
+            "C:\\Program Files\\opentrack\\opentrack.exe",
+            "C:\\Program Files (x86)\\opentrack\\opentrack.exe",
+        };
+        for (const char* p : paths)
+        {
+            DWORD attr = GetFileAttributesA(p);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            {
+                app.openTrackExePath = p;
+                Log("OpenTrack: detected at %s", p);
+                break;
+            }
+        }
+    }
+
+    // TrackIR-via-NPClient bootstrap. Games speak TrackIR by loading
+    // NPClient(64).dll, whose location they read from
+    // HKLM\Software\NaturalPoint\NATURALPOINT\NPClient Location.
+    //
+    // We extract our embedded NPClient64.dll (built from OpenTrack's
+    // contrib/npclient source, MIT) to %LOCALAPPDATA%\SRLoom\NPClient\
+    // and write that path to the registry -- BUT only if the registry
+    // either is unset or points at a path with no DLL on disk. If
+    // OpenTrack (or any other NPClient publisher) already owns the key
+    // and its DLL exists, we leave that pointer alone. OpenTrack's
+    // NPClient and ours both read the same FT_SharedMem we write, so
+    // games get pose either way. This is the "graceful coexistence"
+    // mode the user asked for: we step in only when no one else has.
+    auto npClientFileExists = [](const std::string& p) {
+        DWORD a = GetFileAttributesA(p.c_str());
+        return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    auto readNpDir = [](HKEY root, const char* sub) -> std::string {
+        HKEY k = nullptr;
+        if (RegOpenKeyExA(root, sub, 0, KEY_READ | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS)
+            return {};
+        char buf[MAX_PATH]; DWORD sz = sizeof(buf); DWORD type = 0;
+        std::string out;
+        if (RegQueryValueExA(k, "Path", nullptr, &type, (BYTE*)buf, &sz) == ERROR_SUCCESS
+            && type == REG_SZ && sz > 0)
+        {
+            out.assign(buf, sz - 1);
+            while (!out.empty() && out.back() == '\0') out.pop_back();
+        }
+        RegCloseKey(k);
+        return out;
+    };
+    {
+        // Step 1: extract NPClient64.dll from the embedded resource to
+        // %LOCALAPPDATA%\SRLoom\NPClient\. copy_if_different semantics
+        // via byte comparison -- only write when the existing file
+        // doesn't match the embedded version (typical: app upgrade).
+        size_t embedSize = 0;
+        const void* embedData = LookupEmbeddedResource(IDR_NPCLIENT64, embedSize);
+        std::string ourDir;
+        std::string ourDll;
+        if (embedData && embedSize > 0)
+        {
+            PWSTR base = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) && base)
+            {
+                std::wstring wdir = base;
+                CoTaskMemFree(base);
+                wdir += L"\\SRLoom\\NPClient";
+                SHCreateDirectoryExW(nullptr, wdir.c_str(), nullptr);
+                // Convert to narrow for the registry write below. NPClient
+                // location is ANSI-only (Windows convention).
+                int n = WideCharToMultiByte(CP_ACP, 0, wdir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (n > 0)
+                {
+                    ourDir.resize(n - 1);
+                    WideCharToMultiByte(CP_ACP, 0, wdir.c_str(), -1, ourDir.data(), n, nullptr, nullptr);
+                }
+                ourDll = ourDir + "\\NPClient64.dll";
+
+                bool needWrite = true;
+                HANDLE h = CreateFileA(ourDll.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE)
+                {
+                    LARGE_INTEGER sz{}; GetFileSizeEx(h, &sz);
+                    if ((uint64_t)sz.QuadPart == (uint64_t)embedSize)
+                    {
+                        // Compare bytes; small file (~100KB), cheap.
+                        std::vector<uint8_t> onDisk(embedSize);
+                        DWORD read = 0;
+                        if (ReadFile(h, onDisk.data(), (DWORD)embedSize, &read, nullptr)
+                            && read == embedSize
+                            && memcmp(onDisk.data(), embedData, embedSize) == 0)
+                        {
+                            needWrite = false;
+                        }
+                    }
+                    CloseHandle(h);
+                }
+                if (needWrite)
+                {
+                    HANDLE w = CreateFileA(ourDll.c_str(), GENERIC_WRITE, 0, nullptr,
+                                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (w != INVALID_HANDLE_VALUE)
+                    {
+                        DWORD wrote = 0;
+                        WriteFile(w, embedData, (DWORD)embedSize, &wrote, nullptr);
+                        CloseHandle(w);
+                        Log("TrackIR: extracted NPClient64.dll (%zu bytes) to %s", embedSize, ourDir.c_str());
+                    }
+                    else
+                    {
+                        Log("TrackIR: failed to write %s (err=%lu)", ourDll.c_str(), (unsigned long)GetLastError());
+                        ourDll.clear();
+                    }
+                }
+            }
+        }
+
+        // Step 2: decide whether to take over the NaturalPoint registry
+        // key. Defer to an existing valid path (typically OpenTrack's);
+        // claim it ourselves only when no functional pointer is set.
+        std::string existingDir = readNpDir(HKEY_LOCAL_MACHINE,
+                                            "Software\\NaturalPoint\\NATURALPOINT\\NPClient Location");
+        if (existingDir.empty())
+            existingDir = readNpDir(HKEY_LOCAL_MACHINE,
+                                    "Software\\WOW6432Node\\NaturalPoint\\NATURALPOINT\\NPClient Location");
+        bool existingWorks = false;
+        if (!existingDir.empty())
+        {
+            while (!existingDir.empty() && (existingDir.back() == '\\' || existingDir.back() == '/'))
+                existingDir.pop_back();
+            const bool has32 = npClientFileExists(existingDir + "\\NPClient.dll");
+            const bool has64 = npClientFileExists(existingDir + "\\NPClient64.dll");
+            existingWorks = has32 || has64;
+        }
+
+        if (existingWorks)
+        {
+            app.npClientDir = existingDir;
+            Log("TrackIR: deferring to existing NPClient at %s", existingDir.c_str());
+        }
+        else if (!ourDll.empty())
+        {
+            // Write to HKCU rather than HKLM -- HKCU writes don't require
+            // admin (writing to HKLM\Software would silently fail on
+            // standard user accounts). Games read HKCU after HKLM via the
+            // standard registry override, so this works for the typical
+            // non-elevated SR Loom user. Both bitness views written so
+            // 32-bit games see the same path the 64-bit games do.
+            auto writeKey = [](HKEY root, const char* sub, REGSAM extra, const std::string& path) -> bool {
+                HKEY k = nullptr;
+                LONG r = RegCreateKeyExA(root, sub, 0, nullptr, 0,
+                                         KEY_WRITE | extra, nullptr, &k, nullptr);
+                if (r != ERROR_SUCCESS) return false;
+                r = RegSetValueExA(k, "Path", 0, REG_SZ,
+                                   (const BYTE*)path.c_str(), (DWORD)path.size() + 1);
+                RegCloseKey(k);
+                return r == ERROR_SUCCESS;
+            };
+            const bool a = writeKey(HKEY_CURRENT_USER,
+                                    "Software\\NaturalPoint\\NATURALPOINT\\NPClient Location",
+                                    KEY_WOW64_64KEY, ourDir);
+            const bool b = writeKey(HKEY_CURRENT_USER,
+                                    "Software\\NaturalPoint\\NATURALPOINT\\NPClient Location",
+                                    KEY_WOW64_32KEY, ourDir);
+            if (a || b)
+            {
+                app.npClientDir = ourDir;
+                Log("TrackIR: registered our NPClient at %s (HKCU write %s/%s)",
+                    ourDir.c_str(), a ? "ok" : "fail", b ? "ok" : "fail");
+            }
+        }
+    }
+
+    // OpenTrack UDP + FreeTrack 2.0 default ON at app launch so users don't
+    // have to think about head tracking. TrackIR also defaults ON if (and
+    // only if) the OpenTrack NPClient install was detected above -- the
+    // toggle stays interactable either way, but auto-enabling it when the
+    // prerequisites are met means users with OpenTrack installed get
+    // TrackIR-aware games working out of the box.
+    Log("WinMain: openTrack.SetOutputs (initial)");
+    const bool tirAuto = !app.npClientDir.empty();
+    if (!app.openTrack.SetOutputs(true, true, tirAuto))
+        Log("OpenTrack/FreeTrack/TrackIR: initial enable failed (SR Platform service offline?)");
+    Log("WinMain: head-tracking bootstrap done");
+    }
+    catch (std::exception& e)
+    {
+        Log("WinMain: head-tracking bootstrap std::exception: %s -- continuing without tracking", e.what());
+    }
+    catch (...)
+    {
+        Log("WinMain: head-tracking bootstrap unknown exception -- continuing without tracking");
+    }
+
     // Control GUI (left-click the tray icon). Shares the D3D11 device; lives in its
     // own top-level window so it can sit on any monitor with its own taskbar button.
     Log("WinMain: gui.Init() begin");
@@ -3734,10 +4041,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Accept dropped image files anywhere on the SR Loom main window -- the
     // WM_DROPFILES handler routes through LoadTestImage with the dropped path.
     DragAcceptFiles(app.hwnd, TRUE);
-    const int hk1 = RegisterHotKey(app.hwnd, kHotkeyToggle,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
-    const int hk2 = RegisterHotKey(app.hwnd, kHotkeyMode,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
-    const int hk3 = RegisterHotKey(app.hwnd, kHotkeyCapture, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
-    Log("WinMain: hotkeys W=%d F=%d C=%d", hk1, hk2, hk3);
+    const int hk1 = RegisterHotKey(app.hwnd, kHotkeyToggle,    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W');
+    const int hk2 = RegisterHotKey(app.hwnd, kHotkeyMode,      MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
+    const int hk3 = RegisterHotKey(app.hwnd, kHotkeyCapture,   MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
+    const int hk4 = RegisterHotKey(app.hwnd, kHotkeyCalibrate, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'R');
+    Log("WinMain: hotkeys W=%d F=%d C=%d R=%d", hk1, hk2, hk3, hk4);
 
     // Kick off a once-per-launch (throttled to once per 6h) background poll of
     // GitHub Releases. If a newer tag than kAppVersion exists the worker
@@ -3806,6 +4114,30 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 gs.lfpHeadLeanMm      = app.lfpHeadLeanMm;
                 gs.lfpApertureMm      = (float)(app.lfpRenderer.ApertureDiameterMetres() * 1e3);
                 gs.lfpHeadLeanChanged = false;
+                // OpenTrack snapshot. Mirror live config + counters into
+                // the GuiState; GUI mutates + sets openTrackChanged on
+                // edit, which we apply below.
+                {
+                    auto ot = app.openTrack.GetConfig();
+                    gs.openTrackEnabled      = app.openTrack.IsOpenTrackEnabled();
+                    gs.freeTrackEnabled      = app.openTrack.IsFreeTrackEnabled();
+                    gs.trackIREnabled        = app.openTrack.IsTrackIREnabled();
+                    gs.trackIRAvailable      = !app.npClientDir.empty();
+                    gs.openTrackSensYaw      = ot.sensYaw;
+                    gs.openTrackSensPitch    = ot.sensPitch;
+                    gs.openTrackSensRoll     = ot.sensRoll;
+                    gs.openTrackMode         = ot.outputMode;
+                    gs.openTrackInvertX      = ot.invertX;
+                    gs.openTrackInvertY      = ot.invertY;
+                    gs.openTrackInvertZ      = ot.invertZ;
+                    gs.openTrackInvertYaw    = ot.invertYaw;
+                    gs.openTrackInvertPitch  = ot.invertPitch;
+                    gs.openTrackInvertRoll   = ot.invertRoll;
+                    gs.openTrackChanged      = false;
+                    gs.openTrackCalibrate    = false;
+                    gs.openTrackSentPackets  = app.openTrack.SentPackets();
+                    strncpy_s(gs.openTrackExePath, app.openTrackExePath.c_str(), _TRUNCATE);
+                }
                 // What's being weaved, for the GUI's collapsed summary line.
                 if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
                 {
@@ -3840,6 +4172,50 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     app.vrZoom = 1.0f;
                     app.captureRebind = true;
                 }
+                // OpenTrack/FreeTrack state apply-back.
+                if (gs.openTrackChanged)
+                {
+                    // Manual toggle is a user override against the auto-on
+                    // policy: if ALL outputs are off, remember that the
+                    // user explicitly turned tracking off this session so
+                    // we don't auto-re-enable on the next render tick.
+                    // TrackIR only counts if its prerequisites are met --
+                    // a ticked-but-unavailable TrackIR doesn't keep the
+                    // bridge alive.
+                    const bool tirEffective = gs.trackIREnabled && gs.trackIRAvailable;
+                    app.openTrackUserDisabled =
+                        !(gs.openTrackEnabled || gs.freeTrackEnabled || tirEffective);
+                    // Push the new output set to the bridge. SetOutputs is
+                    // idempotent and only does work on the delta; failure
+                    // (e.g. SR Platform service offline) flips the GuiState
+                    // back so the UI doesn't lie about what's running.
+                    if (!app.openTrack.SetOutputs(gs.openTrackEnabled,
+                                                  gs.freeTrackEnabled,
+                                                  tirEffective))
+                    {
+                        gs.openTrackEnabled = app.openTrack.IsOpenTrackEnabled();
+                        gs.freeTrackEnabled = app.openTrack.IsFreeTrackEnabled();
+                        gs.trackIREnabled   = app.openTrack.IsTrackIREnabled();
+                    }
+                    // Config edits (sliders / mode / inverts).
+                    if (app.openTrack.IsEnabled())
+                    {
+                        auto cfg = app.openTrack.GetConfig();
+                        cfg.sensYaw     = gs.openTrackSensYaw;
+                        cfg.sensPitch   = gs.openTrackSensPitch;
+                        cfg.sensRoll    = gs.openTrackSensRoll;
+                        cfg.outputMode  = gs.openTrackMode;
+                        cfg.invertX     = gs.openTrackInvertX;
+                        cfg.invertY     = gs.openTrackInvertY;
+                        cfg.invertZ     = gs.openTrackInvertZ;
+                        cfg.invertYaw   = gs.openTrackInvertYaw;
+                        cfg.invertPitch = gs.openTrackInvertPitch;
+                        cfg.invertRoll  = gs.openTrackInvertRoll;
+                        app.openTrack.SetConfig(cfg);
+                    }
+                }
+                if (gs.openTrackCalibrate)
+                    app.openTrack.CalibrateNeutral();
             }
         }
     }
@@ -3847,6 +4223,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
+    UnregisterHotKey(app.hwnd, kHotkeyCalibrate);
     // UnregisterHotKey(app.hwnd, kHotkeyDetect); // auto-detect disabled
     app.tray.Remove();
     app.gui.Shutdown();
@@ -3854,6 +4231,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.video.Close();
     app.katanga.End();
     app.lfpRenderer.Shutdown();
+    // Stop OpenTrack BEFORE the weaver shuts down its SRContext --
+    // the bridge holds an SR::HeadPoseTracker pointing into that context.
+    app.openTrack.Disable();
     app.converter.Shutdown();
     app.capture.Shutdown();
     app.weaver.Shutdown();

@@ -13,7 +13,12 @@
 #   cmake -B build/x64 -A x64
 
 cmake_minimum_required(VERSION 3.21)
-project(SRLoom CXX)
+# C is enabled in addition to C++ because third_party/npclient/npclient.c is
+# a pure C file built as a free-standing DLL (NPClient64) -- it must not pull
+# in any C++ runtime so games loading it don't end up with a second MSVC CRT
+# in their process. Listing both languages here tells CMake to enable the C
+# toolchain so it can pick a linker language for the C-only DLL target.
+project(SRLoom CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,6 +81,46 @@ set(IMGUI_SOURCES
     "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
 )
 
+# NPClient.dll (x64) -- the consumer-side DLL TrackIR-aware games load to read
+# head-pose data. Source vendored from OpenTrack's contrib/npclient (MIT,
+# originally from the Linuxtrack project). Built as a free-standing Windows
+# DLL; the built artifact is copied into assets/npclient/ so the resource
+# compiler can embed it as RCDATA in SRLoom.exe. SR Loom extracts the bytes
+# back to %LOCALAPPDATA%\SRLoom\NPClient\ on first launch and points the
+# NaturalPoint registry key at that path, so TrackIR games "just work"
+# without users installing OpenTrack themselves.
+#
+# x86 NPClient.dll is not built here -- adding it requires a second CMake
+# invocation (cross-arch builds aren't single-project under MSVC) and the
+# 64-bit DLL covers every modern TrackIR-aware sim/racing title we care
+# about for v1.7. x86 can be slotted in later for legacy 32-bit games
+# (FSX, P3D v4, X-Plane 9/10, rFactor 2 32-bit) without changing this layout.
+add_library(NPClient64 SHARED
+    third_party/npclient/npclient.c
+)
+set_target_properties(NPClient64 PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "NPClient64"
+    SUFFIX ".dll"
+)
+# DLL is C99; suppress the C++-style warnings MSVC throws at it.
+target_compile_definitions(NPClient64 PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
+)
+
+# Drop the built DLL into a known source-tree path so the resource
+# compiler's IDR_NPCLIENT64 RCDATA line can locate it. copy_if_different
+# means no spurious rebuilds when the bytes are unchanged.
+set(NPCLIENT_EMBED_DIR "${CMAKE_SOURCE_DIR}/assets/npclient")
+file(MAKE_DIRECTORY "${NPCLIENT_EMBED_DIR}")
+add_custom_command(TARGET NPClient64 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:NPClient64>
+        "${NPCLIENT_EMBED_DIR}/NPClient64.dll"
+    VERBATIM
+)
+
 add_executable(SRLoom WIN32
     src/main.cpp
     src/Renderer.cpp
@@ -97,6 +142,8 @@ add_executable(SRLoom WIN32
     src/LFPReader.h
     src/LFPRenderer.cpp
     src/LFPRenderer.h
+    src/OpenTrackBridge.cpp
+    src/OpenTrackBridge.h
     src/Common.h
     src/Renderer.h
     src/SRWeaver.h
@@ -141,6 +188,11 @@ target_link_libraries(SRLoom PRIVATE
     gdi32
     windowsapp    # Windows.Graphics.Capture (WinRT)
 )
+
+# SRLoom embeds NPClient64.dll as RCDATA, which only resolves at RC compile
+# time if the DLL is already on disk. Building NPClient64 first guarantees
+# the POST_BUILD copy to assets/npclient/ has run by the time SRLoom starts.
+add_dependencies(SRLoom NPClient64)
 
 # Nothing to copy beside the exe: the UI fonts are embedded as resources (app.rc) and
 # the SR runtime DLLs come from the installed SR Platform. The release is just the exe.

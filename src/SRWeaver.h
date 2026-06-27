@@ -106,6 +106,13 @@ namespace srw
         int SourceHeight() const { return m_imgH; }
 
         bool HasContext() const { return m_context != nullptr; }
+
+        // Borrowed pointer to the SRContext. Used by the OpenTrack bridge
+        // (and anything else that wants to attach its own SR::HeadPoseTracker
+        // / sense stream without spinning up a second context). Lifetime is
+        // tied to this SRWeaver -- callers must Disable any borrowed
+        // subscriptions before Shutdown.
+        SR::SRContext* Context() const { return m_context; }
         bool HasWeaver()  const { return m_weaver != nullptr; }
 
         // Latest tracked head pose (position in mm relative to display centre,
