@@ -1,9 +1,6 @@
 # SR Loom
 
-<img width="210" height="258" alt="Screenshot 2026-05-26 220250" src="https://github.com/user-attachments/assets/82918258-978b-43bf-a060-85bf2056b88b" /> <img width="210" height="258" alt="Screenshot 2026-05-26 221234" src="https://github.com/user-attachments/assets/7b5f002d-dbea-4f95-866d-6e68d2a09e62" />
-
-
-
+<img width="210" height="276" alt="image" src="https://github.com/user-attachments/assets/9c5132f2-5673-4d70-82b9-5ea284c76aad" /> <img width="210" height="276" alt="image" src="https://github.com/user-attachments/assets/d8dcd576-908e-433a-bbd5-f5998231f833" />
 
 A lightweight Windows tray app that weaves stereo 3D onto **Simulated Reality**
 displays (Samsung Odyssey 3D, Acer SpatialLabs, and other LeiaSR / Dimenco
@@ -90,10 +87,10 @@ for its own late-latching).
 
 Left-click the tray icon for the control panel; right-click for a quick menu.
 
-- **Ctrl+Alt+W** — toggle weaving on/off
-- **Ctrl+Alt+F** — switch Fullscreen ⇄ Looking Glass
-- **Ctrl+Alt+C** — make the active window 3D (press again to turn it off)
-- **Ctrl+Alt+R** — recenter head tracking (snap the current head pose to neutral)
+- **Ctrl+Alt+W** - Toggle weaving on/off
+- **Ctrl+Alt+F** - Switch between Fullscreen ⇄ Looking Glass
+- **Ctrl+Alt+C** - Make the active window 3D (press again to turn it off)
+- **Ctrl+Alt+R** - Recalibrate head tracking (snap the current head pose to centre)
 
 The panel has a compact mode (just the on/off switch + a status line) and an
 expanded mode with the display, stereo-input, and depth (convergence) controls,
