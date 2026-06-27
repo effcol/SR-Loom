@@ -438,42 +438,39 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // Scale everything (font + style + window) to the monitor the window is on, so
     // the panel is the same perceptual size on a 4K/150% display and a 1440p/100%
     // one. WM_DPICHANGED re-applies this when it's dragged between monitors.
-    // Step-by-step logging here (a Win10 19045 crash report -- IsPepsiOk --
-    // landed somewhere between "imgui ready" and the next log line at WinMain;
-    // these breadcrumbs pinpoint it on the next run, and the try/catch keeps
-    // a crash in any of these steps from killing the whole process. We still
-    // return true even on ApplyScaling failure -- ImGui has working defaults
-    // for everything, so the GUI will draw, just with un-scaled fonts.
-    try
+    //
+    // __try/__except (Windows SEH, not C++ try/catch) — a v2.0 report came
+    // back showing 0xC0000005 (access violation) inside ApplyScaling at
+    // dpiScale=1.50 on Win10 22H2 + Samsung Odyssey. Access violations are
+    // structured exceptions; plain C++ catch doesn't see them under default
+    // /EHsc, so the previous try/catch quietly let the process die. SEH
+    // catches them. Granular Log calls inside ApplyScaling pin the exact
+    // line for next-run diagnosis; the GUI continues with ImGui's defaults
+    // if the scaling step dies (un-scaled fonts but functional panel).
+    Log("Gui::Init: ImGui_ImplWin32_GetDpiScaleForHwnd");
+    m_dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_hwnd);
+    if (m_dpiScale <= 0.0f || m_dpiScale > 8.0f)
     {
-        Log("Gui::Init: ImGui_ImplWin32_GetDpiScaleForHwnd");
-        m_dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_hwnd);
-        if (m_dpiScale <= 0.0f || m_dpiScale > 8.0f)
-        {
-            Log("Gui::Init: clamping bogus dpiScale=%.2f to 1.0", m_dpiScale);
-            m_dpiScale = 1.0f;
-        }
-        Log("Gui::Init: dpiScale=%.2f -> ApplyScaling", m_dpiScale);
+        Log("Gui::Init: clamping bogus dpiScale=%.2f to 1.0", m_dpiScale);
+        m_dpiScale = 1.0f;
+    }
+    Log("Gui::Init: dpiScale=%.2f -> ApplyScaling", m_dpiScale);
+    __try {
         ApplyScaling();
-        Log("Gui::Init: ApplyScaling done -> SystemParametersInfo");
-        // Centre on the primary monitor's work area (CW_USEDEFAULT doesn't position a
-        // WS_POPUP window); FitHeightToContent later adjusts the height in place.
-        const int w0 = (int)(460 * m_dpiScale), h0 = (int)(820 * m_dpiScale);
-        RECT wa{}; SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
-        const int x0 = wa.left + ((wa.right - wa.left) - w0) / 2;
-        const int y0 = wa.top  + ((wa.bottom - wa.top) - h0) / 2;
-        SetWindowPos(m_hwnd, nullptr, x0, y0, w0, h0, SWP_NOZORDER | SWP_NOACTIVATE);
-        Log("Gui::Init: SetWindowPos done");
     }
-    catch (std::exception& e)
-    {
-        Log("Gui::Init: post-imgui scaling threw: %s -- continuing with defaults", e.what());
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("Gui::Init: ApplyScaling SEH 0x%08lX -- continuing with defaults",
+            (unsigned long)GetExceptionCode());
     }
-    catch (...)
-    {
-        Log("Gui::Init: post-imgui scaling threw unknown exception -- continuing with defaults");
-    }
-    Log("Gui::Init: returning true");
+    Log("Gui::Init: ApplyScaling done -> SystemParametersInfo");
+    // Centre on the primary monitor's work area (CW_USEDEFAULT doesn't position a
+    // WS_POPUP window); FitHeightToContent later adjusts the height in place.
+    const int w0 = (int)(460 * m_dpiScale), h0 = (int)(820 * m_dpiScale);
+    RECT wa{}; SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    const int x0 = wa.left + ((wa.right - wa.left) - w0) / 2;
+    const int y0 = wa.top  + ((wa.bottom - wa.top) - h0) / 2;
+    SetWindowPos(m_hwnd, nullptr, x0, y0, w0, h0, SWP_NOZORDER | SWP_NOACTIVATE);
+    Log("Gui::Init: SetWindowPos done -> returning true");
     return true;
 }
 
@@ -481,14 +478,18 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
 // Called on init, when the theme is toggled, and on WM_DPICHANGED.
 void Gui::ApplyScaling()
 {
+    Log("Gui::ApplyScaling: enter (dpiScale=%.2f)", m_dpiScale);
     ImGui::GetStyle() = ImGuiStyle();              // reset to defaults FIRST, else ScaleAllSizes
                                                    // compounds un-reset fields each call (e.g.
                                                    // WindowMinSize) → window slowly inflates and
                                                    // pushes the theme button off-window.
+    Log("Gui::ApplyScaling: ApplyTheme");
     ApplyTheme(m_lightMode);                       // base (unscaled) sizes + colours
+    Log("Gui::ApplyScaling: ScaleAllSizes");
     ImGui::GetStyle().ScaleAllSizes(m_dpiScale);   // scale paddings/rounding to DPI
 
     ImGuiIO& io = ImGui::GetIO();
+    Log("Gui::ApplyScaling: io.Fonts->Clear");
     io.Fonts->Clear();
     const float s = m_dpiScale;
     // Body = Inter (bundled, SIL OFL) — the open-source SF-Pro-like UI font Reeder's
@@ -510,12 +511,16 @@ void Gui::ApplyScaling()
         ImFontConfig cfg; cfg.FontDataOwnedByAtlas = false;
         return io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int)sz, px, &cfg, ranges);
     };
+    Log("Gui::ApplyScaling: body font (Inter Regular)");
     m_fontRegular = addEmbedded(IDR_FONT_REGULAR, 17.0f * s, bodyRange);
-    if (!m_fontRegular) m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s, nullptr, bodyRange);
-    if (!m_fontRegular) m_fontRegular = io.Fonts->AddFontDefault();
+    if (!m_fontRegular) { Log("Gui::ApplyScaling: Inter Regular failed -> SegUIVar.ttf"); m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s, nullptr, bodyRange); }
+    if (!m_fontRegular) { Log("Gui::ApplyScaling: SegUIVar.ttf failed -> AddFontDefault"); m_fontRegular = io.Fonts->AddFontDefault(); }
+    Log("Gui::ApplyScaling: body font done (ptr=%p)", (void*)m_fontRegular);
+    Log("Gui::ApplyScaling: hero font (Inter SemiBold)");
     ImFont* big = addEmbedded(IDR_FONT_SEMIBOLD, 23.0f * s);
-    if (!big)      big = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 23.0f * s);
+    if (!big) { Log("Gui::ApplyScaling: Inter SemiBold failed -> seguisb.ttf"); big = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 23.0f * s); }
     m_fontLarge = big ? big : m_fontRegular;
+    Log("Gui::ApplyScaling: hero font done (ptr=%p)", (void*)m_fontLarge);
     // Windows' own caption-button glyphs: Segoe Fluent Icons (Win11) -> Segoe
     // MDL2 Assets (Win10). Baked at the native ~10px so the min/max/close
     // look like the OS's. If BOTH font files fail to load (e.g. corrupted
@@ -531,9 +536,13 @@ void Gui::ApplyScaling()
     }
     if (!m_fontIcons)
         Log("Gui::ApplyScaling: icon font UNAVAILABLE (both SegoeIcons.ttf and segmdl2.ttf failed) -- using drawn-glyph fallback");
+    Log("Gui::ApplyScaling: io.Fonts->Build");
     io.Fonts->Build();
+    Log("Gui::ApplyScaling: SetFontDefault");
     io.FontDefault = m_fontRegular;
+    Log("Gui::ApplyScaling: ImGui_ImplDX11_InvalidateDeviceObjects");
     ImGui_ImplDX11_InvalidateDeviceObjects();      // recreate the font texture next frame
+    Log("Gui::ApplyScaling: font atlas rebuilt");
 
     // Recolour the native title bar to match the app (keeps the native min/max/close
     // buttons, just tinted). Caption + text + thin border; dark-mode flag controls
