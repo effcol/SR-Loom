@@ -115,7 +115,8 @@ namespace srw
     private:
         bool EnsureSwapChain(UINT w, UINT h);
         void ReleaseSwapChain();
-        void ApplyScaling();          // (re)build style + fonts for m_lightMode at m_dpiScale
+        void ApplyScaling();          // SEH-wrapped trampoline; safe to call directly
+        void ApplyScalingImpl();      // the actual work -- only invoked via the trampoline
         void FitHeightToContent(int clientContentH);   // shrink/grow window to fit content
         static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 

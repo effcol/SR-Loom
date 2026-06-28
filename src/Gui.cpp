@@ -455,13 +455,7 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
         m_dpiScale = 1.0f;
     }
     Log("Gui::Init: dpiScale=%.2f -> ApplyScaling", m_dpiScale);
-    __try {
-        ApplyScaling();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("Gui::Init: ApplyScaling SEH 0x%08lX -- continuing with defaults",
-            (unsigned long)GetExceptionCode());
-    }
+    ApplyScaling();   // self-SEH-wrapped, see ApplyScalingSEH trampoline
     Log("Gui::Init: ApplyScaling done -> SystemParametersInfo");
     // Centre on the primary monitor's work area (CW_USEDEFAULT doesn't position a
     // WS_POPUP window); FitHeightToContent later adjusts the height in place.
@@ -474,9 +468,25 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     return true;
 }
 
-// Rebuild the ImGui style and fonts for the current theme at the current DPI scale.
-// Called on init, when the theme is toggled, and on WM_DPICHANGED.
+// SEH wrapper. __try cannot live in a function that requires C++ object
+// unwinding (C2712 under /EHsc), so the actual work lives in
+// ApplyScalingImpl and this thin trampoline (with no locals + no RAII)
+// catches any access violation that fires inside. Used by both Init()
+// and the per-frame WM_DPICHANGED rebuild path -- safety net for the
+// Win10 + Samsung Odyssey + high-DPI font-baker crash class.
 void Gui::ApplyScaling()
+{
+    __try { ApplyScalingImpl(); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("Gui::ApplyScaling SEH 0x%08lX -- continuing with defaults",
+            (unsigned long)GetExceptionCode());
+    }
+}
+
+// The actual scaling work; called only through the SEH trampoline above
+// so an access violation inside is caught instead of killing the process.
+void Gui::ApplyScalingImpl()
 {
     Log("Gui::ApplyScaling: enter (dpiScale=%.2f)", m_dpiScale);
     ImGui::GetStyle() = ImGuiStyle();              // reset to defaults FIRST, else ScaleAllSizes
@@ -644,6 +654,14 @@ bool Gui::Render(GuiState& state)
     // Apply a pending theme/DPI rebuild BETWEEN frames. Clearing the font atlas
     // mid-frame (after NewFrame) would crash ImGui::Render — that was the
     // light-mode-toggle crash. Doing it here keeps the whole frame consistent.
+    // SEH-guarded like the init-time call -- WM_DPICHANGED fires every time
+    // the window crosses a monitor with a different DPI; without this an
+    // access violation inside ApplyScaling (same root cause as the init
+    // crash on Win10 + Samsung Odyssey) would kill the whole app on drag.
+    // ApplyScaling already wraps itself in SEH via the trampoline, so a
+    // DPI-change-time access violation (e.g. dragging the window onto a
+    // monitor that triggers the Samsung Odyssey + Win10 font-baker bug)
+    // is caught -- the per-frame loop continues with the previous atlas.
     if (m_pendingRescale) { ApplyScaling(); m_pendingRescale = false; }
 
     ImGui_ImplDX11_NewFrame();
