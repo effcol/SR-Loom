@@ -9,6 +9,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <string>
+#include <vector>
 
 struct ImFont;   // Dear ImGui (defined in imgui.h); only used by pointer here
 
@@ -95,6 +96,19 @@ namespace srw
         // detected opentrack.exe path (empty if not installed). GUI shows
         // an "Open OpenTrack" button when non-empty.
         char         openTrackExePath[260] = "";
+        // Per-game profiles section. Main mirrors the live profile list
+        // + master toggle into here; GUI sets the request flags when the
+        // user clicks something, main consumes them after Render returns.
+        struct ProfileEntry { std::string name; bool includeHT = false; };
+        std::vector<ProfileEntry> profileEntries;
+        bool         profilesAutoApply       = true;
+        bool         profilesAutoApplyChanged= false;   // user toggled
+        bool         profileSaveCurrent      = false;   // "Save current" clicked
+        int          profileApplyIndex       = -1;      // clicked a profile to apply (tray menu only)
+        int          profileUpdateIndex      = -1;      // clicked Update on selected profile (GUI)
+        int          profileDeleteIndex      = -1;      // clicked Delete next to a profile
+        int          profileToggleHTIndex    = -1;      // clicked the per-row HT button
+        bool         profilesOpenIni         = false;   // "Open profiles.ini" clicked
     };
 
     class Gui
@@ -141,6 +155,17 @@ namespace srw
         bool                     m_acerNeedsAdmin = false;  // last Acer SpatialLabs write was ACCESS_DENIED
         bool                     m_acerSectionOpen = false; // ACER SPATIALLABS section expanded?
         bool                     m_startupSectionOpen = false; // STARTUP section expanded?
+        bool                     m_profilesSectionOpen = false; // PROFILES section expanded?
+        // HEADTRACKING starts EXPANDED by default -- it's a primary feature
+        // (most users care about the on/off toggle + mode) and shouldn't
+        // hide behind a click on first launch. Collapsible so users who
+        // never touch tracking can tidy it away.
+        bool                     m_headTrackingSectionOpen = true;
+        // DISPLAY + STEREO 3D INPUT also collapsible (default expanded);
+        // users who've set their format / display mode once may want to
+        // tidy away those sections too once everything is dialled in.
+        bool                     m_displaySectionOpen     = true;
+        bool                     m_stereoInputSectionOpen = true;
         bool                     m_openTrackSectionOpen = false; // OPENTRACK section expanded?
         // STARTUP-section state, cached from HKCU at Init() so toggling doesn't
         // read the registry per frame.

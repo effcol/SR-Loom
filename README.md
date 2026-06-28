@@ -8,9 +8,11 @@ panels). Point it at your screen, a window, or a floating "looking glass," pick
 the stereo format your content is in, and it converts and weaves it with
 head-tracked depth — no glasses.
 
-> **v2.0** — single self-contained `SRLoom.exe`. Adds head-tracking output
-> for PC games (OpenTrack UDP + FreeTrack 2.0 + TrackIR via embedded NPClient).
-> Requires a Simulated Reality display and the SR Platform runtime installed.
+> **v2.1** — single self-contained `SRLoom.exe`. Adds per-game and per-file
+> profiles: focus a game with a saved profile and SR Loom flips to the right
+> stereo format automatically; load an image or video and it remembers what
+> you last set. Requires a Simulated Reality display and the SR Platform
+> runtime installed.
 
 ## What it does
 

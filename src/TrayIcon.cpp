@@ -310,6 +310,41 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
         AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(htMenu), "Head Tracking");
     }
 
+    // Profiles submenu: per-game auto-apply (NTM AutoCP-Launcher style).
+    // Master toggle + "Save current" + list of saved profiles. Clicking
+    // a saved-profile name applies it manually; the Delete submenu
+    // mirrors the list with delete actions. Hand-edit profiles.ini for
+    // anything more elaborate (the "Open profiles.ini" item helps).
+    {
+        HMENU pMenu = CreatePopupMenu();
+        AppendMenuA(pMenu, MF_STRING | (s.profilesAutoApply ? MF_CHECKED : 0),
+                    ID_TRAY_PROFILES_AUTO, "Switch profile when game is focused");
+        AppendMenuA(pMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(pMenu, MF_STRING, ID_TRAY_PROFILES_SAVECUR,
+                    "Save current window as profile");
+        AppendMenuA(pMenu, MF_STRING, ID_TRAY_PROFILES_OPEN_INI,
+                    "Open profiles.ini in editor");
+        if (!s.profileNames.empty())
+        {
+            AppendMenuA(pMenu, MF_SEPARATOR, 0, nullptr);
+            const size_t maxN = (size_t)(ID_TRAY_PROFILES_LIST_MAX - ID_TRAY_PROFILES_LIST_BASE);
+            const size_t n = (s.profileNames.size() < maxN) ? s.profileNames.size() : maxN;
+            for (size_t i = 0; i < n; ++i)
+                AppendMenuA(pMenu, MF_STRING,
+                            ID_TRAY_PROFILES_LIST_BASE + (UINT)i,
+                            s.profileNames[i].c_str());
+            // Per-profile delete submenu underneath, mirrors the list above.
+            HMENU dMenu = CreatePopupMenu();
+            for (size_t i = 0; i < n; ++i)
+                AppendMenuA(dMenu, MF_STRING,
+                            ID_TRAY_PROFILES_DEL_BASE + (UINT)i,
+                            s.profileNames[i].c_str());
+            AppendMenuA(pMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(dMenu),
+                        "Delete profile");
+        }
+        AppendMenuA(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(pMenu), "Profiles");
+    }
+
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_EXIT, "Exit");
 

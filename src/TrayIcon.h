@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Common.h"
+#include <string>
 #include <vector>
 
 namespace srw
@@ -38,6 +39,12 @@ namespace srw
     // 6-hour throttle, and the result is always posted back via
     // WM_APP_UPDATE_RESULT so the user gets visual feedback either way).
     constexpr UINT WM_APP_CHECK_UPDATES = WM_APP + 8;
+
+    // WinEventHook callback -> main window: a new foreground window
+    // appeared. lParam is the HWND. Handler walks the Profiles list and
+    // applies the first matching profile's settings. Posted (not sent)
+    // because Win32 forbids non-trivial work inside hook callbacks.
+    constexpr UINT WM_APP_FOREGROUND_CHANGED = WM_APP + 9;
 
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
@@ -91,6 +98,15 @@ namespace srw
     constexpr UINT ID_TRAY_HT_MODE_BASE  = 43310; // +0..+4 -> outputMode 1..5
     constexpr UINT ID_TRAY_HT_MODE_MAX   = 43319;
 
+    // Profiles submenu (NTM-style per-game auto-apply).
+    constexpr UINT ID_TRAY_PROFILES_AUTO     = 43400;  // master "auto-apply" toggle
+    constexpr UINT ID_TRAY_PROFILES_SAVECUR  = 43401;  // "Save current as profile"
+    constexpr UINT ID_TRAY_PROFILES_OPEN_INI = 43402;  // open profiles.ini in editor
+    constexpr UINT ID_TRAY_PROFILES_LIST_BASE = 43410; // +0..+N -> apply that profile manually
+    constexpr UINT ID_TRAY_PROFILES_LIST_MAX  = 43499;
+    constexpr UINT ID_TRAY_PROFILES_DEL_BASE  = 43500; // +0..+N -> delete that profile
+    constexpr UINT ID_TRAY_PROFILES_DEL_MAX   = 43599;
+
     // State the context menu reflects (checkmarks).
     struct MenuState
     {
@@ -112,6 +128,10 @@ namespace srw
         bool         htFreeTrack;     // FreeTrack 2.0 active?
         bool         htTrackIR;       // TrackIR (NPClient) active?
         int          htOutputMode;    // 1..5 -- see opentrack_pipeline.h
+        // Profile list (NTM-style per-game auto-apply). Names + the
+        // master "auto-apply" toggle drive the Profiles submenu.
+        bool                     profilesAutoApply;
+        std::vector<std::string> profileNames;
     };
 
     class TrayIcon

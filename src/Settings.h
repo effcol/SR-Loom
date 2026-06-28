@@ -15,4 +15,11 @@ namespace srw::Settings
     // utility. When false, the control panel opens on launch.
     bool ReadStartInTray();
     void WriteStartInTray(bool enable);
+
+    // Master toggle for the per-game profile auto-apply feature (see
+    // Profiles.h). Default ON when a profile list exists; off-by-default
+    // is fine when no profiles are configured (nothing to apply anyway).
+    // Stored as DWORD under HKCU\Software\SRLoom\AutoApplyProfiles.
+    bool ReadAutoApplyProfiles();
+    void WriteAutoApplyProfiles(bool enable);
 }

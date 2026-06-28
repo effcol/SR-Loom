@@ -13,6 +13,8 @@
 #include "Detector.h"
 #include "Gui.h"
 #include "Settings.h"
+#include "Profiles.h"
+#include "MediaProfiles.h"
 #include "VideoSource.h"
 #include "KatangaSource.h"
 #include "LFPReader.h"
@@ -124,6 +126,47 @@ namespace
         // next session start. The flag clears whenever a session ends, so the auto-on
         // behaviour resumes from the next fresh weave.
         bool         openTrackUserDisabled = false;
+        // Per-game profile auto-apply (NTM-style). The list is loaded from
+        // %LOCALAPPDATA%\SRLoom\profiles.ini at startup and re-saved on edit.
+        // m_lastProfile is the last name applied -- used to debounce so we
+        // don't re-apply on every WM_APP_FOREGROUND_CHANGED.
+        std::vector<Profile>  profiles;
+        bool                  profilesAutoApply = true;
+        std::string           lastAppliedProfile;
+        // HWND-based debounce: re-applying the SAME running window is a
+        // no-op, but a fresh HWND (e.g. closing and re-launching the game)
+        // triggers the apply path even though the profile name matches
+        // what we just applied. lastAppliedProfile alone wasn't enough --
+        // user closed+relaunched a game, the new HWND matched the saved
+        // profile, but the name-debounce blocked the apply.
+        HWND                  lastAppliedHwnd = nullptr;
+        // WinEventHook handle for EVENT_SYSTEM_FOREGROUND. Posts back to
+        // the main window via WM_APP_FOREGROUND_CHANGED with the new HWND
+        // in lParam; the handler walks profiles, matches, applies.
+        HWINEVENTHOOK         fgHook = nullptr;
+        // Last foreground window that was NOT one of our own. Updated by
+        // the foreground hook every time the user focuses an external app.
+        // Used by "Save current as profile" because at click-time the
+        // GUI panel itself is the foreground -- without this cache we'd
+        // capture SR Loom's own exe instead of the game the user just
+        // alt-tabbed away from.
+        HWND                  lastExternalForeground = nullptr;
+        // Currently-loaded image / video file path (empty when source is
+        // not media). Set by LoadTestImage; cleared on source change away.
+        // Used by the media-profile system to (a) look up + apply remembered
+        // settings when a file is opened and (b) auto-save settings back to
+        // the profile when the user tweaks format / swap / convergence /
+        // anaglyph while the file is the live source. Kept in its own
+        // INI (media_profiles.ini) separate from the game profiles list
+        // so opened-photo entries don't pollute the GUI profiles dropdown.
+        std::string           currentMediaPath;
+        // Last-saved hash of the stereo state for the current media file
+        // (format + swap + convergence + anaglyph + pulfrich + frame pack).
+        // The render loop compares the live hash each tick: change ->
+        // schedule a save, throttled by lastMediaSaveMs so dragging the
+        // convergence slider doesn't hammer the INI file.
+        uint64_t              lastMediaStateHash = 0;
+        DWORD                 lastMediaSaveMs    = 0;
                                      // Bound when format==Katanga; the render loop
                                      // arms/engages based on receiver state. Game-exit
                                      // detection lives in KatangaSource itself (it
@@ -1421,6 +1464,334 @@ namespace
     }
 
     void SetWeaving(AppState& app, bool enable);   // fwd decl (defined below)
+    void ChangeFormat(AppState& app, StereoFormat newFmt);  // fwd decl
+    void EnsureWeavingFormatOnly(AppState& app);   // fwd decl
+    void EnsureWeaving(AppState& app);             // fwd decl
+    void UseWindow(AppState& app, HWND target);    // fwd decl
+
+    // Foreground/process helpers for the per-game profile system. Both
+    // return "" on failure (no exception, no abort) so the foreground
+    // handler can safely no-op when it can't read a window's identity.
+    std::string ForegroundExeBaseName(HWND fg)
+    {
+        if (!fg) return {};
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        if (pid == 0) return {};
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!proc) return {};
+        char path[MAX_PATH] = {};
+        DWORD len = MAX_PATH;
+        const BOOL ok = QueryFullProcessImageNameA(proc, 0, path, &len);
+        CloseHandle(proc);
+        if (!ok || len == 0) return {};
+        const char* slash = strrchr(path, '\\');
+        return slash ? std::string(slash + 1) : std::string(path);
+    }
+
+    std::string WindowTitle(HWND fg)
+    {
+        if (!fg) return {};
+        char buf[512] = {};
+        if (GetWindowTextA(fg, buf, (int)sizeof(buf)) <= 0) return {};
+        return std::string(buf);
+    }
+
+    // Apply a profile's stereo settings to the running state. Used by
+    // both the auto-apply path (foreground match) and the manual
+    // "click a profile in the tray menu" path.
+    //
+    // captureHwnd: when the foreground hook fires the auto-apply path, we
+    // pass the game's window so SR Loom re-targets the capture at the
+    // game (mode -> WindowOverlay, source -> CaptureWindow). Without this
+    // a freshly-launched game would just see the format flip but the
+    // weave would still be pointed at whatever it was pointed at before
+    // (probably "Monitor"), so the user wouldn't see anything. The manual
+    // tray "apply" path passes nullptr -- it doesn't know which window
+    // the user "meant", so it just flips the format and lets the user
+    // pick the source themselves.
+    void ApplyProfile(AppState& app, const Profile& p, HWND captureHwnd = nullptr)
+    {
+        Log("Profile apply: '%s' (format=%s swap=%d conv=%.2f hwnd=%p HT=%d)",
+            p.name.c_str(), Profiles::FormatToString(p.format),
+            (int)p.swapEyes, (double)p.convergence, (void*)captureHwnd,
+            (int)p.includeHeadTracking);
+        // Format + format-specific sub-options. Set the sub-options BEFORE
+        // ChangeFormat so the freshly-applied format reads the right
+        // anaglyph combo / decode mode / pulfrich timing / FP preset on
+        // its first frame.
+        app.swapEyes       = p.swapEyes;
+        app.convergence    = p.convergence;
+        app.anaglyphCombo  = p.anaglyphCombo;
+        app.anaglyphMode   = p.anaglyphMode;
+        app.pulfrichMode   = (PulfrichMode)p.pulfrichMode;
+        app.pulfrichDelay  = p.pulfrichDelay;
+        app.pulfrichNd     = p.pulfrichNd;
+        app.framePackMode  = p.framePackMode;
+        if (p.quiltCols > 0) app.quiltCols = p.quiltCols;
+        if (p.quiltRows > 0) app.quiltRows = p.quiltRows;
+        if (p.quiltLeftIdx  >= 0) app.quiltLeftIdx  = p.quiltLeftIdx;
+        if (p.quiltRightIdx >= 0) app.quiltRightIdx = p.quiltRightIdx;
+        ChangeFormat(app, p.format);
+        if (captureHwnd)
+        {
+            UseWindow(app, captureHwnd);   // sets mode = WindowOverlay
+            EnsureWeaving(app);             // full ensure -- starts weave if off
+        }
+        else
+        {
+            EnsureWeavingFormatOnly(app);
+        }
+        // Optional head-tracking apply. Only if the profile opted in --
+        // most users won't want a per-game HT override and don't want
+        // their global HT state stomped on every alt-tab.
+        if (p.includeHeadTracking)
+        {
+            auto cfg = app.openTrack.GetConfig();
+            cfg.outputMode  = p.htOutputMode;
+            cfg.invertX     = p.htInvertX;
+            cfg.invertY     = p.htInvertY;
+            cfg.invertZ     = p.htInvertZ;
+            cfg.invertYaw   = p.htInvertYaw;
+            cfg.invertPitch = p.htInvertPitch;
+            cfg.invertRoll  = p.htInvertRoll;
+            app.openTrack.SetConfig(cfg);
+            app.openTrack.SetOutputs(p.htOpenTrack, p.htFreeTrack, p.htTrackIR);
+        }
+        app.lastAppliedProfile = p.name;
+    }
+
+    // Called when WinEventHook reports a foreground-window change.
+    // Walks profile list, applies first match (skipping if the same
+    // profile was applied last -- prevents thrash when alt-tabbing to
+    // and from a game with itself).
+    void HandleForegroundChanged(AppState& app, HWND fg)
+    {
+        if (!app.profilesAutoApply || app.profiles.empty()) return;
+        const std::string exe = ForegroundExeBaseName(fg);
+        const std::string title = WindowTitle(fg);
+        if (exe.empty() && title.empty()) return;
+        for (const auto& p : app.profiles)
+        {
+            if (Profiles::Matches(p, exe, title))
+            {
+                // Debounce on HWND, not profile name: same window in
+                // foreground = no-op, but a new HWND (relaunch, different
+                // instance) re-applies even if it's the same profile.
+                if (fg != app.lastAppliedHwnd)
+                {
+                    ApplyProfile(app, p, fg);
+                    app.lastAppliedHwnd = fg;
+                }
+                return;
+            }
+        }
+    }
+
+    // "Save current window as profile" tray action. Captures the
+    // foreground window's exe + title and the current SR Loom stereo
+    // settings; persists. If a profile with the same name (= exe by
+    // default, or window title if empty) already exists, overwrites it.
+    void SaveCurrentAsProfile(AppState& app)
+    {
+        // Prefer the cached "last non-self foreground" -- when the user
+        // clicks the GUI button, the SR Loom panel itself is the live
+        // foreground, so GetForegroundWindow() would return our own
+        // window and we'd save "SRLoom.exe" as the profile. The hook
+        // cache holds the last external window the user focused.
+        HWND fg = app.lastExternalForeground;
+        if (!fg || !IsWindow(fg))
+        {
+            HWND cur = GetForegroundWindow();
+            if (cur && cur != app.hwnd) fg = cur;
+        }
+        if (!fg || fg == app.hwnd) { Log("Profiles: no external window to save"); return; }
+        const std::string exe = ForegroundExeBaseName(fg);
+        const std::string title = WindowTitle(fg);
+        if (exe.empty() && title.empty()) return;
+        Profile p;
+        // Prefer the window title as the profile's human-readable name
+        // (matches what shows up in Windows' alt-tab); fall back to the
+        // exe if the title is empty or has weird chars.
+        p.name = !title.empty() ? title : exe;
+        p.exe          = exe;          // match by exe; usually enough
+        p.title        = "";           // empty title pattern = any title for that exe
+        p.format       = app.format;
+        p.swapEyes     = app.swapEyes;
+        p.convergence  = app.convergence;
+        // Capture every format-specific sub-option so re-applying the
+        // profile later restores anaglyph/pulfrich/frame-pack detail
+        // (e.g. red/cyan vs green/magenta, recovered vs filtered decode).
+        p.anaglyphCombo  = app.anaglyphCombo;
+        p.anaglyphMode   = app.anaglyphMode;
+        p.pulfrichMode   = (int)app.pulfrichMode;
+        p.pulfrichDelay  = app.pulfrichDelay;
+        p.pulfrichNd     = app.pulfrichNd;
+        p.framePackMode  = app.framePackMode;
+        p.quiltCols      = app.quiltCols;
+        p.quiltRows      = app.quiltRows;
+        p.quiltLeftIdx   = app.quiltLeftIdx;
+        p.quiltRightIdx  = app.quiltRightIdx;
+        // Head-tracking snapshot: stored but only applied later when the
+        // user explicitly flags includeHeadTracking on this profile
+        // (per-row toggle in the PROFILES list). Default false so a fresh
+        // profile leaves the global HT state alone.
+        p.includeHeadTracking = false;
+        p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
+        p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
+        p.htTrackIR     = app.openTrack.IsTrackIREnabled();
+        const auto cfg  = app.openTrack.GetConfig();
+        p.htOutputMode  = cfg.outputMode;
+        p.htInvertX     = cfg.invertX;
+        p.htInvertY     = cfg.invertY;
+        p.htInvertZ     = cfg.invertZ;
+        p.htInvertYaw   = cfg.invertYaw;
+        p.htInvertPitch = cfg.invertPitch;
+        p.htInvertRoll  = cfg.invertRoll;
+        // Replace-by-name so re-saving updates instead of duplicating.
+        for (auto& existing : app.profiles)
+        {
+            if (existing.name == p.name) { existing = p; Profiles::Save(app.profiles); return; }
+        }
+        app.profiles.push_back(p);
+        Profiles::Save(app.profiles);
+        Log("Profiles: saved '%s' (%s)", p.name.c_str(), exe.c_str());
+    }
+
+    // Build a hash of the user-visible stereo state. Used by the media-
+    // profile auto-save path to detect change with no need to mirror an
+    // independent "last state" struct -- one cheap uint compare per frame.
+    uint64_t HashStereoState(const AppState& app)
+    {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a 64 seed
+        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        mix((uint64_t)(int)app.format);
+        mix((uint64_t)(app.swapEyes ? 1 : 0));
+        mix((uint64_t)(int)(app.convergence * 1000.0f));
+        mix((uint64_t)app.anaglyphCombo);
+        mix((uint64_t)app.anaglyphMode);
+        mix((uint64_t)(int)app.pulfrichMode);
+        mix((uint64_t)app.pulfrichDelay);
+        mix((uint64_t)app.pulfrichNd);
+        mix((uint64_t)app.framePackMode);
+        // Quilt grid + view picks -- without these in the hash, quilt
+        // tweaks (cols/rows from filename token override, or the user
+        // dragging the L/R view sliders) wouldn't trigger a save.
+        mix((uint64_t)app.quiltCols);
+        mix((uint64_t)app.quiltRows);
+        mix((uint64_t)app.quiltLeftIdx);
+        mix((uint64_t)app.quiltRightIdx);
+        return h;
+    }
+
+    // Build a Profile snapshot of the live stereo state. Used by both
+    // the explicit "save now" path (source-change-away, shutdown) and
+    // the throttled auto-save below.
+    Profile SnapshotStereoState(const AppState& app)
+    {
+        Profile p;
+        p.format        = app.format;
+        p.swapEyes      = app.swapEyes;
+        p.convergence   = app.convergence;
+        p.anaglyphCombo = app.anaglyphCombo;
+        p.anaglyphMode  = app.anaglyphMode;
+        p.pulfrichMode  = (int)app.pulfrichMode;
+        p.pulfrichDelay = app.pulfrichDelay;
+        p.pulfrichNd    = app.pulfrichNd;
+        p.framePackMode = app.framePackMode;
+        p.quiltCols     = app.quiltCols;
+        p.quiltRows     = app.quiltRows;
+        p.quiltLeftIdx  = app.quiltLeftIdx;
+        p.quiltRightIdx = app.quiltRightIdx;
+        return p;
+    }
+
+    // Force-flush any unsaved media-profile state right now. Called on
+    // source-change-away (before clearing currentMediaPath) and on app
+    // shutdown so the user's last tweaks aren't lost just because they
+    // didn't sit on the slider for 250ms.
+    void FlushMediaProfileIfDirty(AppState& app)
+    {
+        if (app.currentMediaPath.empty()) return;
+        const uint64_t h = HashStereoState(app);
+        if (h == app.lastMediaStateHash) return;
+        MediaProfiles::SaveFor(app.currentMediaPath, SnapshotStereoState(app));
+        app.lastMediaStateHash = h;
+        app.lastMediaSaveMs    = GetTickCount();
+    }
+
+    // Called from the render loop. When a media file is the source,
+    // detect any stereo-state change vs the last save and (throttled)
+    // write the new state to media_profiles.ini for this file. Throttle
+    // avoids hammering the INI on slider drags -- a settled value lands
+    // within ~quarter of a second of the user releasing the mouse.
+    void AutoSaveMediaProfileIfDirty(AppState& app)
+    {
+        if (app.currentMediaPath.empty()) return;
+        if (app.source != SourceKind::TestImage)
+        {
+            // Source changed away from media (user picked Monitor / a
+            // window / etc). FLUSH any unsaved state before clearing
+            // tracking -- without this, last-second tweaks made just
+            // before switching source were lost.
+            FlushMediaProfileIfDirty(app);
+            app.currentMediaPath.clear();
+            app.lastMediaStateHash = 0;
+            return;
+        }
+        const uint64_t h = HashStereoState(app);
+        if (h == app.lastMediaStateHash) return;
+        const DWORD now = GetTickCount();
+        if (app.lastMediaSaveMs != 0 && (now - app.lastMediaSaveMs) < 250) return;
+        MediaProfiles::SaveFor(app.currentMediaPath, SnapshotStereoState(app));
+        app.lastMediaStateHash = h;
+        app.lastMediaSaveMs    = now;
+    }
+
+    // SetWinEventHook callback. Hook runs out-of-context; Win32 forbids
+    // non-trivial work here. We post to the main thread, which handles
+    // the actual profile match + apply in WM_APP_FOREGROUND_CHANGED.
+    void CALLBACK ForegroundEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                      LONG idObject, LONG idChild,
+                                      DWORD, DWORD)
+    {
+        if (!g_app || !hwnd) return;
+        if (event != EVENT_SYSTEM_FOREGROUND) return;
+        if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+        // Skip our own windows so toggling our panel doesn't fire.
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) return;
+        // Cache the latest non-self foreground so "Save current as profile"
+        // can fetch the right window even when our panel is the live
+        // foreground at button-click time. Atomic-safe enough at HWND
+        // granularity -- it's a pointer-sized store on x64.
+        g_app->lastExternalForeground = hwnd;
+        PostMessage(g_app->hwnd, WM_APP_FOREGROUND_CHANGED, 0, (LPARAM)hwnd);
+    }
+
+    // Install / uninstall the global EVENT_SYSTEM_FOREGROUND hook based on
+    // app.profilesAutoApply. Idempotent. Called once at startup and again
+    // whenever the user flips "Enable Profiles". The hook has a non-zero
+    // system cost (per-process delivery thread + DWM bookkeeping) so we
+    // skip it entirely when auto-apply is off.
+    void RefreshForegroundHook(AppState& app)
+    {
+        const bool wantHook = app.profilesAutoApply;
+        if (wantHook && !app.fgHook)
+        {
+            app.fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                         nullptr, ForegroundEventProc, 0, 0,
+                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            Log("RefreshForegroundHook: installed hook=%p", (void*)app.fgHook);
+        }
+        else if (!wantHook && app.fgHook)
+        {
+            UnhookWinEvent(app.fgHook);
+            app.fgHook = nullptr;
+            Log("RefreshForegroundHook: removed hook");
+        }
+    }
 
     // Keep the overlay aligned with the tracked source window each frame.
     void UpdateOverlayTracking(AppState& app)
@@ -2144,6 +2515,48 @@ namespace
         // saved size so the next LG entry re-fits the window to the new
         // content instead of preserving the old shape.
         app.loupeActive   = false;
+        // Media profile remember-and-apply. Stash the path so the auto-
+        // save path can write back to the right key when the user tweaks
+        // settings, and look up any saved profile for this file -- on hit,
+        // overlay the saved format/swap/convergence/anaglyph on top of
+        // whatever LoadTestImage just inferred from the filename. Skipped
+        // for LFP/ESLF since their format is forced (LightField), and
+        // saving sub-settings for them doesn't make sense yet.
+        if (!isLFP && !isEslf)
+        {
+            app.currentMediaPath = path;
+            Profile mp;
+            if (MediaProfiles::LoadFor(path, mp))
+            {
+                app.format        = mp.format;
+                app.swapEyes      = mp.swapEyes;
+                app.convergence   = mp.convergence;
+                app.anaglyphCombo = mp.anaglyphCombo;
+                app.anaglyphMode  = mp.anaglyphMode;
+                app.pulfrichMode  = (PulfrichMode)mp.pulfrichMode;
+                app.pulfrichDelay = mp.pulfrichDelay;
+                app.pulfrichNd    = mp.pulfrichNd;
+                app.framePackMode = mp.framePackMode;
+                // Quilt overrides only when the saved values look valid
+                // (positive; -1 means "auto" -- the filename parse done
+                // earlier in LoadTestImage already picked sensible defaults).
+                if (mp.quiltCols > 0) app.quiltCols = mp.quiltCols;
+                if (mp.quiltRows > 0) app.quiltRows = mp.quiltRows;
+                if (mp.quiltLeftIdx  >= 0) app.quiltLeftIdx  = mp.quiltLeftIdx;
+                if (mp.quiltRightIdx >= 0) app.quiltRightIdx = mp.quiltRightIdx;
+                Log("LoadTestImage: applied media profile (format=%s)",
+                    Profiles::FormatToString(mp.format));
+            }
+            // Seed the hash so the first auto-save tick doesn't immediately
+            // re-write the freshly-loaded state back to disk -- only user
+            // tweaks AFTER load should trigger a save.
+            app.lastMediaStateHash = HashStereoState(app);
+            app.lastMediaSaveMs    = GetTickCount();
+        }
+        else
+        {
+            app.currentMediaPath.clear();
+        }
         EnsureWeaving(app);
         return true;
     }
@@ -3016,7 +3429,11 @@ namespace
                               app->openTrack.IsOpenTrackEnabled(),
                               app->openTrack.IsFreeTrackEnabled(),
                               app->openTrack.IsTrackIREnabled(),
-                              app->openTrack.GetConfig().outputMode };
+                              app->openTrack.GetConfig().outputMode,
+                              app->profilesAutoApply,
+                              {} };
+                ms.profileNames.reserve(app->profiles.size());
+                for (const auto& p : app->profiles) ms.profileNames.push_back(p.name);
                 app->tray.ShowContextMenu(hwnd, ms);
             }
             else if (app && LOWORD(lParam) == WM_LBUTTONUP)
@@ -3086,6 +3503,15 @@ namespace
             // 6-hour throttle and always posts a WM_APP_UPDATE_RESULT so
             // the user sees a balloon either way.
             UpdateChecker::StartAsync(hwnd, WM_APP_UPDATE_RESULT, true);
+            return 0;
+
+        case WM_APP_FOREGROUND_CHANGED:
+            // Posted by ForegroundEventProc (out-of-context WinEvent hook)
+            // when the user alt-tabs / focuses a new window. lParam is the
+            // new foreground HWND. We do the actual profile match + apply
+            // here on the main thread so ChangeFormat / EnsureWeaving /
+            // SetWeaving don't fire from inside the hook callback.
+            if (app) HandleForegroundChanged(*app, reinterpret_cast<HWND>(lParam));
             return 0;
 
 
@@ -3419,6 +3845,59 @@ namespace
                 auto cfg = app->openTrack.GetConfig();
                 cfg.outputMode = mode;
                 app->openTrack.SetConfig(cfg);
+                return 0;
+            }
+            // Profiles submenu commands.
+            if (cmd == ID_TRAY_PROFILES_AUTO)
+            {
+                app->profilesAutoApply = !app->profilesAutoApply;
+                Settings::WriteAutoApplyProfiles(app->profilesAutoApply);
+                RefreshForegroundHook(*app);
+                return 0;
+            }
+            if (cmd == ID_TRAY_PROFILES_SAVECUR)
+            {
+                SaveCurrentAsProfile(*app);
+                return 0;
+            }
+            if (cmd == ID_TRAY_PROFILES_OPEN_INI)
+            {
+                // Open profiles.ini in the user's default text editor.
+                // Save first so the file exists with the latest state +
+                // the helpful header comments even on a fresh install.
+                Profiles::Save(app->profiles);
+                PWSTR base = nullptr;
+                if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) && base)
+                {
+                    std::wstring p = base; CoTaskMemFree(base);
+                    p += L"\\SRLoom\\profiles.ini";
+                    ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
+                return 0;
+            }
+            // Manual-apply: click a profile name in the list.
+            if (cmd >= ID_TRAY_PROFILES_LIST_BASE && cmd <= ID_TRAY_PROFILES_LIST_MAX)
+            {
+                const size_t idx = (size_t)(cmd - ID_TRAY_PROFILES_LIST_BASE);
+                if (idx < app->profiles.size())
+                {
+                    ApplyProfile(*app, app->profiles[idx]);
+                }
+                return 0;
+            }
+            // Delete: click a profile name in the Delete submenu.
+            if (cmd >= ID_TRAY_PROFILES_DEL_BASE && cmd <= ID_TRAY_PROFILES_DEL_MAX)
+            {
+                const size_t idx = (size_t)(cmd - ID_TRAY_PROFILES_DEL_BASE);
+                if (idx < app->profiles.size())
+                {
+                    const std::string name = app->profiles[idx].name;
+                    Log("Profiles: deleted '%s'", name.c_str());
+                    app->profiles.erase(app->profiles.begin() + idx);
+                    Profiles::Save(app->profiles);
+                    if (app->lastAppliedProfile == name)
+                        app->lastAppliedProfile.clear();
+                }
                 return 0;
             }
             break;
@@ -4047,6 +4526,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     const int hk4 = RegisterHotKey(app.hwnd, kHotkeyCalibrate, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'R');
     Log("WinMain: hotkeys W=%d F=%d C=%d R=%d", hk1, hk2, hk3, hk4);
 
+    // Profiles: load list + master enable. Install the foreground-watch
+    // hook only if auto-apply is on -- global EVENT_SYSTEM_FOREGROUND
+    // hooks have a known cost (every-process delivery thread + DWM
+    // bookkeeping) and we don't need them when the feature is off. The
+    // toggle handler installs / tears down the hook on the fly when the
+    // user flips it.
+    app.profiles          = Profiles::Load();
+    app.profilesAutoApply = Settings::ReadAutoApplyProfiles();
+    RefreshForegroundHook(app);
+    Log("WinMain: profiles loaded=%zu autoApply=%d hook=%p",
+        app.profiles.size(), (int)app.profilesAutoApply, (void*)app.fgHook);
+
     // Kick off a once-per-launch (throttled to once per 6h) background poll of
     // GitHub Releases. If a newer tag than kAppVersion exists the worker
     // PostMessages WM_APP_UPDATE_RESULT so the WndProc can pop a balloon
@@ -4138,6 +4629,30 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     gs.openTrackSentPackets  = app.openTrack.SentPackets();
                     strncpy_s(gs.openTrackExePath, app.openTrackExePath.c_str(), _TRUNCATE);
                 }
+                // Profiles snapshot: name + includeHT per entry, plus
+                // master toggle. Click flags (save / apply / delete /
+                // toggle-HT / open-ini / autoApply-changed) are RESET
+                // here and READ after Render below -- one-shot events
+                // triggered by user clicks during the frame.
+                {
+                    gs.profileEntries.clear();
+                    gs.profileEntries.reserve(app.profiles.size());
+                    for (const auto& p : app.profiles)
+                    {
+                        GuiState::ProfileEntry e;
+                        e.name = p.name;
+                        e.includeHT = p.includeHeadTracking;
+                        gs.profileEntries.push_back(std::move(e));
+                    }
+                    gs.profilesAutoApply        = app.profilesAutoApply;
+                    gs.profilesAutoApplyChanged = false;
+                    gs.profileSaveCurrent       = false;
+                    gs.profileApplyIndex        = -1;
+                    gs.profileUpdateIndex       = -1;
+                    gs.profileDeleteIndex       = -1;
+                    gs.profileToggleHTIndex     = -1;
+                    gs.profilesOpenIni          = false;
+                }
                 // What's being weaved, for the GUI's collapsed summary line.
                 if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
                 {
@@ -4216,14 +4731,132 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 }
                 if (gs.openTrackCalibrate)
                     app.openTrack.CalibrateNeutral();
+                // Profiles apply-back: consume click flags from the GUI.
+                if (gs.profilesAutoApplyChanged)
+                {
+                    app.profilesAutoApply = gs.profilesAutoApply;
+                    Settings::WriteAutoApplyProfiles(app.profilesAutoApply);
+                    RefreshForegroundHook(app);
+                }
+                if (gs.profileSaveCurrent)
+                    SaveCurrentAsProfile(app);
+                if (gs.profileApplyIndex >= 0 &&
+                    (size_t)gs.profileApplyIndex < app.profiles.size())
+                {
+                    // Manual apply (tray menu path) -- no captureHwnd,
+                    // format-only re-bind.
+                    ApplyProfile(app, app.profiles[(size_t)gs.profileApplyIndex]);
+                }
+                if (gs.profileUpdateIndex >= 0 &&
+                    (size_t)gs.profileUpdateIndex < app.profiles.size())
+                {
+                    // Update: overwrite the selected profile's settings
+                    // with the current state. Keeps name + exe + title +
+                    // includeHeadTracking; refreshes everything else.
+                    // Lets the user "I tweaked the format/swap mid-game,
+                    // save those tweaks back to the profile."
+                    Profile& p = app.profiles[(size_t)gs.profileUpdateIndex];
+                    p.format       = app.format;
+                    p.swapEyes     = app.swapEyes;
+                    p.convergence  = app.convergence;
+                    p.anaglyphCombo  = app.anaglyphCombo;
+                    p.anaglyphMode   = app.anaglyphMode;
+                    p.pulfrichMode   = (int)app.pulfrichMode;
+                    p.pulfrichDelay  = app.pulfrichDelay;
+                    p.pulfrichNd     = app.pulfrichNd;
+                    p.framePackMode  = app.framePackMode;
+                    p.quiltCols      = app.quiltCols;
+                    p.quiltRows      = app.quiltRows;
+                    p.quiltLeftIdx   = app.quiltLeftIdx;
+                    p.quiltRightIdx  = app.quiltRightIdx;
+                    // Refresh the HT snapshot too if the profile is
+                    // currently flagged to carry HT settings -- same
+                    // "you're updating the profile, capture everything"
+                    // semantic as the per-row HT-on toggle.
+                    if (p.includeHeadTracking)
+                    {
+                        p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
+                        p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
+                        p.htTrackIR     = app.openTrack.IsTrackIREnabled();
+                        const auto cfg  = app.openTrack.GetConfig();
+                        p.htOutputMode  = cfg.outputMode;
+                        p.htInvertX     = cfg.invertX;
+                        p.htInvertY     = cfg.invertY;
+                        p.htInvertZ     = cfg.invertZ;
+                        p.htInvertYaw   = cfg.invertYaw;
+                        p.htInvertPitch = cfg.invertPitch;
+                        p.htInvertRoll  = cfg.invertRoll;
+                    }
+                    Profiles::Save(app.profiles);
+                    Log("Profiles: updated '%s' from current state", p.name.c_str());
+                }
+                if (gs.profileDeleteIndex >= 0 &&
+                    (size_t)gs.profileDeleteIndex < app.profiles.size())
+                {
+                    const std::string name = app.profiles[(size_t)gs.profileDeleteIndex].name;
+                    Log("Profiles: deleted '%s'", name.c_str());
+                    app.profiles.erase(app.profiles.begin() + gs.profileDeleteIndex);
+                    Profiles::Save(app.profiles);
+                    if (app.lastAppliedProfile == name)
+                        app.lastAppliedProfile.clear();
+                }
+                if (gs.profileToggleHTIndex >= 0 &&
+                    (size_t)gs.profileToggleHTIndex < app.profiles.size())
+                {
+                    Profile& p = app.profiles[(size_t)gs.profileToggleHTIndex];
+                    p.includeHeadTracking = !p.includeHeadTracking;
+                    // When the user flips includeHT ON, snapshot the
+                    // current HT state -- they're saying "remember the
+                    // HT setup I have RIGHT NOW for this game". Otherwise
+                    // the saved ht_* fields are whatever was there at
+                    // save-time, which may be stale.
+                    if (p.includeHeadTracking)
+                    {
+                        p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
+                        p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
+                        p.htTrackIR     = app.openTrack.IsTrackIREnabled();
+                        const auto cfg  = app.openTrack.GetConfig();
+                        p.htOutputMode  = cfg.outputMode;
+                        p.htInvertX     = cfg.invertX;
+                        p.htInvertY     = cfg.invertY;
+                        p.htInvertZ     = cfg.invertZ;
+                        p.htInvertYaw   = cfg.invertYaw;
+                        p.htInvertPitch = cfg.invertPitch;
+                        p.htInvertRoll  = cfg.invertRoll;
+                    }
+                    Profiles::Save(app.profiles);
+                }
+                if (gs.profilesOpenIni)
+                {
+                    Profiles::Save(app.profiles);
+                    PWSTR base = nullptr;
+                    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) && base)
+                    {
+                        std::wstring p = base; CoTaskMemFree(base);
+                        p += L"\\SRLoom\\profiles.ini";
+                        ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                }
             }
+            // After all GUI / WM_COMMAND state changes have settled,
+            // check if the currently-loaded image / video has had its
+            // stereo settings tweaked -- if so, save the new state back
+            // to its media profile. Throttled internally to avoid INI
+            // hammering on slider drags.
+            AutoSaveMediaProfileIfDirty(app);
         }
     }
+
+    // Shutdown flush: write any pending media-profile changes before the
+    // app exits. Without this, edits made in the last quarter-second of
+    // the session (the throttle window) would be lost.
+    FlushMediaProfileIfDirty(app);
 
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
     UnregisterHotKey(app.hwnd, kHotkeyCalibrate);
+    if (app.fgHook) { UnhookWinEvent(app.fgHook); app.fgHook = nullptr; }
     // UnregisterHotKey(app.hwnd, kHotkeyDetect); // auto-detect disabled
     app.tray.Remove();
     app.gui.Shutdown();

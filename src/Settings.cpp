@@ -14,6 +14,7 @@ namespace
     constexpr wchar_t kSettingsKey[]     = L"Software\\SRLoom";
     constexpr wchar_t kSrLoomValue[]     = L"SRLoom";
     constexpr wchar_t kStartInTrayValue[] = L"StartInTray";
+    constexpr wchar_t kAutoApplyProfilesValue[] = L"AutoApplyProfiles";
 
     DWORD ReadDword(const wchar_t* path, const wchar_t* name, DWORD defaultValue)
     {
@@ -93,5 +94,17 @@ namespace srw::Settings
     void WriteStartInTray(bool enable)
     {
         WriteDword(kSettingsKey, kStartInTrayValue, enable ? 1u : 0u);
+    }
+
+    bool ReadAutoApplyProfiles()
+    {
+        // Default ON -- the only way this hurts is if a user has built a
+        // profile list and forgotten about it. The opt-out is one menu click.
+        return ReadDword(kSettingsKey, kAutoApplyProfilesValue, 1) != 0;
+    }
+
+    void WriteAutoApplyProfiles(bool enable)
+    {
+        WriteDword(kSettingsKey, kAutoApplyProfilesValue, enable ? 1u : 0u);
     }
 }

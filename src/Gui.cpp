@@ -2,6 +2,7 @@
 #include "TrayIcon.h"   // ID_TRAY_* command ids (reused by the GUI)
 #include "AcerSpatialLabs.h"
 #include "UpdateChecker.h"   // user-forced check from the About popup
+#include <algorithm>
 #include "Settings.h"   // run-at-startup / start-in-tray persistence
 #include "resource.h"   // IDI_TRAY (app icon)
 
@@ -139,6 +140,40 @@ namespace
         ImGui::TextUnformatted(label);
         ImGui::PopStyleColor();
         ImGui::Dummy(ImVec2(0, 1));
+    }
+
+    // Same visual as Section() but with a click-to-toggle chevron after
+    // the label. Mutates the open/closed flag in place. Caller wraps the
+    // section body in `if (open) { ... }`. Returns the new open state for
+    // convenience so a single-line idiom works:
+    //     if (CollapsibleHeader("FOO", m_fooOpen)) { ... body ... }
+    bool CollapsibleHeader(const char* hdr, bool& open, float dpiScale,
+                           const char* uniqueId)
+    {
+        ImGui::Dummy(ImVec2(0, 5));
+        const ImVec2 ts   = ImGui::CalcTextSize(hdr);
+        const float  h    = ImGui::GetFrameHeight();
+        const float  s    = 4.0f * dpiScale;
+        const float  gap  = 7.0f * dpiScale;
+        const float  bw   = ts.x + gap + s * 2;
+        const ImVec2 p    = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton(uniqueId, ImVec2(bw, h));
+        if (ImGui::IsItemClicked()) open = !open;
+        const bool hov = ImGui::IsItemHovered();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+        dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+        const float cx = p.x + ts.x + gap + s;
+        const float cy = p.y + h * 0.5f;
+        if (open)
+            dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                  ImVec2(cx + s, cy + s * 0.55f),
+                                  ImVec2(cx,     cy - s * 0.55f), col);
+        else
+            dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                  ImVec2(cx + s, cy - s * 0.55f),
+                                  ImVec2(cx,     cy + s * 0.55f), col);
+        return open;
     }
 
     // A segmented control: a tight row of equal-width cells, the active one filled
@@ -488,18 +523,22 @@ void Gui::ApplyScaling()
 // so an access violation inside is caught instead of killing the process.
 void Gui::ApplyScalingImpl()
 {
+    // Per-step breadcrumbs (added in v2.0.1 to pin IsPepsiOk's Win10 +
+    // Samsung Odyssey font-baker crash) were causing visible flashes on
+    // WM_DPICHANGED: ApplyScaling fires on every monitor-drag, and each
+    // synchronous fopen/fputs/fclose stalls the render thread for a ms
+    // or so. ~17 of those per call easily ate a frame on VRR OLEDs, which
+    // showed up as a black blink. Keep only the entry line + the rare
+    // font-fallback messages -- those fire ~once, not per-rebuild.
     Log("Gui::ApplyScaling: enter (dpiScale=%.2f)", m_dpiScale);
     ImGui::GetStyle() = ImGuiStyle();              // reset to defaults FIRST, else ScaleAllSizes
                                                    // compounds un-reset fields each call (e.g.
                                                    // WindowMinSize) → window slowly inflates and
                                                    // pushes the theme button off-window.
-    Log("Gui::ApplyScaling: ApplyTheme");
     ApplyTheme(m_lightMode);                       // base (unscaled) sizes + colours
-    Log("Gui::ApplyScaling: ScaleAllSizes");
     ImGui::GetStyle().ScaleAllSizes(m_dpiScale);   // scale paddings/rounding to DPI
 
     ImGuiIO& io = ImGui::GetIO();
-    Log("Gui::ApplyScaling: io.Fonts->Clear");
     io.Fonts->Clear();
     const float s = m_dpiScale;
     // Body = Inter (bundled, SIL OFL) — the open-source SF-Pro-like UI font Reeder's
@@ -521,16 +560,12 @@ void Gui::ApplyScalingImpl()
         ImFontConfig cfg; cfg.FontDataOwnedByAtlas = false;
         return io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int)sz, px, &cfg, ranges);
     };
-    Log("Gui::ApplyScaling: body font (Inter Regular)");
     m_fontRegular = addEmbedded(IDR_FONT_REGULAR, 17.0f * s, bodyRange);
     if (!m_fontRegular) { Log("Gui::ApplyScaling: Inter Regular failed -> SegUIVar.ttf"); m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s, nullptr, bodyRange); }
     if (!m_fontRegular) { Log("Gui::ApplyScaling: SegUIVar.ttf failed -> AddFontDefault"); m_fontRegular = io.Fonts->AddFontDefault(); }
-    Log("Gui::ApplyScaling: body font done (ptr=%p)", (void*)m_fontRegular);
-    Log("Gui::ApplyScaling: hero font (Inter SemiBold)");
     ImFont* big = addEmbedded(IDR_FONT_SEMIBOLD, 23.0f * s);
     if (!big) { Log("Gui::ApplyScaling: Inter SemiBold failed -> seguisb.ttf"); big = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 23.0f * s); }
     m_fontLarge = big ? big : m_fontRegular;
-    Log("Gui::ApplyScaling: hero font done (ptr=%p)", (void*)m_fontLarge);
     // Windows' own caption-button glyphs: Segoe Fluent Icons (Win11) -> Segoe
     // MDL2 Assets (Win10). Baked at the native ~10px so the min/max/close
     // look like the OS's. If BOTH font files fail to load (e.g. corrupted
@@ -538,21 +573,13 @@ void Gui::ApplyScalingImpl()
     // and the About popup both null-check it and fall back to drawn glyphs.
     static const ImWchar iconRange[] = { 0xE700, 0xE9FF, 0 };
     m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegoeIcons.ttf", 10.0f * s, nullptr, iconRange);
-    if (m_fontIcons) Log("Gui::ApplyScaling: icon font = SegoeIcons.ttf (Win11)");
     if (!m_fontIcons)
-    {
         m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segmdl2.ttf", 10.0f * s, nullptr, iconRange);
-        if (m_fontIcons) Log("Gui::ApplyScaling: icon font = segmdl2.ttf (Win10 fallback)");
-    }
     if (!m_fontIcons)
         Log("Gui::ApplyScaling: icon font UNAVAILABLE (both SegoeIcons.ttf and segmdl2.ttf failed) -- using drawn-glyph fallback");
-    Log("Gui::ApplyScaling: io.Fonts->Build");
     io.Fonts->Build();
-    Log("Gui::ApplyScaling: SetFontDefault");
     io.FontDefault = m_fontRegular;
-    Log("Gui::ApplyScaling: ImGui_ImplDX11_InvalidateDeviceObjects");
     ImGui_ImplDX11_InvalidateDeviceObjects();      // recreate the font texture next frame
-    Log("Gui::ApplyScaling: font atlas rebuilt");
 
     // Recolour the native title bar to match the app (keeps the native min/max/close
     // buttons, just tinted). Caption + text + thin border; dark-mode flag controls
@@ -1026,7 +1053,7 @@ bool Gui::Render(GuiState& state)
     {
         // What to weave. The source choice implies the output: Monitor = fullscreen,
         // a picked Window = windowed overlay; Looking Glass is the floating loupe.
-        Section("DISPLAY");
+        if (CollapsibleHeader("DISPLAY", m_displaySectionOpen, m_dpiScale, "##displayhdr"))
         {
             const float gap = 10.0f;
             const float half = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
@@ -1133,7 +1160,7 @@ bool Gui::Render(GuiState& state)
             if (ImGui::Button("Make Active Window 3D", ImVec2(half, 0))) post(ID_TRAY_CAPTURE_FOREGROUND);
         }
 
-        Section("STEREO 3D INPUT");
+        if (CollapsibleHeader("STEREO 3D INPUT", m_stereoInputSectionOpen, m_dpiScale, "##stereohdr"))
         {
             // Category combo (whole list, no scroll). SBS / TAB / Interleaved /
             // VR180 / VR360 expose a second "variant" combo for the layout.
@@ -1392,31 +1419,68 @@ bool Gui::Render(GuiState& state)
         // VR VIEWER / LIGHT FIELD when those conditional sections render),
         // since they're adjustments to the input rather than a category of
         // their own. Saves a heading + a few pixels in the panel.
-        if (RowToggle("Swap Eyes", state.swapEyes)) post(ID_TRAY_SWAP_EYES);
-        // Two depth controls: convergence (zero-plane shift) + separation (depth scale).
-        auto adjSlider = [&](const char* label, const char* id, float* v) -> bool {
-            const float startX  = ImGui::GetCursorPosX();
-            const float labelCol = ImGui::CalcTextSize("Convergence").x + ImGui::GetStyle().ItemSpacing.x * 2;
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(label);
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(startX + labelCol);   // line the sliders up in one column
-            const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
-            bool ch = ImGui::SliderFloat(id, v, -1.0f, 1.0f, "%.2f");
-            ImGui::SameLine();
-            ImGui::PushID(id);
-            if (ImGui::Button("Reset", ImVec2(resetW, 0))) { *v = 0.0f; ch = true; }
-            ImGui::PopID();
-            return ch;
-        };
-        if (adjSlider("Convergence", "##conv", &state.convergence)) convChanged = true;
+        //
+        // STEREO 3D INPUT is collapsible -- hide these with it. VR VIEWER /
+        // LIGHT FIELD are their own (always-open) conditional sections, and
+        // both keep these controls visible when active.
+        const bool showInputAdjust =
+            m_stereoInputSectionOpen || IsVRFormat(state.format) ||
+            state.format == StereoFormat::LightField;
+        if (showInputAdjust)
+        {
+            if (RowToggle("Swap Eyes", state.swapEyes)) post(ID_TRAY_SWAP_EYES);
+            // Two depth controls: convergence (zero-plane shift) + separation (depth scale).
+            auto adjSlider = [&](const char* label, const char* id, float* v) -> bool {
+                const float startX  = ImGui::GetCursorPosX();
+                const float labelCol = ImGui::CalcTextSize("Convergence").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(label);
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(startX + labelCol);   // line the sliders up in one column
+                const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
+                bool ch = ImGui::SliderFloat(id, v, -1.0f, 1.0f, "%.2f");
+                ImGui::SameLine();
+                ImGui::PushID(id);
+                if (ImGui::Button("Reset", ImVec2(resetW, 0))) { *v = 0.0f; ch = true; }
+                ImGui::PopID();
+                return ch;
+            };
+            if (adjSlider("Convergence", "##conv", &state.convergence)) convChanged = true;
+        }
 
-        // HEADTRACKING section -- non-collapsible, sits right after ADJUST.
-        // OpenTrack UDP toggle + mode buttons + Calibrate + Launch OpenTrack.
-        // Defaults ON whenever an SR session is active; user toggle overrides
-        // for the rest of that session (cleared on session end).
-        Section("HEADTRACKING");
+        // HEADTRACKING section -- now collapsible (default expanded).
+        // Same chevron-header pattern as ACER SPATIALLABS / STARTUP /
+        // PROFILES. OpenTrack UDP toggle + mode buttons + Calibrate +
+        // Launch OpenTrack. Defaults ON whenever an SR session is active;
+        // user toggle overrides for the rest of that session.
+        ImGui::Dummy(ImVec2(0, 5));
+        {
+            const char* hdr   = "HEADTRACKING";
+            const ImVec2 ts   = ImGui::CalcTextSize(hdr);
+            const float  h    = ImGui::GetFrameHeight();
+            const float  s    = 4.0f * m_dpiScale;
+            const float  gap  = 7.0f * m_dpiScale;
+            const float  bw   = ts.x + gap + s * 2;
+            const ImVec2 p    = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##headtrkhdr", ImVec2(bw, h));
+            if (ImGui::IsItemClicked()) m_headTrackingSectionOpen = !m_headTrackingSectionOpen;
+            const bool hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+            dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+            const float cx = p.x + ts.x + gap + s;
+            const float cy = p.y + h * 0.5f;
+            if (m_headTrackingSectionOpen)
+                dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                      ImVec2(cx + s, cy + s * 0.55f),
+                                      ImVec2(cx,     cy - s * 0.55f), col);
+            else
+                dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                      ImVec2(cx + s, cy - s * 0.55f),
+                                      ImVec2(cx,     cy + s * 0.55f), col);
+        }
+        if (m_headTrackingSectionOpen)
         {
             // Protocol picker: checkbox-combo over OpenTrack UDP +
             // FreeTrack 2.0 Enhanced. Either, both, or none can be active;
@@ -1606,6 +1670,173 @@ bool Gui::Render(GuiState& state)
                 // typical ascender offset for arrows in body fonts.
                 const float arrYAdj = -0.10f * lblSz.y;
                 dl->AddText(ImVec2(startX + lblSz.x, baseY + arrYAdj), col, arr);
+            }
+        }
+
+        // PROFILES section -- per-game auto-apply (NTM AutoCP-Launcher style).
+        // Collapsible header matching ACER SPATIALLABS / STARTUP visual.
+        // Body: master toggle, "save current" button, scrollable list with
+        // delete-X per row, "Open profiles.ini" link. List is populated by
+        // main from app.profiles each frame; click handlers set request
+        // flags that main consumes after Render returns.
+        ImGui::Dummy(ImVec2(0, 5));
+        {
+            const char* hdr   = "PROFILES";
+            const ImVec2 ts   = ImGui::CalcTextSize(hdr);
+            const float  h    = ImGui::GetFrameHeight();
+            const float  s   = 4.0f * m_dpiScale;
+            const float  gap = 7.0f * m_dpiScale;
+            const float  bw  = ts.x + gap + s * 2;
+            const ImVec2 p   = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##profileshdr", ImVec2(bw, h));
+            if (ImGui::IsItemClicked()) m_profilesSectionOpen = !m_profilesSectionOpen;
+            const bool hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+            dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+            const float cx = p.x + ts.x + gap + s;
+            const float cy = p.y + h * 0.5f;
+            if (m_profilesSectionOpen)
+                dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                      ImVec2(cx + s, cy + s * 0.55f),
+                                      ImVec2(cx,     cy - s * 0.55f), col);
+            else
+                dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                      ImVec2(cx + s, cy - s * 0.55f),
+                                      ImVec2(cx,     cy + s * 0.55f), col);
+        }
+        if (m_profilesSectionOpen)
+        {
+            // Top row: [label "Enable Profiles" + toggle | "Open profiles.ini ↗" button]
+            // Compact split so the most-used controls (enable + jump to
+            // edit file) live on one line.
+            const float availTop = ImGui::GetContentRegionAvail().x;
+            const float gapTop   = ImGui::GetStyle().ItemSpacing.x;
+            const float halfTop  = (availTop - gapTop) * 0.5f;
+            const float togW     = ImGui::GetFrameHeight() * 1.8f;
+            const float startXTop= ImGui::GetCursorPosX();
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Enable Profiles");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Auto-apply a profile when its game is focused.");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(startXTop + halfTop - togW);
+            if (ToggleSwitch("##enableprofiles", state.profilesAutoApply))
+            {
+                state.profilesAutoApply        = !state.profilesAutoApply;
+                state.profilesAutoApplyChanged = true;
+            }
+            ImGui::SameLine(0, gapTop);
+            // Right half: open-INI launcher with the same NE-arrow + custom
+            // render trick the OpenTrack launch button uses (no inter-glyph
+            // gap, arrow nudged up to the cap line).
+            {
+                const ImVec2 btnTL = ImGui::GetCursorScreenPos();
+                const bool clicked = ImGui::Button("##openini_btn", ImVec2(halfTop, 0));
+                if (clicked) state.profilesOpenIni = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Open %%LOCALAPPDATA%%\\SRLoom\\profiles.ini");
+                const char* lbl = "Open profiles.ini";
+                const char* arr = "\xE2\x86\x97";
+                const ImVec2 lblSz = ImGui::CalcTextSize(lbl);
+                const ImVec2 arrSz = ImGui::CalcTextSize(arr);
+                const float totalW = lblSz.x + arrSz.x;
+                const float btnH = ImGui::GetItemRectSize().y;
+                const float baseY = btnTL.y + (btnH - lblSz.y) * 0.5f;
+                const float startX = btnTL.x + (halfTop - totalW) * 0.5f;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+                dl->AddText(ImVec2(startX, baseY), col, lbl);
+                const float arrYAdj = -0.10f * lblSz.y;
+                dl->AddText(ImVec2(startX + lblSz.x, baseY + arrYAdj), col, arr);
+            }
+
+            // Save current as profile -- still full-width, the primary
+            // "add" action so it should be prominent.
+            const float availSave = ImGui::GetContentRegionAvail().x;
+            if (ImGui::Button("Save Current Window Settings As Profile", ImVec2(availSave, 0)))
+                state.profileSaveCurrent = true;
+
+            if (!state.profileEntries.empty())
+            {
+                // (no Dummy spacer here -- ImGui's normal ItemSpacing.y
+                // already gives this row the same gap as everything else
+                // in the section, an explicit extra dummy looked off.)
+                // Dropdown of saved profiles -- scales to any number of
+                // entries without bloating the panel. Selection is purely
+                // visual ("which row is the user looking at"); per-row
+                // actions live below: Apply / HT-toggle / Delete.
+                static int s_selected = 0;
+                if (s_selected >= (int)state.profileEntries.size()) s_selected = 0;
+                const float availList = ImGui::GetContentRegionAvail().x;
+                ImGui::SetNextItemWidth(availList);
+                if (ImGui::BeginCombo("##profiles_list",
+                                      state.profileEntries[s_selected].name.c_str()))
+                {
+                    for (int i = 0; i < (int)state.profileEntries.size(); ++i)
+                    {
+                        const bool sel = (i == s_selected);
+                        // Suffix " (HT)" on rows whose profile includes
+                        // head-tracking, so the dropdown preview itself
+                        // tells you at a glance which ones carry HT.
+                        std::string label = state.profileEntries[i].name;
+                        if (state.profileEntries[i].includeHT) label += "  (HT)";
+                        if (ImGui::Selectable(label.c_str(), sel)) s_selected = i;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                // Action row beneath the dropdown: Update / HT / Delete
+                // all act on the currently-selected entry. Three buttons
+                // share the row width equally. There's no manual "Apply"
+                // button here because the auto-apply hook already fires
+                // a profile when its matching game gets focused; the
+                // useful action is "I just tweaked the format / swap /
+                // convergence -- save those tweaks back to this profile."
+                const float spc   = ImGui::GetStyle().ItemSpacing.x;
+                const float thirdW = (availList - spc * 2) / 3.0f;
+                if (ImGui::Button("Update", ImVec2(thirdW, 0)))
+                    state.profileUpdateIndex = s_selected;
+                if (ImGui::IsItemHovered())
+                {
+                    const float maxW = 300.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::Text("Overwrite '%s' with the current stereo settings (format, swap eyes, convergence, etc).",
+                                state.profileEntries[s_selected].name.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine(0, spc);
+                const bool inclHT = state.profileEntries[s_selected].includeHT;
+                ImGui::PushStyleColor(ImGuiCol_Text, inclHT ? g_accent : g_dim);
+                if (ImGui::Button(inclHT ? "HT: ON" : "HT: off", ImVec2(thirdW, 0)))
+                    state.profileToggleHTIndex = s_selected;
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                {
+                    const float maxW = 300.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(inclHT
+                        ? "Profile includes head-tracking settings (output mode + per-axis inverts + active protocols). Click to exclude."
+                        : "Profile does NOT include head-tracking settings. Click to snapshot the current HT state into this profile.");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine(0, spc);
+                if (ImGui::Button("Delete", ImVec2(thirdW, 0)))
+                    state.profileDeleteIndex = s_selected;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Delete profile '%s'", state.profileEntries[s_selected].name.c_str());
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
+                ImGui::TextWrapped("No profiles yet. Focus a game, then come back here and click Save above.");
+                ImGui::PopStyleColor();
             }
         }
 

@@ -133,6 +133,10 @@ add_executable(SRLoom WIN32
     src/Gui.cpp
     src/AcerSpatialLabs.cpp
     src/Settings.cpp
+    src/Profiles.cpp
+    src/Profiles.h
+    src/MediaProfiles.cpp
+    src/MediaProfiles.h
     src/VideoSource.cpp
     src/UpdateChecker.cpp
     src/UpdateChecker.h
