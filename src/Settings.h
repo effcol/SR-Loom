@@ -22,4 +22,25 @@ namespace srw::Settings
     // Stored as DWORD under HKCU\Software\SRLoom\AutoApplyProfiles.
     bool ReadAutoApplyProfiles();
     void WriteAutoApplyProfiles(bool enable);
+
+    // Whether SR Loom should turn on head-tracking output (OpenTrack UDP +
+    // FreeTrack + TrackIR) automatically at launch. Default ON so the
+    // common case ("I want head tracking in games") works out of the box.
+    // Users who don't use head tracking can flip it off in STARTUP and
+    // avoid the SR camera engaging just because SR Loom is running.
+    // Stored as DWORD under HKCU\Software\SRLoom\HeadTrackingOnStartup.
+    bool ReadHeadTrackingOnStartup();
+    void WriteHeadTrackingOnStartup(bool enable);
+
+    // Katanga auto-receive: when a game (or bridge, e.g. the 3D Slicer
+    // extension) starts publishing frames over Katanga, SR Loom switches to
+    // receiving them automatically, and restores the previous setup when it
+    // stops. Default ON. HKCU\Software\SRLoom\KatangaAutoReceive.
+    bool ReadKatangaAutoReceive();
+    void WriteKatangaAutoReceive(bool enable);
+
+    // Windows' app light/dark mode (HKCU ...\Themes\Personalize\
+    // AppsUseLightTheme). The panel and the Looking Glass title bar follow
+    // it, and re-read it on WM_SETTINGCHANGE so a live switch is picked up.
+    bool ReadSystemUsesLightTheme();
 }

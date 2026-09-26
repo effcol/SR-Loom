@@ -165,6 +165,16 @@ add_executable(SRLoom WIN32
     ${IMGUI_SOURCES}
 )
 
+# Release PDB, kept locally (not shipped, *.pdb is gitignored). The crash
+# handler logs "SRLoom.exe +0x<RVA>"; keep the PDB that matches each
+# released exe so a user's log can be resolved to a function/line.
+# /DEBUG turns /OPT:REF + /OPT:ICF off by default -- re-enable them so the
+# exe stays as lean as before (it only gains a small PDB-path record).
+if(MSVC)
+    target_compile_options(SRLoom PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(SRLoom PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+endif()
+
 target_include_directories(SRLoom PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party

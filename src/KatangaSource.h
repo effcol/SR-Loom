@@ -36,6 +36,18 @@ namespace srw
         int Height() const { return m_height; }
         DXGI_FORMAT Format() const { return m_format; }
 
+        // Bumped every time a (new) shared texture is opened. A publisher
+        // that resizes (e.g. the 3D Slicer bridge's render-scale slider)
+        // swaps to a new texture while "receiving" stays true -- the render
+        // loop compares this to know it must re-bind the weaver's input,
+        // instead of leaving it on the released texture.
+        unsigned Generation() const { return m_generation; }
+
+        // Cheap probe, no device needed: is anyone publishing a (non-zero)
+        // Katanga texture handle right now? Used by auto-receive while SR
+        // Loom isn't in Katanga mode.
+        static bool PublisherPresent();
+
     private:
         bool TryOpenTexture(HANDLE sharedHandle);
         void ReleaseTexture();
@@ -52,5 +64,6 @@ namespace srw
         int                       m_height         = 0;
         DXGI_FORMAT               m_format         = DXGI_FORMAT_UNKNOWN;
         DWORD                     m_lastPollTick   = 0;
+        unsigned                  m_generation     = 0;
     };
 }

@@ -31,6 +31,7 @@
 #include <shlobj.h>        // SHGetKnownFolderPath, SHCreateDirectoryExW (NPClient extract)
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -120,11 +121,12 @@ namespace
         // FT_SharedMem the DLL reads from. Empty when not detected; GUI
         // greys the TrackIR checkbox + shows "(Please install OpenTrack)".
         std::string  npClientDir;
-        // Auto-enable policy: OpenTrack turns on with each SR session and off when it
-        // ends. The user toggle in ADJUST can override -- if the user disables it mid-
-        // session we set openTrackUserDisabled, then suppress the auto-enable on the
-        // next session start. The flag clears whenever a session ends, so the auto-on
-        // behaviour resumes from the next fresh weave.
+        // Auto-enable policy: head-tracking outputs come on at launch (unless
+        // "Head Tracking On Startup" is off) and are opportunistically re-enabled
+        // on weave-start if the launch attempt failed. They stay on across
+        // weave-stop. openTrackUserDisabled records "the user turned all outputs
+        // off" (GUI / tray toggles, or startup-off) and suppresses that
+        // re-enable; it clears only when the user turns an output back on.
         bool         openTrackUserDisabled = false;
         // Per-game profile auto-apply (NTM-style). The list is loaded from
         // %LOCALAPPDATA%\SRLoom\profiles.ini at startup and re-saved on edit.
@@ -140,6 +142,47 @@ namespace
         // user closed+relaunched a game, the new HWND matched the saved
         // profile, but the name-debounce blocked the apply.
         HWND                  lastAppliedHwnd = nullptr;
+        // Profile name + window title of the last AUTO apply (foreground
+        // hook / poll). Separate from lastAppliedProfile, which the manual
+        // tray/GUI apply also sets: a manual pick must not make the poll
+        // think "different profile" and re-apply over it. The title lets
+        // format=auto profiles re-detect when the same window's title
+        // changes (VLC moving to the next playlist file).
+        std::string           lastAutoAppliedProfile;
+        std::string           lastAutoAppliedTitle;
+        // Currently-tracked "fullscreen-condition profile" HWND. Set by
+        // ApplyProfile when it applies a fullscreenOnly profile to a window
+        // (and cleared when it applies anything else). The periodic poll
+        // watches this HWND; when it stops being fullscreen (or is
+        // destroyed) while we're still weaving it, we auto-disable the
+        // weave. Cleared on disable.
+        HWND                  activeFullscreenProfileHwnd = nullptr;
+        // Taskbar cut-out currently applied to the weave window's region (in
+        // screen coords), so the 250ms poll only calls SetWindowRgn when the
+        // taskbar actually shows / hides / moves. See UpdateTaskbarCutout.
+        // Source-switch hand-off (weave-a-window <-> fullscreen etc.). A new
+        // capture session takes a few frames to deliver its first frame.
+        // Restyling/resizing the weave window straight away meant those
+        // frames showed the OLD image in the NEW geometry (the flicker).
+        // While captureWarmup is set, ApplyMode is deferred (the window
+        // keeps its old shape, showing the last good frame); the first new
+        // frame -- or a 250ms timeout -- applies the mode and renders the new
+        // source in one step.
+        bool                  captureWarmup = false;
+        DWORD                 captureWarmupStartMs = 0;
+        bool                  modeApplyDeferred = false;
+        // Holes currently cut out of the weave window's region (screen coords):
+        // the taskbar plus any system-UI window above the weave (Start, toasts,
+        // Game Bar, Alt+Tab...). taskbarCutActive = any cut-out is applied.
+        bool                  taskbarCutActive = false;
+        std::vector<RECT>     weaveCuts;
+        RECT                  taskbarCutWindow{};   // our window rect the cuts were made for
+        // System-UI rects recently seen above the weave, with the time last
+        // seen. A hole lingers ~200ms after its window goes: the capture runs
+        // a frame or two behind, so closing the hole instantly would weave a
+        // ghost of e.g. the Start menu's last position (the "trail").
+        std::vector<std::pair<RECT, DWORD>> recentUiCuts;
+        DWORD                 lastFullscreenPollMs = 0;
         // WinEventHook handle for EVENT_SYSTEM_FOREGROUND. Posts back to
         // the main window via WM_APP_FOREGROUND_CHANGED with the new HWND
         // in lParam; the handler walks profiles, matches, applies.
@@ -179,6 +222,18 @@ namespace
         // games that self-set HWND_TOPMOST on activation can't pop above
         // our weave. Null if discovery failed or no game is publishing.
         HWND       katangaPublisherWnd = nullptr;
+        unsigned   katangaGeneration   = 0;   // last KatangaSource::Generation() bound to the weaver
+        // Katanga auto-receive (Settings::ReadKatangaAutoReceive). While
+        // katangaAuto is set, SR Loom switched itself into Katanga because a
+        // sender appeared; the saved state is restored when it stops.
+        bool         katangaAuto            = false;
+        DWORD        katangaAutoStartMs     = 0;
+        DWORD        katangaAutoLastPollMs  = 0;
+        bool         katangaAutoBlocked     = false;   // see PollKatangaAutoReceive
+        StereoFormat katangaPrevFormat      = StereoFormat::HalfSBS;
+        OutputMode   katangaPrevMode        = OutputMode::Fullscreen;
+        bool         katangaPrevWeaving     = false;
+        RECT         katangaPlacedRect{};     // where the Katanga weave was last placed
 
         // VR180 / VR360 viewer state (used by the VR converter shader path).
         // yaw / pitch in RADIANS; zoom in [0.2 .. 3.0] (1 = ~90° horizontal
@@ -271,6 +326,10 @@ namespace
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
         bool       loupeActive    = false;   // looking glass shown (keep its position across re-applies)
+        // Last Looking Glass window rect, saved whenever we leave it (e.g. to
+        // Fullscreen) so coming back restores the exact position + size.
+        RECT       loupeSavedRect{};
+        bool       loupeHasSaved  = false;
         bool       captureRebind  = false;   // re-register SRV on next frame
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
         HMONITOR   sourceMonitor  = nullptr; // monitor being captured (passthrough / display picker)
@@ -1262,10 +1321,154 @@ namespace
 
     // ------------------------------------------------------------------------
 
+    // Per-eye content aspect for the current source + format. Used to size
+    // the Windowed / Looking Glass window so it matches the 3D content shape
+    // (no letterbox bars inside). FullSBS crops to centre 50% vertical so
+    // per-eye is w/2 over h/2; HalfSBS per-eye is w/2 over h; TAB per-eye
+    // is w over h/2; etc.
+    double ContentAspect(const AppState& app)
+    {
+        double aspect = 16.0 / 9.0;
+        int sw = 0, sh = 0;
+        if (app.source == SourceKind::TestImage)
+        {
+            if (app.format == StereoFormat::LightField && app.lfpRenderer.HasData())
+            {
+                sw = app.lfpRenderer.OutputPerEyeWidth();
+                sh = app.lfpRenderer.OutputHeight();
+            }
+            else if (app.video.IsOpen()) { sw = app.video.Width(); sh = app.video.Height(); }
+            else                         { sw = app.weaver.SourceWidth(); sh = app.weaver.SourceHeight(); }
+        }
+        else
+        {
+            // Live capture: source dims come from the active capture.
+            if (app.dxgiActive)              { sw = app.captureDxgi.Width(); sh = app.captureDxgi.Height(); }
+            else if (app.capture.IsActive()) { sw = app.capture.Width();     sh = app.capture.Height(); }
+        }
+        if (sw <= 0 || sh <= 0) return aspect;
+        double aw = (double)sw, ah = (double)sh;
+        switch (app.format)
+        {
+        case StereoFormat::Quilt:
+            if (app.quiltCols > 0 && app.quiltRows > 0) {
+                aw /= app.quiltCols; ah /= app.quiltRows;
+            }
+            break;
+        case StereoFormat::FullSBS:
+            aw *= 0.5; ah *= 0.5; break;
+        case StereoFormat::HalfSBS:           aw *= 0.5; break;
+        case StereoFormat::FullTAB:
+        case StereoFormat::HalfTAB:
+        case StereoFormat::RowInterleaved:    ah *= 0.5; break;
+        case StereoFormat::ColumnInterleaved: aw *= 0.5; break;
+        default: break;
+        }
+        if (aw > 0 && ah > 0) aspect = aw / ah;
+        return aspect;
+    }
+
+    // Looking Glass format change: re-fit the window to the new content
+    // aspect WITHOUT moving it. Keeps the window's top-left corner and
+    // height exactly where the user put them and only changes the width
+    // (clamped to the SR display). A plain resize -- no restyle, no
+    // swap-chain or z-order churn -- so the loupe doesn't jump or flicker.
+    RECT FitRectToAspectKeepingPos(const RECT& r, double aspect, const RECT& d);   // fwd decl
+
+    void RefitLoupeKeepingPosition(AppState& app)
+    {
+        RECT wr{};
+        if (!GetWindowRect(app.hwnd, &wr)) return;
+        const RECT nr = FitRectToAspectKeepingPos(wr, ContentAspect(app), app.srDisplayRect);
+        const int w = nr.right - nr.left, h = nr.bottom - nr.top;
+        if (w == wr.right - wr.left && h == wr.bottom - wr.top) return;
+        SetWindowPos(app.hwnd, nullptr, 0, 0, w, h,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void UpdateTaskbarCutout(AppState& app, bool force);   // fwd decl (defined below)
+    void ApplyMode(AppState& app);                         // fwd decl (defined below)
+
+    // Native title bar (Looking Glass / Windowed) in Windows' light/dark app
+    // mode, with ONE fixed caption colour for active and inactive. Without a
+    // fixed colour it spawned in the bright "active" caption and flashed
+    // until it lost focus. 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 20H1+),
+    // 34/35/36 = border / caption / text colour (Win11; ignored on Win10).
+    // Re-applied on WM_SETTINGCHANGE so a live theme switch is picked up.
+    void ApplyCaptionTheme(HWND hwnd)
+    {
+        const bool     light   = Settings::ReadSystemUsesLightTheme();
+        const BOOL     dark    = light ? FALSE : TRUE;
+        const COLORREF caption = light ? RGB(243, 243, 243) : RGB(32, 32, 32);
+        const COLORREF text    = light ? RGB(28, 28, 28)    : RGB(230, 230, 230);
+        DwmSetWindowAttribute(hwnd, 20, &dark,    sizeof(dark));
+        DwmSetWindowAttribute(hwnd, 34, &caption, sizeof(caption));
+        DwmSetWindowAttribute(hwnd, 35, &caption, sizeof(caption));
+        DwmSetWindowAttribute(hwnd, 36, &text,    sizeof(text));
+    }
+
+    // Keep a rect's top-left and height, change its width to `aspect`,
+    // clamped to the SR display. Used to fit the Looking Glass to an
+    // image/video's shape without moving it.
+    RECT FitRectToAspectKeepingPos(const RECT& r, double aspect, const RECT& d)
+    {
+        const int dw = d.right - d.left, dh = d.bottom - d.top;
+        int h = r.bottom - r.top;
+        int w = (int)(h * aspect + 0.5);
+        const int maxW = (dw > 200) ? dw - 100 : 1280;
+        const int maxH = (dh > 200) ? dh - 100 : 720;
+        if (w > maxW) { w = maxW; h = (int)(w / aspect + 0.5); }
+        if (h > maxH) { h = maxH; w = (int)(h * aspect + 0.5); }
+        if (w < 320) w = 320;
+        if (h < 240) h = 240;
+        return { r.left, r.top, r.left + w, r.top + h };
+    }
+
+    // A capture source switch while the weave is on screen: hold the current
+    // window (shape + last frame) until the new session's first frame. See
+    // AppState::captureWarmup.
+    void BeginCaptureWarmup(AppState& app)
+    {
+        app.captureWarmup        = true;
+        app.captureWarmupStartMs = GetTickCount();
+    }
+
+    // Called by RenderFrame once the new capture delivered a frame (or the
+    // warm-up timed out): apply the deferred mode now, in the same frame the
+    // new source is first drawn.
+    void EndCaptureWarmup(AppState& app)
+    {
+        app.captureWarmup = false;
+        if (!app.modeApplyDeferred) return;
+        app.modeApplyDeferred = false;
+        ApplyMode(app);
+    }
+
     void ApplyMode(AppState& app)
     {
+        // Mid source-switch: keep the old window until the new capture's
+        // first frame arrives (see captureWarmup). RenderFrame applies it.
+        if (app.captureWarmup)
+        {
+            app.modeApplyDeferred = true;
+            return;
+        }
         if (app.mode != OutputMode::LookingGlass)
-            app.loupeActive = false;   // reset so the loupe re-centres next time it's entered
+        {
+            // Leaving the Looking Glass: the window still has the loupe's
+            // geometry here (we haven't restyled yet), so remember it -- the
+            // next Looking Glass entry comes back exactly where it was.
+            if (app.loupeActive)
+            {
+                RECT r{};
+                if (GetWindowRect(app.hwnd, &r) && r.right > r.left && r.bottom > r.top)
+                {
+                    app.loupeSavedRect = r;
+                    app.loupeHasSaved  = true;
+                }
+            }
+            app.loupeActive = false;
+        }
         // Right (min / windowed / close) overlay is ONLY for fullscreen test-image
         // viewing; in windowed mode the native title-bar chrome already does
         // those three actions. Left (settings) overlay shows in both -- it's
@@ -1326,53 +1529,6 @@ namespace
         case OutputMode::Windowed:
         default:
         {
-            // Compute the per-eye content aspect for the current source +
-            // format. Used to size the initial window (so it matches the
-            // 3D content shape -- no letterbox bars around the inside).
-            // FullSBS crops to centre 50% vertical so per-eye is w/2 over
-            // h/2; HalfSBS per-eye is w/2 over h; TAB per-eye is w over
-            // h/2; etc.
-            auto computeAspect = [&]() -> double {
-                double aspect = 16.0 / 9.0;
-                int sw = 0, sh = 0;
-                if (app.source == SourceKind::TestImage)
-                {
-                    if (app.format == StereoFormat::LightField && app.lfpRenderer.HasData())
-                    {
-                        sw = app.lfpRenderer.OutputPerEyeWidth();
-                        sh = app.lfpRenderer.OutputHeight();
-                    }
-                    else if (app.video.IsOpen()) { sw = app.video.Width(); sh = app.video.Height(); }
-                    else                         { sw = app.weaver.SourceWidth(); sh = app.weaver.SourceHeight(); }
-                }
-                else
-                {
-                    // Live capture: source dims come from the active capture.
-                    if (app.dxgiActive)        { sw = app.captureDxgi.Width(); sh = app.captureDxgi.Height(); }
-                    else if (app.capture.IsActive()) { sw = app.capture.Width(); sh = app.capture.Height(); }
-                }
-                if (sw <= 0 || sh <= 0) return aspect;
-                double aw = (double)sw, ah = (double)sh;
-                switch (app.format)
-                {
-                case StereoFormat::Quilt:
-                    if (app.quiltCols > 0 && app.quiltRows > 0) {
-                        aw /= app.quiltCols; ah /= app.quiltRows;
-                    }
-                    break;
-                case StereoFormat::FullSBS:
-                    aw *= 0.5; ah *= 0.5; break;
-                case StereoFormat::HalfSBS:           aw *= 0.5; break;
-                case StereoFormat::FullTAB:
-                case StereoFormat::HalfTAB:
-                case StereoFormat::RowInterleaved:    ah *= 0.5; break;
-                case StereoFormat::ColumnInterleaved: aw *= 0.5; break;
-                default: break;
-                }
-                if (aw > 0 && ah > 0) aspect = aw / ah;
-                return aspect;
-            };
-
             const bool isLG = (app.mode == OutputMode::LookingGlass);
             style   = WS_OVERLAPPEDWINDOW;
             zorder  = isLG ? HWND_TOPMOST : HWND_NOTOPMOST;
@@ -1381,13 +1537,26 @@ namespace
             // LG: preserve user-set size after first entry; only size on
             // initial open. Windowed: always re-size to content shape on
             // mode change.
-            if (isLG && app.loupeActive)
+            // Re-entering the Looking Glass (e.g. back from Fullscreen): use
+            // the remembered rect if it's still on the SR display. For an
+            // image/video, fit the width to the (possibly new) content
+            // without moving it; in passthrough the shape is the user's.
+            RECT onScreen{};
+            if (isLG && !app.loupeActive && app.loupeHasSaved &&
+                IntersectRect(&onScreen, &app.loupeSavedRect, &app.srDisplayRect))
+            {
+                rect = app.loupeSavedRect;
+                if (app.source != SourceKind::CaptureMonitor)
+                    rect = FitRectToAspectKeepingPos(rect, ContentAspect(app), app.srDisplayRect);
+                app.loupeActive = true;
+            }
+            else if (isLG && app.loupeActive)
             {
                 GetWindowRect(hwnd, &rect);
             }
             else
             {
-                const double aspect = computeAspect();
+                const double aspect = ContentAspect(app);
                 int h = isLG ? 600 : 720;
                 int w = (int)(h * aspect + 0.5);
                 const int maxW = (dw > 200) ? dw - 100 : 1280;
@@ -1405,8 +1574,36 @@ namespace
         }
         }
 
+        // Going layered: switch to the bit-blt swap chain BEFORE the window
+        // becomes layered. A flip-model chain can't present to a layered
+        // window, so doing it after (the old order) guaranteed a blank frame
+        // on e.g. test-image Fullscreen -> Looking Glass. Going non-layered
+        // keeps the old order (style first, then the flip chain below),
+        // since flip can't be created on a still-layered window. No-op when
+        // the model is already right (passthrough Fullscreen <-> Looking
+        // Glass are both layered and never recreate the chain).
+        if (ct) app.renderer.SetLayered(true);
+        // Katanga armed (selected, but no sender frames yet): keep the weave
+        // window HIDDEN. Showing it here (the WS_VISIBLE style + the
+        // SWP_SHOWWINDOW below) put an empty, black, full-display window up
+        // -- the long-standing "Katanga turns the screen black" bug. The
+        // render loop shows it when the first frame arrives.
+        const bool katangaArmed = (app.format == StereoFormat::Katanga &&
+                                   !app.katanga.IsReceiving());
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
-        SetWindowLongPtr(hwnd, GWL_STYLE, style | WS_VISIBLE);
+        SetWindowLongPtr(hwnd, GWL_STYLE, style | (katangaArmed ? 0 : WS_VISIBLE));
+        // Looking Glass / Windowed use the native title bar: theme it BEFORE
+        // the window is shown in its new style (see ApplyCaptionTheme).
+        if (style & WS_CAPTION) ApplyCaptionTheme(hwnd);
+        else
+        {
+            // Frameless modes (Fullscreen / overlay): no Win11 window border
+            // at all -- otherwise DWM can draw its default light/accent 1px
+            // outline around the weave. 34 = DWMWA_BORDER_COLOR,
+            // 0xFFFFFFFE = DWMWA_COLOR_NONE (Win11; ignored on Win10).
+            const COLORREF none = 0xFFFFFFFE;
+            DwmSetWindowAttribute(hwnd, 34, &none, sizeof(none));
+        }
         if (exStyle & WS_EX_LAYERED)
             SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);  // fully opaque
         // WindowOverlay applies a rounded-rect region per-frame in
@@ -1415,14 +1612,21 @@ namespace
         // stale region left over from a prior WindowOverlay session.
         if (app.mode != OutputMode::WindowOverlay)
             SetWindowRgn(hwnd, nullptr, FALSE);
-        UINT flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW;
-        if (exStyle & WS_EX_NOACTIVATE) flags |= SWP_NOACTIVATE;
+        app.taskbarCutActive = false;   // region cleared; recomputed at the end
+        UINT flags = SWP_FRAMECHANGED | (katangaArmed ? SWP_HIDEWINDOW : SWP_SHOWWINDOW);
+        // The Looking Glass never needs focus when it appears (it's click-
+        // through; grabbing its chrome still activates it normally), and
+        // activating it would steal focus from the app the user is in.
+        if ((exStyle & WS_EX_NOACTIVATE) || app.mode == OutputMode::LookingGlass)
+            flags |= SWP_NOACTIVATE;
         SetWindowPos(hwnd, zorder, rect.left, rect.top,
                      rect.right - rect.left, rect.bottom - rect.top, flags);
 
         // Match the swap-chain model to the window: flip (low-latency) when not
         // click-through, bit-blt when layered (flip can't render on layered windows).
         app.renderer.SetLayered(ct);
+        // Re-cut the taskbar hole for the new window rect (region was cleared above).
+        UpdateTaskbarCutout(app, true);
     }
 
     // The looking glass passes clicks through the glass, but becomes grabbable when
@@ -1431,7 +1635,7 @@ namespace
     // works even while the window is click-through.
     void UpdateLoupeInteractivity(AppState& app)
     {
-        if (app.mode != OutputMode::LookingGlass) return;
+        if (app.mode != OutputMode::LookingGlass || app.modeApplyDeferred) return;
 
         bool interactive;
         if (app.loupeDragging)
@@ -1497,6 +1701,28 @@ namespace
         return std::string(buf);
     }
 
+    // True if `h` currently covers its entire monitor (fullscreen). Used
+    // by the fullscreenOnly profile condition: VLC / MPC / an image viewer
+    // going fullscreen should trigger the weave; going back to windowed
+    // should turn it off. Compares against the FULL monitor rect (not the
+    // work area) since fullscreen apps cover the taskbar too. Small 2-px
+    // tolerance for the window manager's invisible resize border on some
+    // borderless-fullscreen setups.
+    bool IsWindowFullscreen(HWND h)
+    {
+        if (!h || !::IsWindow(h) || !::IsWindowVisible(h)) return false;
+        if (::IsIconic(h)) return false;
+        RECT wr{};
+        if (!::GetWindowRect(h, &wr)) return false;
+        HMONITOR mon = ::MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{ sizeof(mi) };
+        if (!::GetMonitorInfo(mon, &mi)) return false;
+        return wr.left   <= mi.rcMonitor.left   + 2 &&
+               wr.top    <= mi.rcMonitor.top    + 2 &&
+               wr.right  >= mi.rcMonitor.right  - 2 &&
+               wr.bottom >= mi.rcMonitor.bottom - 2;
+    }
+
     // Apply a profile's stereo settings to the running state. Used by
     // both the auto-apply path (foreground match) and the manual
     // "click a profile in the tray menu" path.
@@ -1510,10 +1736,25 @@ namespace
     // tray "apply" path passes nullptr -- it doesn't know which window
     // the user "meant", so it just flips the format and lets the user
     // pick the source themselves.
-    void ApplyProfile(AppState& app, const Profile& p, HWND captureHwnd = nullptr)
+    void ApplyProfile(AppState& app, const Profile& p, HWND captureHwnd = nullptr,
+                      const std::string& currentTitle = std::string())
     {
+        // If the profile has format=auto, resolve the effective format
+        // from the current window title. Recognises tokens like HSBS /
+        // HTAB / _2x1 / MVC / anaglyph / etc. (see Profiles::DetectFormatFromTitle).
+        // Falls back to defaultFormat if nothing recognisable.
+        StereoFormat effFormat = p.format;
+        if (p.useAutoFormat)
+        {
+            bool detected = false;
+            StereoFormat f = Profiles::DetectFormatFromTitle(currentTitle, detected);
+            effFormat = detected ? f : p.defaultFormat;
+            Log("Profile auto-format: title='%s' -> %s (detected=%d, default=%s)",
+                currentTitle.c_str(), Profiles::FormatToString(effFormat),
+                (int)detected, Profiles::FormatToString(p.defaultFormat));
+        }
         Log("Profile apply: '%s' (format=%s swap=%d conv=%.2f hwnd=%p HT=%d)",
-            p.name.c_str(), Profiles::FormatToString(p.format),
+            p.name.c_str(), Profiles::FormatToString(effFormat),
             (int)p.swapEyes, (double)p.convergence, (void*)captureHwnd,
             (int)p.includeHeadTracking);
         // Format + format-specific sub-options. Set the sub-options BEFORE
@@ -1532,7 +1773,7 @@ namespace
         if (p.quiltRows > 0) app.quiltRows = p.quiltRows;
         if (p.quiltLeftIdx  >= 0) app.quiltLeftIdx  = p.quiltLeftIdx;
         if (p.quiltRightIdx >= 0) app.quiltRightIdx = p.quiltRightIdx;
-        ChangeFormat(app, p.format);
+        ChangeFormat(app, effFormat);
         if (captureHwnd)
         {
             UseWindow(app, captureHwnd);   // sets mode = WindowOverlay
@@ -1559,32 +1800,346 @@ namespace
             app.openTrack.SetOutputs(p.htOpenTrack, p.htFreeTrack, p.htTrackIR);
         }
         app.lastAppliedProfile = p.name;
+        // Only a fullscreenOnly profile bound to a real window gets the
+        // "turn off when it leaves fullscreen" tracking. Anything else
+        // (another profile, a manual apply) replaces it, so a stale handle
+        // can't later switch off an unrelated weave.
+        app.activeFullscreenProfileHwnd =
+            (p.fullscreenOnly && captureHwnd) ? captureHwnd : nullptr;
     }
 
-    // Called when WinEventHook reports a foreground-window change.
-    // Walks profile list, applies first match (skipping if the same
-    // profile was applied last -- prevents thrash when alt-tabbing to
-    // and from a game with itself).
+    // True for any window owned by SR Loom's own process (GUI panel,
+    // weave window, fullscreen-control overlay, tray menus).
+    bool IsOwnProcessWindow(HWND h)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        return pid == GetCurrentProcessId();
+    }
+
+    // Called when WinEventHook reports a foreground-window change AND
+    // also polled from the main loop every ~250ms so that entering/exiting
+    // fullscreen without focus change (VLC F11, browser F11) and title
+    // changes (VLC's next playlist file) are still picked up. Walks the
+    // profile list, applies the first match.
     void HandleForegroundChanged(AppState& app, HWND fg)
     {
         if (!app.profilesAutoApply || app.profiles.empty()) return;
+        if (!fg || IsOwnProcessWindow(fg)) return;
         const std::string exe = ForegroundExeBaseName(fg);
         const std::string title = WindowTitle(fg);
         if (exe.empty() && title.empty()) return;
         for (const auto& p : app.profiles)
         {
-            if (Profiles::Matches(p, exe, title))
+            if (!Profiles::Matches(p, exe, title)) continue;
+            // fullscreenOnly gate: only apply when the target window is
+            // actually presenting fullscreen. `continue`, not `return`, so
+            // a later profile for the same app (e.g. a windowed variant)
+            // still gets its chance. The periodic poll keeps re-invoking
+            // us, so entering fullscreen later triggers the apply.
+            if (p.fullscreenOnly && !IsWindowFullscreen(fg)) continue;
+            // Debounce on HWND + profile: same window + same profile = no-op,
+            // but a new HWND (relaunch, different instance) or a different
+            // profile for the same window (windowed -> fullscreen variant)
+            // re-applies.
+            if (fg != app.lastAppliedHwnd || p.name != app.lastAutoAppliedProfile)
             {
-                // Debounce on HWND, not profile name: same window in
-                // foreground = no-op, but a new HWND (relaunch, different
-                // instance) re-applies even if it's the same profile.
-                if (fg != app.lastAppliedHwnd)
-                {
-                    ApplyProfile(app, p, fg);
-                    app.lastAppliedHwnd = fg;
-                }
-                return;
+                ApplyProfile(app, p, fg, title);
+                app.lastAppliedHwnd        = fg;
+                app.lastAutoAppliedProfile = p.name;
+                app.lastAutoAppliedTitle   = title;
             }
+            else if (p.useAutoFormat && title != app.lastAutoAppliedTitle)
+            {
+                // Same window + profile, new title: a media player moved on
+                // to the next file. Re-detect the format only -- a full
+                // re-apply would stomp the user's convergence/swap tweaks.
+                // ChangeFormat doesn't turn weaving on, so a user who paused
+                // the weave stays paused (the new format is ready for when
+                // they resume).
+                app.lastAutoAppliedTitle = title;
+                bool detected = false;
+                const StereoFormat f = Profiles::DetectFormatFromTitle(title, detected);
+                const StereoFormat eff = detected ? f : p.defaultFormat;
+                if (eff != app.format)
+                {
+                    Log("Profile auto-format: title changed '%s' -> %s (detected=%d)",
+                        title.c_str(), Profiles::FormatToString(eff), (int)detected);
+                    ChangeFormat(app, eff);
+                }
+            }
+            return;
+        }
+    }
+
+    // Periodic tick for fullscreen-condition profiles. Handles two events
+    // the WinEventHook doesn't cover: (a) exiting fullscreen without focus
+    // change -> disable the weave; (b) entering fullscreen without focus
+    // change -> apply the profile. Throttled to 250ms so this is cheap
+    // even in the tight render loop.
+    void PollProfileFullscreenState(AppState& app)
+    {
+        const DWORD now = GetTickCount();
+        if (app.lastFullscreenPollMs != 0 && (now - app.lastFullscreenPollMs) < 250)
+            return;
+        app.lastFullscreenPollMs = now;
+
+        // (a) Currently-active fullscreen-condition profile: if its window
+        // stops being fullscreen (or dies), turn the weave off. We do NOT
+        // touch format / other settings -- just disable, so re-entering
+        // fullscreen picks the same profile up cleanly. Only if we're still
+        // weaving that window: if the user has since pointed the weave at
+        // something else, just drop the tracking.
+        if (app.activeFullscreenProfileHwnd)
+        {
+            HWND h = app.activeFullscreenProfileHwnd;
+            if (!::IsWindow(h) || !IsWindowFullscreen(h))
+            {
+                const bool stillOurs = app.weavingEnabled &&
+                                       app.source == SourceKind::CaptureWindow &&
+                                       app.sourceWindow == h;
+                Log("Profile: fullscreen exited (hwnd=%p)%s", (void*)h,
+                    stillOurs ? ", disabling weave" : "");
+                if (stillOurs) SetWeaving(app, false);
+                app.activeFullscreenProfileHwnd = nullptr;
+                app.lastAppliedHwnd = nullptr;
+                app.lastAppliedProfile.clear();
+                app.lastAutoAppliedProfile.clear();
+            }
+        }
+
+        // (b) Foreground window may have entered fullscreen, or changed
+        // title, since we last checked. HandleForegroundChanged is
+        // internally guarded (own windows, no match, not fullscreen yet,
+        // already applied), so calling it every tick is safe + cheap.
+        if (app.profilesAutoApply && !app.profiles.empty())
+            HandleForegroundChanged(app, ::GetForegroundWindow());
+    }
+
+    // --- Weave window vs. taskbar / fullscreen apps ----------------------
+    //
+    // Fullscreen passthrough and the Looking Glass sit in the topmost band so
+    // nothing covers the weave. Two refinements on top of that:
+    //   - the SR display's taskbar is cut OUT of the weave window whenever it's
+    //     showing, so the real 2D taskbar is visible (un-woven) through the
+    //     hole while SR Loom stays on top of everything else;
+    //   - a fullscreen app/game that pushes itself above us (many set
+    //     HWND_TOPMOST on activation) gets put back underneath.
+
+    HMONITOR SrMonitor(const AppState& app);   // fwd decl (defined below)
+
+    bool IsTopmostWeaveMode(const AppState& app)
+    {
+        return app.weavingEnabled && app.hwnd && IsWindowVisible(app.hwnd) &&
+               (app.mode == OutputMode::Fullscreen || app.mode == OutputMode::LookingGlass) &&
+               app.format != StereoFormat::Katanga;   // Katanga pins itself above the game
+    }
+
+    bool IsCloaked(HWND h)
+    {
+        DWORD cloaked = 0;
+        return SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+               cloaked != 0;
+    }
+
+    // Windows shell UI (desktop, Start, search, task view, flyouts) --
+    // allowed above the weave, and never treated as a fullscreen app.
+    bool IsShellWindowUncached(HWND h);
+
+    // IsShellWindow runs every frame from UpdateTaskbarCutout on the
+    // foreground window, and resolving a process name needs OpenProcess --
+    // so remember the answer for the last window asked about.
+    bool IsShellWindow(HWND h)
+    {
+        static HWND s_hwnd  = nullptr;
+        static bool s_shell = false;
+        if (h != s_hwnd || !IsWindow(h))
+        {
+            s_hwnd  = h;
+            s_shell = IsShellWindowUncached(h);
+        }
+        return s_shell;
+    }
+
+    bool IsShellWindowUncached(HWND h)
+    {
+        char cls[64] = {};
+        GetClassNameA(h, cls, (int)sizeof(cls));
+        if (!strcmp(cls, "Progman") || !strcmp(cls, "WorkerW") ||
+            !strcmp(cls, "Shell_TrayWnd") || !strcmp(cls, "Shell_SecondaryTrayWnd"))
+            return true;
+        const std::string exe = ForegroundExeBaseName(h);
+        static const char* kShellExes[] = {
+            "explorer.exe", "ShellExperienceHost.exe", "StartMenuExperienceHost.exe",
+            "SearchHost.exe", "SearchApp.exe", "ShellHost.exe",
+        };
+        for (const char* s : kShellExes)
+            if (_stricmp(exe.c_str(), s) == 0) return true;
+        return false;
+    }
+
+    // The SR display's taskbar (primary "Shell_TrayWnd" or a per-monitor
+    // "Shell_SecondaryTrayWnd"), or nullptr if that monitor has none.
+    HWND SrTaskbar(HMONITOR srMon)
+    {
+        HWND tb = FindWindowA("Shell_TrayWnd", nullptr);
+        if (tb && IsWindowVisible(tb) && MonitorFromWindow(tb, MONITOR_DEFAULTTONULL) == srMon)
+            return tb;
+        for (HWND s = FindWindowExA(nullptr, nullptr, "Shell_SecondaryTrayWnd", nullptr); s;
+             s = FindWindowExA(nullptr, s, "Shell_SecondaryTrayWnd", nullptr))
+        {
+            if (IsWindowVisible(s) && MonitorFromWindow(s, MONITOR_DEFAULTTONULL) == srMon)
+                return s;
+        }
+        return nullptr;
+    }
+
+    // z-order band of a window (undocumented user32!GetWindowBand, present on
+    // Win8+). 1 = ZBID_DESKTOP (every normal app, SR Loom included); anything
+    // higher is system UI that always stacks above us: Start, toasts / Action
+    // Center, volume OSD, Alt+Tab, Win+V / emoji, Game Bar. Returns 0 if the
+    // API is unavailable or fails.
+    DWORD WindowBand(HWND h)
+    {
+        using GetWindowBandFn = BOOL (WINAPI*)(HWND, DWORD*);
+        static GetWindowBandFn fn = reinterpret_cast<GetWindowBandFn>(
+            GetProcAddress(GetModuleHandleA("user32.dll"), "GetWindowBand"));
+        DWORD band = 0;
+        if (!fn || !fn(h, &band)) return 0;
+        return band;
+    }
+
+    // Cut holes in the weave window's region so things that must stay 2D show
+    // through un-woven, with no woven "ghost" of them underneath:
+    //   - the SR display's taskbar, while it's showing (not auto-hidden, and
+    //     no fullscreen app/game in front of it);
+    //   - every visible system-UI window above the weave (band > desktop, see
+    //     WindowBand). They're drawn above us anyway, but the capture also
+    //     contains them, so their woven copy showed through translucent parts
+    //     and trailed behind as they moved/closed. Their holes linger ~200ms
+    //     after they go, to outlast the capture's frame or two of lag.
+    // Runs every frame; only calls SetWindowRgn when the hole set changes,
+    // unless force (after ApplyMode cleared the region). Never touches
+    // WindowOverlay's rounded region: taskbarCutActive is only ever set in
+    // the topmost modes.
+    void UpdateTaskbarCutout(AppState& app, bool force)
+    {
+        auto clearCut = [&]() {
+            app.recentUiCuts.clear();
+            if (!app.taskbarCutActive) return;
+            SetWindowRgn(app.hwnd, nullptr, TRUE);
+            app.taskbarCutActive = false;
+            app.weaveCuts.clear();
+        };
+        if (!IsTopmostWeaveMode(app)) { clearCut(); return; }
+
+        RECT wr{};
+        if (!GetWindowRect(app.hwnd, &wr)) return;
+        const HMONITOR mon = SrMonitor(app);
+        std::vector<RECT> cuts;
+        RECT cut{};
+
+        // Taskbar.
+        HWND tb = SrTaskbar(mon);
+        RECT tr{};
+        if (tb && GetWindowRect(tb, &tr))
+        {
+            // A fullscreen app in front hides the taskbar -- weave all of it.
+            HWND fg = GetForegroundWindow();
+            const bool fsInFront = fg && !IsOwnProcessWindow(fg) && !IsShellWindow(fg) &&
+                MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) == mon && IsWindowFullscreen(fg);
+            // Auto-hide leaves only a sliver on-screen; the intersection with
+            // our window handles that (and a Looking Glass not over it).
+            if (!fsInFront && IntersectRect(&cut, &tr, &wr))
+                cuts.push_back(cut);
+        }
+
+        // System UI above us (higher z-band). Walk up the z-order from our
+        // window; everything in a higher band is before us in the list.
+        const DWORD now = GetTickCount();
+        for (HWND h = GetWindow(app.hwnd, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV))
+        {
+            if (!IsWindowVisible(h) || IsCloaked(h) || IsOwnProcessWindow(h)) continue;
+            if (WindowBand(h) <= 1) continue;   // desktop band (or unknown): not system UI
+            RECT r{};
+            if (!GetWindowRect(h, &r) || !IntersectRect(&cut, &r, &wr)) continue;
+            bool known = false;
+            for (auto& rc : app.recentUiCuts)
+                if (EqualRect(&rc.first, &cut)) { rc.second = now; known = true; break; }
+            if (!known) app.recentUiCuts.push_back({ cut, now });
+        }
+        // Keep holes for recently-closed UI a little longer (capture lag).
+        constexpr DWORD kLingerMs = 200;
+        app.recentUiCuts.erase(
+            std::remove_if(app.recentUiCuts.begin(), app.recentUiCuts.end(),
+                           [&](const auto& rc) { return now - rc.second > kLingerMs; }),
+            app.recentUiCuts.end());
+        for (const auto& rc : app.recentUiCuts) cuts.push_back(rc.first);
+
+        if (cuts.empty()) { clearCut(); return; }
+
+        auto sameCuts = [&]() {
+            if (cuts.size() != app.weaveCuts.size()) return false;
+            for (size_t i = 0; i < cuts.size(); ++i)
+                if (!EqualRect(&cuts[i], &app.weaveCuts[i])) return false;
+            return true;
+        };
+        if (!force && app.taskbarCutActive && sameCuts() && EqualRect(&wr, &app.taskbarCutWindow))
+            return;
+
+        HRGN rgn = CreateRectRgn(0, 0, wr.right - wr.left, wr.bottom - wr.top);
+        for (const RECT& c : cuts)
+        {
+            HRGN hole = CreateRectRgn(c.left - wr.left, c.top - wr.top,
+                                      c.right - wr.left, c.bottom - wr.top);
+            CombineRgn(rgn, rgn, hole, RGN_DIFF);
+            DeleteObject(hole);
+        }
+        SetWindowRgn(app.hwnd, rgn, TRUE);   // the system owns rgn from here
+        app.taskbarCutActive = true;
+        app.weaveCuts        = std::move(cuts);
+        app.taskbarCutWindow = wr;
+    }
+
+    // Put the weave back on top if a fullscreen app/game on the SR display
+    // has pushed itself above it. Only fullscreen-sized, non-shell windows
+    // count, so Start, flyouts, tray menus, tooltips and SR Loom's own panel
+    // can still appear above the weave as normal.
+    void KeepWeaveAboveFullscreenApps(AppState& app)
+    {
+        if (!IsTopmostWeaveMode(app)) return;
+        const HMONITOR mon = SrMonitor(app);
+        for (HWND h = GetWindow(app.hwnd, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV))
+        {
+            if (!IsWindowVisible(h) || IsCloaked(h) || IsOwnProcessWindow(h)) continue;
+            if (MonitorFromWindow(h, MONITOR_DEFAULTTONULL) != mon || !IsWindowFullscreen(h)) continue;
+            if (IsShellWindow(h)) continue;
+            // Full-screen TRANSPARENT overlays are not games: NVIDIA's overlay
+            // (class CEF-OSC-WIDGET, NVIDIA Share.exe / NVIDIA Overlay.exe --
+            // permanently up, WS_EX_LAYERED | NOACTIVATE | TOOLWINDOW),
+            // Discord's 2025+ game-glued overlay, and similar. They're per-
+            // pixel transparent, so sitting below them is harmless, and their
+            // widgets / FPS counters then stay 2D. Pushing above them every
+            // 250ms would just ping-pong the z-order forever. Real game
+            // windows don't use click-through / tool-window layered styles.
+            {
+                const LONG_PTR ex = GetWindowLongPtr(h, GWL_EXSTYLE);
+                if (ex & WS_EX_TRANSPARENT) continue;
+                if ((ex & WS_EX_LAYERED) && (ex & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW))) continue;
+                char cls[64] = {};
+                GetClassNameA(h, cls, (int)sizeof(cls));
+                if (!strcmp(cls, "CEF-OSC-WIDGET")) continue;
+            }
+            static DWORD s_lastLogMs = 0;
+            if (GetTickCount() - s_lastLogMs > 5000)
+            {
+                s_lastLogMs = GetTickCount();
+                Log("Weave: fullscreen window %p ('%s') went above the weave -- re-asserting topmost",
+                    (void*)h, ForegroundExeBaseName(h).c_str());
+            }
+            SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            return;
         }
     }
 
@@ -1796,8 +2351,8 @@ namespace
     // Keep the overlay aligned with the tracked source window each frame.
     void UpdateOverlayTracking(AppState& app)
     {
-        if (app.mode != OutputMode::WindowOverlay)
-            return;
+        if (app.mode != OutputMode::WindowOverlay || app.modeApplyDeferred)
+            return;   // (deferred: window still has the previous mode's shape)
 
         HWND src = app.sourceWindow;
         if (!src || !IsWindow(src))
@@ -1981,7 +2536,9 @@ namespace
             app.weaver.LensDisable();
             app.weaver.StopSR();
         }
-        app.tray.SetTooltip(enable ? "SR Loom — weaving" : "SR Loom — paused (SR off)");
+        app.tray.SetTooltip(enable
+            ? "SR Loom — weaving\nLeft-click for panel"
+            : "SR Loom — paused (SR off)\nLeft-click for panel");
     }
 
     // Selecting a source or format turns weaving ON if it isn't already (so the 3D
@@ -2028,20 +2585,26 @@ namespace
     // refreshed on those edges.
     void ChangeFormat(AppState& app, StereoFormat newFmt)
     {
+        // Picking any other format while auto-receiving Katanga means the
+        // user has taken over: don't auto-restore their old setup later.
+        if (app.katangaAuto && newFmt != StereoFormat::Katanga)
+            app.katangaAuto = false;
         const StereoFormat oldFmt = app.format;
         const bool katangaEdge = (oldFmt == StereoFormat::Katanga)
                               != (newFmt == StereoFormat::Katanga);
         app.format = newFmt;
         app.captureRebind = true;
-        // Invalidate the LookingGlass / Windowed "saved" size so the next
-        // ApplyMode call re-fits the window to the new format's content
-        // aspect (e.g. FullSBS 16:9 per-eye vs HalfSBS 8:9). Without this
-        // the window keeps its old shape and content gets pillarboxed or
-        // squished in the window for the rest of the session.
+        // Looking Glass format change. In passthrough (weaving the screen
+        // beneath it) the loupe's content IS whatever is under the window,
+        // so the format doesn't change its shape: leave it exactly as the
+        // user placed and sized it. For an image/video file the content has
+        // its own aspect (FullSBS 16:9 per-eye vs HalfSBS 8:9), so re-fit
+        // the size -- in place (same top-left + height), never re-centred --
+        // or the content ends up pillarboxed / squished.
         if (oldFmt != newFmt && app.mode == OutputMode::LookingGlass)
         {
-            app.loupeActive = false;
-            ApplyMode(app);
+            if (!app.loupeActive)                              ApplyMode(app);
+            else if (app.source != SourceKind::CaptureMonitor) RefitLoupeKeepingPosition(app);
         }
         if (newFmt == StereoFormat::Katanga && oldFmt != StereoFormat::Katanga)
         {
@@ -2117,8 +2680,10 @@ namespace
     {
         DemoteVRFormatForLiveCapture(app);
         app.capture.SetCaptureCursor(false);   // overlay sits on the source; real cursor shows through
+        const bool wasWeaving = app.weavingEnabled;
         if (target && app.capture.StartWindow(target))
         {
+            if (wasWeaving) BeginCaptureWarmup(app);
             app.source       = SourceKind::CaptureWindow;
             app.sourceWindow = target;
             app.captureRebind = true;   // re-register the SRV once frames arrive
@@ -2207,8 +2772,17 @@ namespace
         app.sourceWindow = nullptr;
         app.capture.SetCaptureCursor(false);   // same screen as the real cursor → don't double it
         HMONITOR mon = SrMonitor(app);
+        // Already capturing the SR display? Keep the running session.
+        // StartMonitor tears the WGC session down and rebuilds it, which
+        // drops frames for a moment -- visible as a flicker every time the
+        // panel's Fullscreen / Looking Glass buttons (or a profile) re-pick
+        // the source that's already live.
+        if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay &&
+            app.sourceMonitor == mon && app.capture.IsActive())
+            return;
         if (app.capture.StartMonitor(mon))
         {
+            if (app.weavingEnabled) BeginCaptureWarmup(app);
             app.source = SourceKind::CaptureMonitor;
             app.sourceMonitor = mon;
             app.foreignDisplay = false;   // this IS the SR display → crop to the viewer region
@@ -2795,6 +3369,99 @@ namespace
         return ctx.best;
     }
 
+    // --- Katanga auto-receive --------------------------------------------
+    //
+    // With Settings::ReadKatangaAutoReceive on (default), a Katanga sender
+    // appearing (a Katanga game, or a bridge such as markleoryan79's 3D
+    // Slicer extension) switches SR Loom into Katanga receiving by itself;
+    // when the sender stops, the previous format / mode / weaving state comes
+    // back. The existing Katanga machinery (arm mode, publisher discovery,
+    // lens hint) does the actual receiving.
+
+    void EndKatangaAuto(AppState& app, const char* why)
+    {
+        if (!app.katangaAuto) return;
+        app.katangaAuto = false;   // before ChangeFormat (it treats format changes as a user takeover)
+        // Don't re-engage on whatever handle is still sitting in the mapping.
+        app.katangaAutoBlocked = KatangaSource::PublisherPresent();
+        Log("Katanga auto-receive: ending (%s) -> restoring previous setup", why);
+        ChangeFormat(app, app.katangaPrevFormat);   // stops the receiver, lens back on
+        app.mode = app.katangaPrevMode;
+        if (!app.katangaPrevWeaving) SetWeaving(app, false);
+        else                         ApplyMode(app);
+    }
+
+    void BeginKatangaAuto(AppState& app)
+    {
+        app.katangaPrevFormat  = app.format;
+        app.katangaPrevMode    = app.mode;
+        app.katangaPrevWeaving = app.weavingEnabled;
+        app.katangaAuto        = true;
+        app.katangaAutoStartMs = GetTickCount();
+        Log("Katanga auto-receive: sender detected -> switching to Katanga");
+        app.mode = OutputMode::Fullscreen;
+        ChangeFormat(app, StereoFormat::Katanga);    // arm: receiver on, lens off, window hidden
+        if (!app.weavingEnabled) SetWeaving(app, true);   // SR session up (stays armed until frames)
+    }
+
+    // 500ms poll from the main loop.
+    void PollKatangaAutoReceive(AppState& app)
+    {
+        const DWORD now = GetTickCount();
+        if (now - app.katangaAutoLastPollMs < 500) return;
+        app.katangaAutoLastPollMs = now;
+
+        // katangaAutoBlocked: set when an auto session ends while a handle is
+        // still published (sender stopped but left a stale value, or an idle
+        // process holds the mapping and never sends frames). Stay blocked
+        // until the mapping goes away, so we don't flip formats every few
+        // seconds.
+        const bool present = KatangaSource::PublisherPresent();
+        if (!present) app.katangaAutoBlocked = false;
+
+        if (app.katangaAuto)
+        {
+            if (!Settings::ReadKatangaAutoReceive())
+                EndKatangaAuto(app, "auto-receive turned off");
+            else if (!app.katanga.IsReceiving() && now - app.katangaAutoStartMs > 3000)
+                EndKatangaAuto(app, "no frames arrived");
+            return;
+        }
+        if (app.format == StereoFormat::Katanga) return;   // manual Katanga (profile) already receives
+        if (!present || app.katangaAutoBlocked || !Settings::ReadKatangaAutoReceive()) return;
+        BeginKatangaAuto(app);
+    }
+
+    // Where the Katanga weave goes while receiving: the whole SR display for
+    // a fullscreen sender, or exactly over the sender window's client area
+    // when it's windowed on the SR display (following it as it moves).
+    void PlaceKatangaWeave(AppState& app)
+    {
+        RECT target = app.srDisplayRect;
+        HWND pub = app.katangaPublisherWnd;
+        if (pub && IsWindow(pub) && !IsIconic(pub) &&
+            MonitorFromWindow(pub, MONITOR_DEFAULTTONULL) == SrMonitor(app) &&
+            !IsWindowFullscreen(pub))
+        {
+            RECT cr{};
+            POINT tl{ 0, 0 };
+            RECT clipped{};
+            if (GetClientRect(pub, &cr) && ClientToScreen(pub, &tl) &&
+                cr.right > 0 && cr.bottom > 0)
+            {
+                const RECT client{ tl.x, tl.y, tl.x + cr.right, tl.y + cr.bottom };
+                if (IntersectRect(&clipped, &client, &app.srDisplayRect))
+                    target = clipped;
+            }
+        }
+        RECT cur{};
+        GetWindowRect(app.hwnd, &cur);
+        if (!EqualRect(&cur, &target))
+            SetWindowPos(app.hwnd, nullptr, target.left, target.top,
+                         target.right - target.left, target.bottom - target.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     void RenderFrame(AppState& app)
     {
         if (!app.weavingEnabled || !app.renderer.IsValid())
@@ -2861,6 +3528,11 @@ namespace
         // AFTER the wait): tracking source-window position / cursor hover gets read
         // here so it's the freshest state by the time the frame reaches the panel.
         // Reading them BEFORE WaitForFrame would let them go up-to-one-refresh stale.
+        // Safety net for the source-switch hand-off: if the capture died or the
+        // source moved off live capture, never leave the mode change deferred.
+        if (app.captureWarmup && (!app.capture.IsActive() ||
+                                  GetTickCount() - app.captureWarmupStartMs > 400))
+            EndCaptureWarmup(app);
         UpdateOverlayTracking(app);     // follow the source window in overlay mode
         UpdateLoupeInteractivity(app);  // hover the chrome to grab/move the looking glass
 
@@ -2897,7 +3569,26 @@ namespace
                 RECT r = PassthroughRegion(app, app.hwnd);
                 app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
             }
-            const bool wgcGotFrame = app.capture.Update(capSizeChanged);
+            bool wgcGotFrame = app.capture.Update(capSizeChanged);
+
+            // Source-switch hand-off: the new session's first frame is here
+            // (or it's taking too long) -- switch the window to the new mode
+            // now and re-crop to the new window in this same frame, so the
+            // first thing drawn in the new geometry is the new source.
+            if (app.captureWarmup &&
+                (wgcGotFrame || GetTickCount() - app.captureWarmupStartMs > 250))
+            {
+                EndCaptureWarmup(app);
+                if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay &&
+                    app.capture.FrameWidth() > 0)
+                {
+                    RECT r = PassthroughRegion(app, app.hwnd);
+                    app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
+                    bool recropSizeChanged = false;
+                    if (app.capture.Update(recropSizeChanged)) wgcGotFrame = true;
+                    if (recropSizeChanged) capSizeChanged = true;
+                }
+            }
 
             // Track whether WGC is still delivering frames. An exclusive-fullscreen
             // app on the captured monitor freezes WGC (it sees DWM's last composed
@@ -2966,6 +3657,14 @@ namespace
         {
             const bool wasReceiving = (app.katanga.SRV() != nullptr);
             const bool nowReceiving = app.katanga.Update();
+            // Publisher swapped to a new texture (resize) while still
+            // receiving: re-bind the weaver's input, or it keeps sampling
+            // the released texture (frozen picture / use-after-free).
+            if (nowReceiving && app.katanga.Generation() != app.katangaGeneration)
+            {
+                app.katangaGeneration = app.katanga.Generation();
+                app.captureRebind = true;
+            }
             if (nowReceiving != wasReceiving)
             {
                 app.captureRebind = true;
@@ -3017,7 +3716,11 @@ namespace
                     SetWindowPos(app.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     ShowWindow(app.hwnd, SW_HIDE);
+                    app.katangaPlacedRect = {};
                     Log("Katanga: reception lost -> arm-mode (waiting for next game)");
+                    // Auto-received session: the sender's gone, so put the
+                    // user's previous setup back instead of staying armed.
+                    if (app.katangaAuto) EndKatangaAuto(app, "sender stopped");
                     return;
                 }
             }
@@ -3036,8 +3739,20 @@ namespace
             if (nowReceiving && app.katangaPublisherWnd
                 && IsWindow(app.katangaPublisherWnd))
             {
-                SetWindowPos(app.hwnd, app.katangaPublisherWnd, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                // NOTE: SetWindowPos's hWndInsertAfter is the window that ends
+                // up directly ABOVE ours -- passing the game HWND (as this used
+                // to) put the weave directly BELOW the game every frame, and
+                // stripped our topmost flag if the game wasn't topmost. Instead:
+                // only when the game has actually got above us (walk up from it
+                // looking for our window), jump back to the top of the topmost
+                // band. No per-frame z-order churn when the order is already right.
+                bool weAreAbove = false;
+                for (HWND h = GetWindow(app.katangaPublisherWnd, GW_HWNDPREV); h;
+                     h = GetWindow(h, GW_HWNDPREV))
+                    if (h == app.hwnd) { weAreAbove = true; break; }
+                if (!weAreAbove)
+                    SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
             else if (nowReceiving)
             {
@@ -3045,6 +3760,7 @@ namespace
                 SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
+            if (nowReceiving) PlaceKatangaWeave(app);
         }
 
         // FAST PATH: a live source already in side-by-side layout (full OR half SBS,
@@ -3434,6 +4150,7 @@ namespace
                               {} };
                 ms.profileNames.reserve(app->profiles.size());
                 for (const auto& p : app->profiles) ms.profileNames.push_back(p.name);
+                if (!app->pendingUpdateUrl.empty()) ms.updateTag = app->pendingUpdateTag;
                 app->tray.ShowContextMenu(hwnd, ms);
             }
             else if (app && LOWORD(lParam) == WM_LBUTTONUP)
@@ -3455,6 +4172,14 @@ namespace
                 auto* info = reinterpret_cast<ReleaseInfo*>(wParam);
                 char title[128], body[256];
                 DWORD infoFlags = NIIF_INFO;
+                // Auto-checks now run on launch AND on every panel open, and
+                // the found release is remembered across launches -- so only
+                // balloon for a release we haven't already announced (the GUI
+                // banner + tray item carry it from then on). User-forced
+                // checks always get a balloon.
+                const bool announce = info->forced ||
+                    info->status != ReleaseInfo::Available ||
+                    info->tag != app->pendingUpdateTag;
                 switch (info->status)
                 {
                 case ReleaseInfo::Available:
@@ -3486,14 +4211,17 @@ namespace
                     Log("UpdateChecker: user-checked, fetch failed");
                     break;
                 }
-                NOTIFYICONDATAA nid{ sizeof(nid) };
-                nid.hWnd   = hwnd;
-                nid.uID    = 1;
-                nid.uFlags = NIF_INFO;
-                nid.dwInfoFlags = infoFlags;
-                _snprintf_s(nid.szInfoTitle, _TRUNCATE, "%s", title);
-                _snprintf_s(nid.szInfo,      _TRUNCATE, "%s", body);
-                Shell_NotifyIconA(NIM_MODIFY, &nid);
+                if (announce)
+                {
+                    NOTIFYICONDATAA nid{ sizeof(nid) };
+                    nid.hWnd   = hwnd;
+                    nid.uID    = 1;
+                    nid.uFlags = NIF_INFO;
+                    nid.dwInfoFlags = infoFlags;
+                    _snprintf_s(nid.szInfoTitle, _TRUNCATE, "%s", title);
+                    _snprintf_s(nid.szInfo,      _TRUNCATE, "%s", body);
+                    Shell_NotifyIconA(NIM_MODIFY, &nid);
+                }
                 delete info;
             }
             return 0;
@@ -3729,7 +4457,15 @@ namespace
                 int n = 0;
                 const StereoFormatEntry* fmts = StereoFormatList(n);
                 const int idx = (int)(cmd - ID_TRAY_FMT_BASE);
-                if (idx < n) { ChangeFormat(*app, fmts[idx].fmt); EnsureWeavingFormatOnly(*app); }
+                if (idx < n)
+                {
+                    // Katanga places its own weave (full SR display, or over a
+                    // windowed sender) from the Fullscreen mode's layered window.
+                    if (fmts[idx].fmt == StereoFormat::Katanga)
+                        app->mode = OutputMode::Fullscreen;
+                    ChangeFormat(*app, fmts[idx].fmt);
+                    EnsureWeavingFormatOnly(*app);
+                }
                 // Re-show the test-image settings overlay so Quilt's cols/rows
                 // buttons appear (or vanish) immediately on a format change.
                 if (g_fsSet && IsWindowVisible(g_fsSet)) ShowFsSetOverlay(*app);
@@ -3776,6 +4512,18 @@ namespace
 
             switch (cmd)
             {
+            case ID_TRAY_OPEN_UPDATE:
+                // Tray "Update available" item / GUI update banner.
+                if (!app->pendingUpdateUrl.empty())
+                    ShellExecuteA(nullptr, "open", app->pendingUpdateUrl.c_str(),
+                                  nullptr, nullptr, SW_SHOWNORMAL);
+                return 0;
+            case ID_TRAY_OPEN_PANEL:
+                // Same behaviour as left-clicking the tray icon: show the
+                // GUI (or bring it to front if already visible).
+                if (!app->gui.IsVisible()) app->gui.Toggle();
+                if (app->gui.Hwnd()) SetForegroundWindow(app->gui.Hwnd());
+                return 0;
             case ID_TRAY_TOGGLE_WEAVE: SetWeaving(*app, !app->weavingEnabled); return 0;
             case ID_TRAY_MODE_FULLSCREEN:
                 app->mode = OutputMode::Fullscreen;
@@ -3875,13 +4623,17 @@ namespace
                 }
                 return 0;
             }
-            // Manual-apply: click a profile name in the list.
+            // Manual-apply: click a profile name in the list. Use the last
+            // external foreground's title as the auto-format input (if the
+            // profile is set to auto-format) -- the user's picking this
+            // profile FOR that window, so its title is the right hint.
             if (cmd >= ID_TRAY_PROFILES_LIST_BASE && cmd <= ID_TRAY_PROFILES_LIST_MAX)
             {
                 const size_t idx = (size_t)(cmd - ID_TRAY_PROFILES_LIST_BASE);
                 if (idx < app->profiles.size())
                 {
-                    ApplyProfile(*app, app->profiles[idx]);
+                    const std::string title = WindowTitle(app->lastExternalForeground);
+                    ApplyProfile(*app, app->profiles[idx], nullptr, title);
                 }
                 return 0;
             }
@@ -3897,6 +4649,8 @@ namespace
                     Profiles::Save(app->profiles);
                     if (app->lastAppliedProfile == name)
                         app->lastAppliedProfile.clear();
+                    if (app->lastAutoAppliedProfile == name)
+                        app->lastAutoAppliedProfile.clear();
                 }
                 return 0;
             }
@@ -3943,7 +4697,34 @@ namespace
                 // floating overlays would be orphaned. Hide them.
                 if (wParam == SIZE_MINIMIZED) { HideFsCtrlOverlay(); HideFsSetOverlay(); HideFsVidOverlay(); }
                 else                          RepositionOverlays(*app);
+
+                // The Looking Glass got maximised by a route that bypasses
+                // SC_MAXIMIZE (Aero Snap drag-to-top, Win+Up): switch to
+                // Fullscreen instead, same as the Maximise button. Remember
+                // the loupe's pre-maximise rect (the placement's "normal"
+                // rect, in workspace coords -> screen) so it comes back there.
+                if (wParam == SIZE_MAXIMIZED && app->mode == OutputMode::LookingGlass)
+                {
+                    WINDOWPLACEMENT wp{ sizeof(wp) };
+                    if (GetWindowPlacement(hwnd, &wp))
+                    {
+                        RECT r = wp.rcNormalPosition;
+                        MONITORINFO mi{ sizeof(mi) };
+                        if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+                            OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left,
+                                           mi.rcWork.top  - mi.rcMonitor.top);
+                        app->loupeSavedRect = r;
+                        app->loupeHasSaved  = true;
+                    }
+                    app->loupeActive = false;   // don't let ApplyMode save the maximised rect
+                    app->mode = OutputMode::Fullscreen;
+                    PostMessage(hwnd, WM_APP_APPLY_MODE, 0, 0);
+                }
             }
+            return 0;
+
+        case WM_APP_APPLY_MODE:
+            if (app) ApplyMode(*app);
             return 0;
 
         // While the user drags/resizes the window, the modal move loop blocks our
@@ -4070,7 +4851,27 @@ namespace
                 ApplyMode(*app);
                 return 0;
             }
+            // Same for the Looking Glass (Maximise button or title-bar double-
+            // click): go Fullscreen on the same source. A real OS maximise of
+            // this layered window also made Windows draw the old classic
+            // (Win95-style) frame, since DWM doesn't theme a maximised layered
+            // window's caption. The loupe's rect is remembered (ApplyMode), so
+            // Ctrl+Alt+F / the Looking Glass button brings it back in place.
+            if (app && (wParam & 0xFFF0) == SC_MAXIMIZE &&
+                app->mode == OutputMode::LookingGlass)
+            {
+                app->mode = OutputMode::Fullscreen;
+                ApplyMode(*app);
+                return 0;
+            }
             break;   // let DefWindowProc handle every other system command
+
+        case WM_SETTINGCHANGE:
+            // Windows light/dark app mode may have changed: re-theme the
+            // native title bar (Looking Glass / Windowed). Cheap, idempotent.
+            if (app && (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CAPTION))
+                ApplyCaptionTheme(hwnd);
+            break;
 
         case WM_CLOSE:
             // Closing the window just pauses weaving and hides to the tray.
@@ -4097,11 +4898,12 @@ namespace
 }
 
 // Top-level structured-exception handler: writes the exception code and the
-// faulting module name+address to srweaver.log before the process dies. Lets
-// us diagnose unsymbolicated crash dumps from users -- without it, the dump's
-// instruction pointer means nothing without our PDB. Returns
-// EXCEPTION_CONTINUE_SEARCH so the default Windows error reporter + crash
-// dump generation still run.
+// faulting module name + offset to srweaver.log before the process dies.
+// The offset (RVA = addr - module base) is what matters: ASLR moves the exe
+// every launch, so a bare address from a user's log can't be mapped back to
+// a function, but base+RVA resolves against the release PDB / .map file.
+// Returns EXCEPTION_CONTINUE_SEARCH so the default Windows error reporter +
+// crash dump generation still run.
 static LONG WINAPI SrLoomCrashHandler(EXCEPTION_POINTERS* ep)
 {
     if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -4113,8 +4915,10 @@ static LONG WINAPI SrLoomCrashHandler(EXCEPTION_POINTERS* ep)
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            reinterpret_cast<LPCSTR>(addr), &mod) && mod)
         GetModuleFileNameA(mod, modName, MAX_PATH);
-    Log("CRASH: code=0x%08X at addr=%p (module: %s)",
-        (unsigned)code, addr, modName);
+    const unsigned long long rva = mod
+        ? (unsigned long long)((const char*)addr - (const char*)mod) : 0ull;
+    Log("CRASH: code=0x%08X at addr=%p (module: %s +0x%llX)",
+        (unsigned)code, addr, modName, rva);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -4123,7 +4927,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Install the crash handler first so any later init failure that
     // segfaults / access-violates leaves a useful trail in srweaver.log.
     SetUnhandledExceptionFilter(SrLoomCrashHandler);
-    Log("WinMain: SR Loom v%s starting", kAppVersion);
+    Log("WinMain: SR Loom v%s starting (pid %lu)", kAppVersion, GetCurrentProcessId());
+
+    // Single instance. Two SR Loom processes fight over the SR display /
+    // weaver / hotkeys / tray. A second launch just opens the running
+    // copy's panel and exits. (The mutex is released by the OS on exit.)
+    static HANDLE s_instanceMutex = CreateMutexA(nullptr, FALSE, "Local\\SRLoomSingleInstance");
+    const DWORD instanceGle = GetLastError();
+    if (s_instanceMutex && instanceGle == ERROR_ALREADY_EXISTS)
+    {
+        Log("WinMain: another SR Loom is already running -- opening its panel and exiting");
+        if (HWND other = FindWindowA(kWindowClass, nullptr))
+            PostMessageA(other, WM_COMMAND, MAKEWPARAM(ID_TRAY_OPEN_PANEL, 0), 0);
+        return 0;
+    }
     {
         const char* sr = SRWeaver::GetSRPlatformVersion();
         Log("WinMain: SR Platform runtime version=%s", (sr && *sr) ? sr : "(unknown)");
@@ -4209,6 +5026,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // doesn't recursively capture its own output (no feedback loop).
     if (excludeFromCapture)
         SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
+
+    // No DWM show/hide/resize animations on the weave window. Mode switches
+    // (Looking Glass <-> Fullscreen) restyle + resize it, and the animation
+    // showed as a white/blue window outline sliding to the new rect.
+    // 3 = DWMWA_TRANSITIONS_FORCEDISABLED.
+    {
+        const BOOL noTransitions = TRUE;
+        DwmSetWindowAttribute(app.hwnd, 3, &noTransitions, sizeof(noTransitions));
+    }
 
     // Set up Direct3D. The weaver/SR session is started on demand when weaving is
     // enabled; the default source is the monitor (passthrough), so no initial image.
@@ -4463,10 +5289,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // toggle stays interactable either way, but auto-enabling it when the
     // prerequisites are met means users with OpenTrack installed get
     // TrackIR-aware games working out of the box.
+    // Gated by Settings::ReadHeadTrackingOnStartup (default ON). Users who
+    // don't use head tracking flip that off in STARTUP -- then no outputs
+    // engage at boot and the SR camera stays cold. All three toggles remain
+    // interactable in the HEADTRACKING section, so this only affects the
+    // launch state.
     Log("WinMain: openTrack.SetOutputs (initial)");
     const bool tirAuto = !app.npClientDir.empty();
-    if (!app.openTrack.SetOutputs(true, true, tirAuto))
-        Log("OpenTrack/FreeTrack/TrackIR: initial enable failed (SR Platform service offline?)");
+    const bool htAutoOn = Settings::ReadHeadTrackingOnStartup();
+    if (htAutoOn)
+    {
+        if (!app.openTrack.SetOutputs(true, true, tirAuto))
+            Log("OpenTrack/FreeTrack/TrackIR: initial enable failed (SR Platform service offline?)");
+    }
+    else
+    {
+        // openTrackUserDisabled ensures the "opportunistic re-enable on
+        // weave-start" branch (SetWeaving) doesn't undo the user's choice
+        // by silently turning outputs back on the first time they weave.
+        app.openTrackUserDisabled = true;
+        Log("Head tracking: startup-off (per Settings), outputs left disabled");
+    }
     Log("WinMain: head-tracking bootstrap done");
     }
     catch (std::exception& e)
@@ -4538,11 +5381,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     Log("WinMain: profiles loaded=%zu autoApply=%d hook=%p",
         app.profiles.size(), (int)app.profilesAutoApply, (void*)app.fgHook);
 
-    // Kick off a once-per-launch (throttled to once per 6h) background poll of
-    // GitHub Releases. If a newer tag than kAppVersion exists the worker
-    // PostMessages WM_APP_UPDATE_RESULT so the WndProc can pop a balloon
-    // (auto-check is silent on up-to-date / failure -- only the user-
-    // forced check from the About popup yields balloons for those).
+    // Update notice: first show whatever the last successful check found (so
+    // the GUI banner + tray item appear immediately, even when the throttle
+    // skips the network), then kick off a background poll of GitHub Releases
+    // (throttled to once an hour; also re-run whenever the panel is opened).
+    // A newer tag posts WM_APP_UPDATE_RESULT; auto-checks are silent on
+    // up-to-date / failure -- only the About popup's forced check reports those.
+    if (UpdateChecker::CachedUpdate(app.pendingUpdateTag, app.pendingUpdateUrl))
+        Log("UpdateChecker: cached update available -- %s", app.pendingUpdateTag.c_str());
     UpdateChecker::StartAsync(app.hwnd, WM_APP_UPDATE_RESULT, false);
     // RegisterHotKey(app.hwnd, kHotkeyDetect,  MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D'); // auto-detect disabled
 
@@ -4569,10 +5415,21 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             UpdateLastForeground(app);   // remember the user's active window for "make 3D"
             RenderFrame(app);
 
+            // Panel just opened -> re-check GitHub for a new release (the
+            // checker's 1-hour throttle keeps this from hammering the API).
+            {
+                static bool s_guiWasVisible = false;
+                const bool guiVisible = app.gui.IsVisible();
+                if (guiVisible && !s_guiWasVisible)
+                    UpdateChecker::StartAsync(app.hwnd, WM_APP_UPDATE_RESULT, false);
+                s_guiWasVisible = guiVisible;
+            }
+
             // Render the control panel when it's open, and pick up its convergence slider.
             if (app.gui.IsVisible())
             {
                 GuiState gs;
+                if (!app.pendingUpdateUrl.empty()) gs.updateTag = app.pendingUpdateTag;
                 gs.weaving       = app.weavingEnabled;
                 gs.mode          = app.mode;
                 gs.source        = app.source;
@@ -4641,7 +5498,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     {
                         GuiState::ProfileEntry e;
                         e.name = p.name;
-                        e.includeHT = p.includeHeadTracking;
+                        e.includeHT      = p.includeHeadTracking;
+                        e.fullscreenOnly = p.fullscreenOnly;
+                        e.useAutoFormat  = p.useAutoFormat;
                         gs.profileEntries.push_back(std::move(e));
                     }
                     gs.profilesAutoApply        = app.profilesAutoApply;
@@ -4651,6 +5510,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     gs.profileUpdateIndex       = -1;
                     gs.profileDeleteIndex       = -1;
                     gs.profileToggleHTIndex     = -1;
+                    gs.profileToggleFullscreenIndex = -1;
+                    gs.profileToggleAutoFormatIndex = -1;
                     gs.profilesOpenIni          = false;
                 }
                 // What's being weaved, for the GUI's collapsed summary line.
@@ -4744,8 +5605,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     (size_t)gs.profileApplyIndex < app.profiles.size())
                 {
                     // Manual apply (tray menu path) -- no captureHwnd,
-                    // format-only re-bind.
-                    ApplyProfile(app, app.profiles[(size_t)gs.profileApplyIndex]);
+                    // format-only re-bind. Pass the last external foreground
+                    // window's title so auto-format profiles get a useful
+                    // hint.
+                    const std::string title = WindowTitle(app.lastExternalForeground);
+                    ApplyProfile(app, app.profiles[(size_t)gs.profileApplyIndex],
+                                 nullptr, title);
                 }
                 if (gs.profileUpdateIndex >= 0 &&
                     (size_t)gs.profileUpdateIndex < app.profiles.size())
@@ -4757,6 +5622,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     // save those tweaks back to the profile."
                     Profile& p = app.profiles[(size_t)gs.profileUpdateIndex];
                     p.format       = app.format;
+                    // Auto-format profiles persist only defaultformat, so
+                    // that's where the current format has to go for Update
+                    // to stick (it becomes the no-token fallback).
+                    if (p.useAutoFormat) p.defaultFormat = app.format;
                     p.swapEyes     = app.swapEyes;
                     p.convergence  = app.convergence;
                     p.anaglyphCombo  = app.anaglyphCombo;
@@ -4799,6 +5668,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     Profiles::Save(app.profiles);
                     if (app.lastAppliedProfile == name)
                         app.lastAppliedProfile.clear();
+                    if (app.lastAutoAppliedProfile == name)
+                        app.lastAutoAppliedProfile.clear();
                 }
                 if (gs.profileToggleHTIndex >= 0 &&
                     (size_t)gs.profileToggleHTIndex < app.profiles.size())
@@ -4826,6 +5697,62 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                     }
                     Profiles::Save(app.profiles);
                 }
+                if (gs.profileToggleFullscreenIndex >= 0 &&
+                    (size_t)gs.profileToggleFullscreenIndex < app.profiles.size())
+                {
+                    Profile& p = app.profiles[(size_t)gs.profileToggleFullscreenIndex];
+                    p.fullscreenOnly = !p.fullscreenOnly;
+                    Profiles::Save(app.profiles);
+                    // If this profile is the one currently auto-applied,
+                    // bring the live state in line with the new setting
+                    // right away instead of waiting for the next focus change.
+                    HWND h = app.lastAppliedHwnd;
+                    if (p.name == app.lastAutoAppliedProfile && h)
+                    {
+                        if (!p.fullscreenOnly)
+                        {
+                            // Turned OFF: stop the "leave fullscreen -> weave
+                            // off" tracking. Keep the debounce so the poll
+                            // doesn't re-apply over the user's live tweaks.
+                            app.activeFullscreenProfileHwnd = nullptr;
+                        }
+                        else if (IsWindowFullscreen(h))
+                        {
+                            // Turned ON while fullscreen: start tracking, so
+                            // leaving fullscreen turns the weave off.
+                            app.activeFullscreenProfileHwnd = h;
+                        }
+                        else
+                        {
+                            // Turned ON while windowed: the profile no longer
+                            // applies here. Stop weaving that window and reset
+                            // the debounce so going fullscreen re-applies it.
+                            if (app.weavingEnabled &&
+                                app.source == SourceKind::CaptureWindow &&
+                                app.sourceWindow == h)
+                                SetWeaving(app, false);
+                            app.activeFullscreenProfileHwnd = nullptr;
+                            app.lastAppliedHwnd = nullptr;
+                            app.lastAutoAppliedProfile.clear();
+                        }
+                    }
+                }
+                if (gs.profileToggleAutoFormatIndex >= 0 &&
+                    (size_t)gs.profileToggleAutoFormatIndex < app.profiles.size())
+                {
+                    Profile& p = app.profiles[(size_t)gs.profileToggleAutoFormatIndex];
+                    p.useAutoFormat = !p.useAutoFormat;
+                    // When flipping auto-format ON, seed defaultFormat with
+                    // the current saved format so "detection fails" still
+                    // yields something sensible (rather than the enum's
+                    // default HalfSBS regardless of what the user had set).
+                    // Flipping it OFF restores the fixed format from that
+                    // fallback (which is what the file actually persists
+                    // while Auto is on).
+                    if (p.useAutoFormat) p.defaultFormat = p.format;
+                    else                 p.format = p.defaultFormat;
+                    Profiles::Save(app.profiles);
+                }
                 if (gs.profilesOpenIni)
                 {
                     Profiles::Save(app.profiles);
@@ -4844,6 +5771,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             // to its media profile. Throttled internally to avoid INI
             // hammering on slider drags.
             AutoSaveMediaProfileIfDirty(app);
+            // Fullscreen-condition profile state tick (throttled to
+            // 250ms internally). Handles enter/exit fullscreen when the
+            // foreground didn't change -- WinEventHook doesn't cover
+            // that case.
+            PollProfileFullscreenState(app);
+            PollKatangaAutoReceive(app);   // throttled to 500ms internally
+            // Taskbar cut-out, every frame: when a window goes borderless-
+            // fullscreen (F11) the taskbar vanishes behind it, and a stale
+            // hole would show that window mid-resize (a white/grey box) for
+            // up to a poll interval. Cheap when nothing changed (a few
+            // window-rect reads; SetWindowRgn only on change).
+            UpdateTaskbarCutout(app, false);
+            // Fullscreen apps popping above the weave (throttled to 250ms --
+            // walks the z-order above us).
+            {
+                static DWORD s_lastWeaveZCheckMs = 0;
+                const DWORD nowMs = GetTickCount();
+                if (nowMs - s_lastWeaveZCheckMs >= 250)
+                {
+                    s_lastWeaveZCheckMs = nowMs;
+                    KeepWeaveAboveFullscreenApps(app);
+                }
+            }
         }
     }
 

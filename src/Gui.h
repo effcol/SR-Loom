@@ -99,7 +99,17 @@ namespace srw
         // Per-game profiles section. Main mirrors the live profile list
         // + master toggle into here; GUI sets the request flags when the
         // user clicks something, main consumes them after Render returns.
-        struct ProfileEntry { std::string name; bool includeHT = false; };
+        //
+        // v2.2: ProfileEntry additionally carries the fullscreenOnly +
+        // useAutoFormat state so per-row toggles can display them without
+        // a full profile-object round-trip.
+        struct ProfileEntry
+        {
+            std::string name;
+            bool        includeHT      = false;
+            bool        fullscreenOnly = false;
+            bool        useAutoFormat  = false;
+        };
         std::vector<ProfileEntry> profileEntries;
         bool         profilesAutoApply       = true;
         bool         profilesAutoApplyChanged= false;   // user toggled
@@ -108,7 +118,12 @@ namespace srw
         int          profileUpdateIndex      = -1;      // clicked Update on selected profile (GUI)
         int          profileDeleteIndex      = -1;      // clicked Delete next to a profile
         int          profileToggleHTIndex    = -1;      // clicked the per-row HT button
+        int          profileToggleFullscreenIndex = -1; // clicked the per-row Fullscreen toggle
+        int          profileToggleAutoFormatIndex = -1; // clicked the per-row Auto-format toggle
         bool         profilesOpenIni         = false;   // "Open profiles.ini" clicked
+        // Newer GitHub release tag ("v2.2") when an update is available,
+        // else empty. Drives the update banner at the top of the panel.
+        std::string  updateTag;
     };
 
     class Gui
@@ -131,7 +146,10 @@ namespace srw
         void ReleaseSwapChain();
         void ApplyScaling();          // SEH-wrapped trampoline; safe to call directly
         void ApplyScalingImpl();      // the actual work -- only invoked via the trampoline
-        void FitHeightToContent(int clientContentH);   // shrink/grow window to fit content
+        void ApplyFontsImpl();        // font-atlas rebuild only -- SEH-wrapped inside ApplyScaling
+        void RecoverFontsAfterCrash();        // built-in-font atlas after an SEH in the font rebuild
+        bool FitHeightToContent(int clientContentH);   // shrink/grow window to fit content; true = resized
+        int                      m_refitDepth = 0;     // Render re-entry guard for the fit-before-present redraw
         static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
         HWND                     m_mainHwnd = nullptr;
@@ -144,6 +162,13 @@ namespace srw
         bool                     m_visible  = false;
         bool                     m_imguiReady = false;
         bool                     m_lightMode = false;   // false = warm dark, true = sepia/cream
+        bool                     m_systemLightMode = false;   // Windows' app mode, last read
+        // Sticky flag set if the font-atlas rebuild ever faults. Once set,
+        // later ApplyScaling calls skip the font rebuild and only rescale
+        // the style, keeping the built-in-font atlas RecoverFontsAfterCrash
+        // installed. Safety net only -- the known cause (issue #4, missing
+        // Win11-only font files on Win10) is fixed in ApplyFontsImpl.
+        bool                     m_fontsBroken = false;
         bool                     m_expanded  = false;   // options collapsed (just the on/off toggle) by default
         float                    m_dpiScale = 1.0f;     // current monitor's DPI scale (1.0 = 96dpi)
         bool                     m_pendingRescale = false;  // apply theme/DPI rebuild before next frame
@@ -171,6 +196,8 @@ namespace srw
         // read the registry per frame.
         bool                     m_runAtStartup = false;
         bool                     m_startInTray  = true;
+        bool                     m_headTrackingOnStartup = true;   // matches pre-toggle default
+        bool                     m_katangaAutoReceive    = true;   // Katanga senders auto-shown in 3D
         // Inline state for the About popup's "Check for updates" link.
         // Idle by default; switches to Checking on click, then settles to
         // UpToDate / Available / Failed when WM_APP_UPDATE_RESULT lands.

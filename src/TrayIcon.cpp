@@ -136,6 +136,23 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
 
+    // Explicit "Open SR Loom" entry at the top. Left-click on the tray
+    // icon also opens the panel, but that's non-obvious from the right-
+    // click menu alone (Reddit feedback, 2026-06-28: user spent time
+    // hunting for the head-tracking UI via right-click before realising).
+    // Bold to hint it's the primary action.
+    AppendMenuA(menu, MF_STRING, ID_TRAY_OPEN_PANEL, "Open SR Loom");
+    SetMenuDefaultItem(menu, ID_TRAY_OPEN_PANEL, FALSE);
+    // Persistent "update available" entry (the launch balloon is easy to
+    // miss and disappears). Opens the release page.
+    if (!s.updateTag.empty())
+    {
+        char label[96];
+        _snprintf_s(label, _TRUNCATE, "Update available: %s  (download)", s.updateTag.c_str());
+        AppendMenuA(menu, MF_STRING, ID_TRAY_OPEN_UPDATE, label);
+    }
+    AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+
     AppendMenuA(menu, MF_STRING | (weavingEnabled ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_TOGGLE_WEAVE, "Weaving enabled");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
@@ -263,8 +280,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     // Quilt: cols x rows grid of views; picks centre pair by default.
     addFmt(fmtMenu, StereoFormat::Quilt, "Quilt");
 
-    // StereoFormat::Katanga deliberately not exposed in the tray menu --
-    // see Common.h's StereoFormatList comment for why.
+    // Katanga: actively listen for a game / bridge sending frames over the
+    // Katanga protocol (the panel's "Katanga Receiver" toggle does it passively).
+    addFmt(fmtMenu, StereoFormat::Katanga, "Katanga");
 
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(fmtMenu, MF_STRING | (swapEyes ? MF_CHECKED : 0), ID_TRAY_SWAP_EYES, "Swap Eyes");

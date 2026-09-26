@@ -54,3 +54,7 @@ tools/sweep_*/
 # DLL is an artifact of the build, not a source file -- keep the source dir
 # clean.
 /assets/npclient/NPClient64.dll
+
+# Local scratch files (e.g. Lytro LFP schema / LFToolbox excerpts used for
+# research). Third-party and/or proprietary -- never commit.
+/*_tmp.*

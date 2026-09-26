@@ -46,9 +46,15 @@ namespace srw
     // because Win32 forbids non-trivial work inside hook callbacks.
     constexpr UINT WM_APP_FOREGROUND_CHANGED = WM_APP + 9;
 
+    // Posted to the main window to run ApplyMode outside the current message
+    // (e.g. the Looking Glass got maximised -> switch to Fullscreen, but not
+    // from inside the WM_SIZE of the maximise itself).
+    constexpr UINT WM_APP_APPLY_MODE = WM_APP + 10;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {
+        ID_TRAY_OPEN_PANEL   = 40000,   // "Open SR Loom" -- shows the GUI (same as left-click)
         ID_TRAY_TOGGLE_WEAVE = 40001,
         ID_TRAY_MODE_FULLSCREEN,
         ID_TRAY_MODE_WINDOWED,
@@ -60,7 +66,8 @@ namespace srw
         ID_TRAY_SRC_MONITOR,
         ID_TRAY_SWAP_EYES,
         ID_TRAY_DETECT,
-        ID_TRAY_EXIT
+        ID_TRAY_EXIT,
+        ID_TRAY_OPEN_UPDATE,            // "Update available" -- opens the GitHub release page
     };
 
     // Window-list items get ids in this range; index = id - base.
@@ -132,6 +139,9 @@ namespace srw
         // master "auto-apply" toggle drive the Profiles submenu.
         bool                     profilesAutoApply;
         std::vector<std::string> profileNames;
+        // Newer release tag (e.g. "v2.2") when an update is available, else
+        // empty. Shown as an "Update available" item at the top of the menu.
+        std::string              updateTag;
     };
 
     class TrayIcon

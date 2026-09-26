@@ -190,6 +190,8 @@ void Capture::Stop()
     m_impl->item = nullptr;
     m_active = false;
     m_regX = m_regY = m_regW = m_regH = 0;   // reset crop to full frame
+    m_appX = m_appY = m_appW = m_appH = 0;
+    SAFE_RELEASE(m_full);                    // belongs to the old session's frames
 }
 
 bool Capture::Update(bool& sizeChanged)
@@ -202,7 +204,7 @@ bool Capture::Update(bool& sizeChanged)
     {
         auto frame = m_impl->framePool.TryGetNextFrame();
         if (!frame)
-            return false;
+            return RecropIfRegionChanged(sizeChanged);
 
         // Drain any queued frames and weave only the newest — minimizes latency.
         for (;;)
@@ -222,17 +224,34 @@ bool Capture::Update(bool& sizeChanged)
         m_frameH = (int)desc.Height;
 
         // Resolve the crop region (default = whole frame), clamped to the frame.
-        int rx = m_regX, ry = m_regY, rw = m_regW, rh = m_regH;
-        if (rw <= 0 || rh <= 0) { rx = 0; ry = 0; rw = m_frameW; rh = m_frameH; }
-        if (rx < 0) rx = 0;
-        if (ry < 0) ry = 0;
-        if (rx + rw > m_frameW) rw = m_frameW - rx;
-        if (ry + rh > m_frameH) rh = m_frameH - ry;
-        if (rw <= 0 || rh <= 0) { frame.Close(); return false; }  // fully off-screen
+        int rx, ry, rw, rh;
+        if (!ResolveRegion(rx, ry, rw, rh)) { frame.Close(); return false; }  // fully off-screen
 
-        sizeChanged = EnsureTarget(rw, rh);
+        const bool fullFrame = (rx == 0 && ry == 0 && rw == m_frameW && rh == m_frameH);
         D3D11_BOX box{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
-        m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
+        if (fullFrame)
+        {
+            // m_tex will hold the whole frame -- no separate full copy needed.
+            SAFE_RELEASE(m_full);
+            sizeChanged = EnsureTarget(rw, rh);
+            if (m_tex)
+                m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
+        }
+        else
+        {
+            // Sub-region: keep the whole frame too, so a later region change
+            // can be re-cropped without waiting for a new frame.
+            ID3D11Texture2D* src = frameTex.get();
+            if (EnsureFull(m_frameW, m_frameH))
+            {
+                m_context->CopyResource(m_full, frameTex.get());
+                src = m_full;
+            }
+            sizeChanged = EnsureTarget(rw, rh);
+            if (m_tex)
+                m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, src, 0, &box);
+        }
+        m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
 
         frame.Close();
 
@@ -250,6 +269,73 @@ bool Capture::Update(bool& sizeChanged)
     {
         return false;
     }
+}
+
+bool Capture::ResolveRegion(int& rx, int& ry, int& rw, int& rh) const
+{
+    rx = m_regX; ry = m_regY; rw = m_regW; rh = m_regH;
+    if (rw <= 0 || rh <= 0) { rx = 0; ry = 0; rw = m_frameW; rh = m_frameH; }
+    if (rx < 0) rx = 0;
+    if (ry < 0) ry = 0;
+    if (rx + rw > m_frameW) rw = m_frameW - rx;
+    if (ry + rh > m_frameH) rh = m_frameH - ry;
+    return rw > 0 && rh > 0;
+}
+
+// No new WGC frame this tick, but the requested crop may have changed (mode
+// switch, loupe moved/resized). Re-crop from the last full frame right away.
+// Returns true (like a new frame) when m_tex was refreshed.
+bool Capture::RecropIfRegionChanged(bool& sizeChanged)
+{
+    if (!m_tex || m_frameW <= 0 || m_frameH <= 0) return false;
+    int rx, ry, rw, rh;
+    if (!ResolveRegion(rx, ry, rw, rh)) return false;
+    if (rx == m_appX && ry == m_appY && rw == m_appW && rh == m_appH) return false;
+
+    if (!m_full)
+    {
+        // Without a retained copy, m_tex is only usable as the source if
+        // it currently holds the whole frame (last crop was full-frame).
+        // Adopt it as the full-frame source; EnsureTarget makes a new m_tex.
+        const bool texIsFull = (m_appX == 0 && m_appY == 0 &&
+                                m_appW == m_frameW && m_appH == m_frameH);
+        if (!texIsFull) return false;
+        m_full = m_tex;
+        m_tex  = nullptr;
+        SAFE_RELEASE(m_srv);
+        m_width = m_height = 0;
+    }
+
+    sizeChanged = EnsureTarget(rw, rh);
+    if (!m_tex) return false;
+    D3D11_BOX box{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
+    m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, m_full, 0, &box);
+    m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
+    // Back to a full-frame crop: m_tex holds everything again.
+    if (rx == 0 && ry == 0 && rw == m_frameW && rh == m_frameH)
+        SAFE_RELEASE(m_full);
+    return true;
+}
+
+bool Capture::EnsureFull(int width, int height)
+{
+    if (m_full)
+    {
+        D3D11_TEXTURE2D_DESC d{};
+        m_full->GetDesc(&d);
+        if ((int)d.Width == width && (int)d.Height == height) return true;
+        SAFE_RELEASE(m_full);
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width            = (UINT)width;
+    td.Height           = (UINT)height;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = m_texFormat;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = 0;   // copy source only
+    return SUCCEEDED(m_device->CreateTexture2D(&td, nullptr, &m_full));
 }
 
 void Capture::SetSourceRegion(int x, int y, int w, int h)

@@ -1,18 +1,24 @@
 // Profiles.h -- per-game auto-apply profile list.
 //
 // A Profile binds {foreground-window match condition} to {SR Loom settings
-// to apply when that window comes forward}. The match condition is a
-// case-insensitive substring test on the foreground window's exe basename
-// AND/OR its window title. An empty string in either field means "any".
+// to apply when that window comes forward}. The match condition is:
+//   - exe basename substring (case-insensitive), and
+//   - window title matched as a regex (ECMAScript, case-insensitive). Plain
+//     strings still work as substring matches; power users get full regex
+//     for cases like `3D SBS Image Viewer|3D.+` (browsers, media players
+//     whose title depends on the file being played).
+//   - optional `fullscreenOnly` gate: only apply when the target window
+//     is presenting fullscreen (media player playback, browser fullscreen
+//     3D viewer, etc.).
 //
-// Inspired by NTM's AutoCP-Launcher (github.com/NTM-3D/AutoCP-Launcher):
-// users build a list of {game -> right stereo format} once, SR Loom flips
-// the format automatically when the game is in focus. Removes the manual
-// "open the tray menu and pick the format every time you alt-tab" friction
-// for the 3DMigoto / Geo-11 / fixer-mod audience.
+// Inspired by NTM's AutoCP-Launcher (github.com/NTM-3D/AutoCP-Launcher).
+// v2.2 profile-schema additions were requested by NTM after v2.1 shipped
+// so his 3D SBS Image Viewer, MPC-3D, VLC etc. workflows work cleanly.
 //
 // Storage: %LOCALAPPDATA%\SRLoom\profiles.ini -- INI-like, hand-editable.
-// One [Name] section per profile, key=value pairs inside.
+// One [Name] section per profile, key=value pairs inside. Only fields the
+// user actually customised are written (sparse serialisation) -- makes the
+// file easy to hand-edit and read.
 #pragma once
 
 #include "Common.h"
@@ -25,9 +31,18 @@ namespace srw
     {
         std::string  name;                 // user-visible label
         std::string  exe;                  // basename substring, case-insensitive ("" = any)
-        std::string  title;                // window-title substring, case-insensitive ("" = any)
-        // What to apply when the match fires:
-        StereoFormat format       = StereoFormat::FullSBS;
+        std::string  title;                // window-title regex, case-insensitive ("" = any)
+        bool         fullscreenOnly = false;   // only match when target window is fullscreen
+        // What to apply when the match fires.
+        // If useAutoFormat is true, the .format field is IGNORED at apply-
+        // time; instead the current window's title is parsed for well-known
+        // stereo tokens (HSBS/HTAB/SBS/TAB/_2x1/_1x2/OU/anaglyph/...) and
+        // the detected format is used. If nothing matches, defaultFormat is
+        // used instead. Lets one profile cover all "3D-named" files opened
+        // in the same viewer/player.
+        StereoFormat format         = StereoFormat::HalfSBS;
+        bool         useAutoFormat  = false;
+        StereoFormat defaultFormat  = StereoFormat::HalfSBS;
         bool         swapEyes     = false;
         float        convergence  = 0.0f;
         // Format-specific sub-options. Only meaningful when `format` is
@@ -68,14 +83,45 @@ namespace srw
         std::vector<Profile> Load();
 
         // Persist the list back to disk. Overwrites the file. Creates the
-        // directory if missing. Logs on I/O failure.
+        // directory if missing. Logs on I/O failure. SPARSE -- writes only
+        // fields that differ from Profile{}'s defaults, so hand-editing the
+        // file stays tractable.
         void Save(const std::vector<Profile>& list);
 
-        // True if the given exe basename + window title match the profile's
-        // patterns. Both fields case-insensitive substring; empty pattern
-        // always matches.
+        // True if exe + title match. `title` matches if it's a case-
+        // insensitive substring of the window title (v2.1 semantics) OR it
+        // matches as a regex (ECMAScript, case-insensitive; compiled once
+        // and cached). An invalid regex just gets the substring half, so a
+        // stray parenthesis doesn't brick the profile. Both patterns must
+        // match; empty pattern is a wildcard.
+        // NOTE: does NOT check `fullscreenOnly` -- caller checks the fullscreen
+        // state itself (needs the target HWND, which this API doesn't take).
         bool Matches(const Profile& p, const std::string& exeBaseName,
                                        const std::string& windowTitle);
+
+        // Parse a window title / filename for well-known stereo tokens.
+        // Returns the detected format + sets detected=true on match; returns
+        // HalfSBS + detected=false if nothing matched. Used when a profile
+        // has format=auto: the detected format wins, falling back to the
+        // profile's defaultFormat if this returns detected=false.
+        //
+        // Case-insensitive, whole-word; `.` `_` `-` and spaces are all
+        // equivalent separators ("Full.SBS" == "full-sbs" == "Full_SBS").
+        //   HSBS / HalfSBS / Half SBS / SBS Half     -> HalfSBS
+        //   FSBS / FullSBS / Full SBS / SBS Full     -> FullSBS
+        //   SBS / SideBySide / Side By Side          -> HalfSBS (streaming default)
+        //   HTAB / HalfTAB / Half OU / HOU*          -> HalfTAB
+        //   FTAB / FullTAB / Full OU / FOU*          -> FullTAB
+        //   TopAndBottom / OverUnder / TAB* / OU*    -> HalfTAB (streaming default)
+        //   FramePacking / FramePack / HDMI3D / MVC* -> FramePacking
+        //   Anaglyph / RedCyan                       -> Anaglyph
+        //   RowInterlaced / Interlaced*              -> RowInterleaved
+        //   Checkerboard*                            -> Checkerboard
+        //   Quilt* / _qs<cols>x<rows>                -> Quilt
+        //   _2x1 (or 2x1*) / _1x2 (or 1x2*)          -> HalfSBS / HalfTAB (Leia)
+        // * = common-word token; only counts when the title also contains
+        //     "3D" / "stereo" (so Chrome's "New Tab" isn't read as TAB).
+        StereoFormat DetectFormatFromTitle(const std::string& title, bool& detected);
 
         // Stable string IDs for StereoFormat (used in the on-disk file --
         // must stay stable across versions so existing profiles keep

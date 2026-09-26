@@ -27,7 +27,38 @@ namespace
     // Settings entry per addition).
     constexpr wchar_t kSettingsKey[]      = L"Software\\SRLoom";
     constexpr wchar_t kLastCheckValue[]   = L"LastUpdateCheckUnix";
-    constexpr DWORD   kThrottleSeconds    = 6 * 60 * 60;   // 6 hours
+    constexpr char    kLatestTagValue[]   = "LatestReleaseTag";
+    constexpr char    kLatestUrlValue[]   = "LatestReleaseUrl";
+    // 1 hour: checks now also run when the panel is opened, so this is the
+    // real cap. GitHub's unauthenticated API allows 60 requests/hour per IP;
+    // we make at most 1.
+    constexpr DWORD   kThrottleSeconds    = 60 * 60;
+
+    std::string ReadRegString(const char* name)
+    {
+        HKEY h = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_READ, &h) != ERROR_SUCCESS)
+            return {};
+        char buf[512] = {};
+        DWORD sz = sizeof(buf) - 1, type = 0;
+        std::string out;
+        if (RegQueryValueExA(h, name, nullptr, &type,
+                             reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && type == REG_SZ)
+            out = buf;
+        RegCloseKey(h);
+        return out;
+    }
+
+    void WriteRegString(const char* name, const std::string& value)
+    {
+        HKEY h = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0,
+                            KEY_WRITE, nullptr, &h, nullptr) != ERROR_SUCCESS)
+            return;
+        RegSetValueExA(h, name, 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(value.c_str()), (DWORD)value.size() + 1);
+        RegCloseKey(h);
+    }
 
     // Read the throttle timestamp; 0 if never recorded.
     DWORD ReadLastCheckUnix()
@@ -217,7 +248,7 @@ namespace srw::UpdateChecker
             if (!FetchLatestRelease(L"api.github.com", path, body))
             {
                 Log("UpdateChecker: fetch failed");
-                if (force) post(new ReleaseInfo{ReleaseInfo::Failed, {}, {}});
+                if (force) post(new ReleaseInfo{ReleaseInfo::Failed, {}, {}, true});
                 return;
             }
             // Record the check timestamp regardless of result so we don't
@@ -229,21 +260,38 @@ namespace srw::UpdateChecker
             if (tag.empty())
             {
                 Log("UpdateChecker: no tag_name in response (len=%zu)", body.size());
-                if (force) post(new ReleaseInfo{ReleaseInfo::Failed, {}, {}});
+                if (force) post(new ReleaseInfo{ReleaseInfo::Failed, {}, {}, true});
                 return;
             }
+            // Remember what the latest release is, so the next launch can
+            // show the update notice without waiting for a network check.
+            WriteRegString(kLatestTagValue, tag);
+            WriteRegString(kLatestUrlValue, url);
 
             const int cmp = CompareVersions(tag, kAppVersion);
             Log("UpdateChecker: current=%s latest=%s cmp=%d", kAppVersion, tag.c_str(), cmp);
             if (cmp <= 0)
             {
                 // Up to date (or somehow ahead) -- silent unless forced.
-                if (force) post(new ReleaseInfo{ReleaseInfo::UpToDate, tag, url});
+                if (force) post(new ReleaseInfo{ReleaseInfo::UpToDate, tag, url, true});
                 return;
             }
 
             // A newer release exists -- always post.
-            post(new ReleaseInfo{ReleaseInfo::Available, tag, url});
+            post(new ReleaseInfo{ReleaseInfo::Available, tag, url, force});
         }).detach();
+    }
+
+    bool CachedUpdate(std::string& tag, std::string& url)
+    {
+        tag = ReadRegString(kLatestTagValue);
+        url = ReadRegString(kLatestUrlValue);
+        if (tag.empty() || url.empty() || CompareVersions(tag, kAppVersion) <= 0)
+        {
+            tag.clear();
+            url.clear();
+            return false;
+        }
+        return true;
     }
 }

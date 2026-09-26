@@ -183,11 +183,11 @@ namespace srw
             { StereoFormat::VR180SBS,          "VR180 (Side-by-Side)" },
             { StereoFormat::VR360TAB,          "VR360 (Top-and-Bottom)" },
             { StereoFormat::VR360SBS,          "VR360 (Side-by-Side)" },
-            // StereoFormat::Katanga intentionally omitted -- the feature
-            // is implemented end-to-end but parked from the UI until the
-            // remaining UX issues (cursor on weave, focus/Z-pin via
-            // publisher discovery) are properly sorted. Re-add this entry
-            // to expose it again.
+            // Katanga: receive frames a game / bridge publishes over the
+            // Katanga shared-texture protocol. Selecting it listens actively;
+            // the "Katanga Receiver" toggle (auto-receive) listens passively
+            // and switches here on its own when a sender appears.
+            { StereoFormat::Katanga,           "Katanga" },
             { StereoFormat::LightField,        "Lytro Light Field" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));

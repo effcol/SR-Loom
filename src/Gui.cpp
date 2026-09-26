@@ -410,6 +410,13 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // and update these in place.
     m_runAtStartup = Settings::ReadRunAtStartup();
     m_startInTray  = Settings::ReadStartInTray();
+    m_headTrackingOnStartup = Settings::ReadHeadTrackingOnStartup();
+    m_katangaAutoReceive    = Settings::ReadKatangaAutoReceive();
+    // Start in Windows' own light/dark app mode. The header's theme button
+    // still flips it for the session; a Windows theme change re-syncs it
+    // (WM_SETTINGCHANGE below).
+    m_systemLightMode = Settings::ReadSystemUsesLightTheme();
+    m_lightMode       = m_systemLightMode;
 
     // The GUI renders on its OWN D3D11 device, never the weaver's. The SR runtime
     // drives the weaver's immediate context (including from its own thread while
@@ -463,6 +470,10 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;   // don't write imgui.ini
+    // ImGui 1.91 shows recoverable user errors in an on-screen tooltip. That
+    // tooltip calls Begin(), which faults if the error happens outside a
+    // frame (font loading, issue #4). Log-only is plenty for a release app.
+    ImGui::GetIO().ConfigErrorRecoveryEnableTooltip = false;
     Log("Gui::Init: ImGui_ImplWin32_Init");
     if (!ImGui_ImplWin32_Init(m_hwnd)) { Log("Gui::Init: ImGui_ImplWin32_Init FAILED"); return false; }
     Log("Gui::Init: ImGui_ImplDX11_Init");
@@ -474,14 +485,9 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // the panel is the same perceptual size on a 4K/150% display and a 1440p/100%
     // one. WM_DPICHANGED re-applies this when it's dragged between monitors.
     //
-    // __try/__except (Windows SEH, not C++ try/catch) — a v2.0 report came
-    // back showing 0xC0000005 (access violation) inside ApplyScaling at
-    // dpiScale=1.50 on Win10 22H2 + Samsung Odyssey. Access violations are
-    // structured exceptions; plain C++ catch doesn't see them under default
-    // /EHsc, so the previous try/catch quietly let the process die. SEH
-    // catches them. Granular Log calls inside ApplyScaling pin the exact
-    // line for next-run diagnosis; the GUI continues with ImGui's defaults
-    // if the scaling step dies (un-scaled fonts but functional panel).
+    // ApplyScaling SEH-wraps itself (see the trampoline for the issue #4
+    // history): if the rebuild ever faults, the GUI continues on ImGui's
+    // built-in font rather than dying.
     Log("Gui::Init: ImGui_ImplWin32_GetDpiScaleForHwnd");
     m_dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(m_hwnd);
     if (m_dpiScale <= 0.0f || m_dpiScale > 8.0f)
@@ -503,34 +509,51 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     return true;
 }
 
-// SEH wrapper. __try cannot live in a function that requires C++ object
-// unwinding (C2712 under /EHsc), so the actual work lives in
-// ApplyScalingImpl and this thin trampoline (with no locals + no RAII)
-// catches any access violation that fires inside. Used by both Init()
-// and the per-frame WM_DPICHANGED rebuild path -- safety net for the
-// Win10 + Samsung Odyssey + high-DPI font-baker crash class.
+// Split-SEH trampoline: style rebuild and font-atlas rebuild in separate
+// __try blocks, so the style always completes and a font-path fault can be
+// handled on its own (RecoverFontsAfterCrash + sticky m_fontsBroken, so
+// later DPI changes don't walk into it again).
+//
+// GitHub issue #4 (Win10 crash on dragging between monitors of different
+// DPI) turned out NOT to be a DPI or baker problem: Win10 has no
+// SegoeIcons.ttf, and ImGui 1.91's AddFontFromFileTTF reports a missing file
+// through ErrorLog -> BeginErrorTooltip() -> Begin(), which faults when
+// called outside a frame. The first fault (at Init) was survivable; the
+// second (on WM_DPICHANGED) left dangling font pointers and crashed the next
+// Render. Fixed at the source in ApplyFontsImpl (existence check before
+// every file load) and Init (error tooltip off); this SEH layer is now just
+// a safety net. __try cannot coexist with C++ RAII in the same function
+// (C2712), so the tramp has no locals with dtors.
 void Gui::ApplyScaling()
 {
+    Log("Gui::ApplyScaling: enter (dpiScale=%.2f)", m_dpiScale);
     __try { ApplyScalingImpl(); }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        Log("Gui::ApplyScaling SEH 0x%08lX -- continuing with defaults",
+        Log("Gui::ApplyScaling: SEH 0x%08lX in style rebuild -- continuing",
             (unsigned long)GetExceptionCode());
+    }
+    if (m_fontsBroken)
+        return;   // fonts already fell back to the built-in atlas; keep it
+    bool sehFired = false;
+    __try { ApplyFontsImpl(); }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("Gui::ApplyScaling: SEH 0x%08lX in font rebuild -- switching to built-in font",
+            (unsigned long)GetExceptionCode());
+        sehFired = true;
+    }
+    if (sehFired)
+    {
+        m_fontsBroken = true;
+        RecoverFontsAfterCrash();
     }
 }
 
-// The actual scaling work; called only through the SEH trampoline above
-// so an access violation inside is caught instead of killing the process.
+// Style + theme + spacing scale + DwmSetWindowAttribute recolour. Pure
+// in-memory writes, safe to call any time.
 void Gui::ApplyScalingImpl()
 {
-    // Per-step breadcrumbs (added in v2.0.1 to pin IsPepsiOk's Win10 +
-    // Samsung Odyssey font-baker crash) were causing visible flashes on
-    // WM_DPICHANGED: ApplyScaling fires on every monitor-drag, and each
-    // synchronous fopen/fputs/fclose stalls the render thread for a ms
-    // or so. ~17 of those per call easily ate a frame on VRR OLEDs, which
-    // showed up as a black blink. Keep only the entry line + the rare
-    // font-fallback messages -- those fire ~once, not per-rebuild.
-    Log("Gui::ApplyScaling: enter (dpiScale=%.2f)", m_dpiScale);
     ImGui::GetStyle() = ImGuiStyle();              // reset to defaults FIRST, else ScaleAllSizes
                                                    // compounds un-reset fields each call (e.g.
                                                    // WindowMinSize) → window slowly inflates and
@@ -538,9 +561,31 @@ void Gui::ApplyScalingImpl()
     ApplyTheme(m_lightMode);                       // base (unscaled) sizes + colours
     ImGui::GetStyle().ScaleAllSizes(m_dpiScale);   // scale paddings/rounding to DPI
 
+    // Recolour the native title bar to match the app (keeps the native min/max/close
+    // buttons, just tinted). Caption + text + thin border; dark-mode flag controls
+    // the button glyph colour. COLORREF is 0x00BBGGRR (the RGB() macro).
+    const ImVec4 bgc = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+    const ImVec4 txc = ImGui::GetStyle().Colors[ImGuiCol_Text];
+    COLORREF caption = RGB((int)(bgc.x * 255), (int)(bgc.y * 255), (int)(bgc.z * 255));
+    COLORREF txt     = RGB((int)(txc.x * 255), (int)(txc.y * 255), (int)(txc.z * 255));
+    BOOL dark = m_lightMode ? FALSE : TRUE;
+    DwmSetWindowAttribute(m_hwnd, kDwmImmersiveDark, &dark,    sizeof(dark));
+    DwmSetWindowAttribute(m_hwnd, kDwmCaptionColor,  &caption, sizeof(caption));
+    DwmSetWindowAttribute(m_hwnd, kDwmTextColor,     &txt,     sizeof(txt));
+    DwmSetWindowAttribute(m_hwnd, kDwmBorderColor,   &caption, sizeof(caption));
+}
+
+// Rebuild the ImGui font atlas for the current DPI. Wrapped by
+// ApplyScaling's second __try; if it faults, RecoverFontsAfterCrash installs
+// the built-in font instead.
+void Gui::ApplyFontsImpl()
+{
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->Clear();
     const float s = m_dpiScale;
+    const float px17 = 17.0f * s;
+    const float px23 = 23.0f * s;
+    const float px10 = 10.0f * s;
     // Body = Inter (bundled, SIL OFL) — the open-source SF-Pro-like UI font Reeder's
     // look is built on; headings = Inter SemiBold. Falls back to Segoe UI Variable
     // then the built-in font if the bundled files are missing.
@@ -560,11 +605,21 @@ void Gui::ApplyScalingImpl()
         ImFontConfig cfg; cfg.FontDataOwnedByAtlas = false;
         return io.Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), (int)sz, px, &cfg, ranges);
     };
-    m_fontRegular = addEmbedded(IDR_FONT_REGULAR, 17.0f * s, bodyRange);
-    if (!m_fontRegular) { Log("Gui::ApplyScaling: Inter Regular failed -> SegUIVar.ttf"); m_fontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegUIVar.ttf", 17.0f * s, nullptr, bodyRange); }
+    // System font from disk. CHECK EXISTENCE FIRST: ImGui 1.91's
+    // AddFontFromFileTTF reports a missing file via ErrorLog, which faults
+    // outside a frame (issue #4 -- Win10 has neither SegoeIcons.ttf nor
+    // SegUIVar.ttf, both Win11-only). Missing -> nullptr, caller falls back.
+    auto addSystem = [&](const char* path, float px, const ImWchar* ranges = nullptr) -> ImFont* {
+        const DWORD attrs = GetFileAttributesA(path);
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+            return nullptr;
+        return io.Fonts->AddFontFromFileTTF(path, px, nullptr, ranges);
+    };
+    m_fontRegular = addEmbedded(IDR_FONT_REGULAR, px17, bodyRange);
+    if (!m_fontRegular) { Log("Gui::ApplyScaling: Inter Regular failed -> SegUIVar.ttf"); m_fontRegular = addSystem("C:\\Windows\\Fonts\\SegUIVar.ttf", px17, bodyRange); }
     if (!m_fontRegular) { Log("Gui::ApplyScaling: SegUIVar.ttf failed -> AddFontDefault"); m_fontRegular = io.Fonts->AddFontDefault(); }
-    ImFont* big = addEmbedded(IDR_FONT_SEMIBOLD, 23.0f * s);
-    if (!big) { Log("Gui::ApplyScaling: Inter SemiBold failed -> seguisb.ttf"); big = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 23.0f * s); }
+    ImFont* big = addEmbedded(IDR_FONT_SEMIBOLD, px23);
+    if (!big) { Log("Gui::ApplyScaling: Inter SemiBold failed -> seguisb.ttf"); big = addSystem("C:\\Windows\\Fonts\\seguisb.ttf", px23); }
     m_fontLarge = big ? big : m_fontRegular;
     // Windows' own caption-button glyphs: Segoe Fluent Icons (Win11) -> Segoe
     // MDL2 Assets (Win10). Baked at the native ~10px so the min/max/close
@@ -572,27 +627,45 @@ void Gui::ApplyScalingImpl()
     // system fonts directory) we leave m_fontIcons = nullptr -- CaptionButton
     // and the About popup both null-check it and fall back to drawn glyphs.
     static const ImWchar iconRange[] = { 0xE700, 0xE9FF, 0 };
-    m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\SegoeIcons.ttf", 10.0f * s, nullptr, iconRange);
+    m_fontIcons = addSystem("C:\\Windows\\Fonts\\SegoeIcons.ttf", px10, iconRange);
     if (!m_fontIcons)
-        m_fontIcons = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segmdl2.ttf", 10.0f * s, nullptr, iconRange);
+        m_fontIcons = addSystem("C:\\Windows\\Fonts\\segmdl2.ttf", px10, iconRange);
     if (!m_fontIcons)
         Log("Gui::ApplyScaling: icon font UNAVAILABLE (both SegoeIcons.ttf and segmdl2.ttf failed) -- using drawn-glyph fallback");
     io.Fonts->Build();
     io.FontDefault = m_fontRegular;
     ImGui_ImplDX11_InvalidateDeviceObjects();      // recreate the font texture next frame
+}
 
-    // Recolour the native title bar to match the app (keeps the native min/max/close
-    // buttons, just tinted). Caption + text + thin border; dark-mode flag controls
-    // the button glyph colour. COLORREF is 0x00BBGGRR (the RGB() macro).
-    const ImVec4 bgc = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
-    const ImVec4 txc = ImGui::GetStyle().Colors[ImGuiCol_Text];
-    COLORREF caption = RGB((int)(bgc.x * 255), (int)(bgc.y * 255), (int)(bgc.z * 255));
-    COLORREF txt     = RGB((int)(txc.x * 255), (int)(txc.y * 255), (int)(txc.z * 255));
-    BOOL dark = m_lightMode ? FALSE : TRUE;
-    DwmSetWindowAttribute(m_hwnd, kDwmImmersiveDark, &dark,    sizeof(dark));
-    DwmSetWindowAttribute(m_hwnd, kDwmCaptionColor,  &caption, sizeof(caption));
-    DwmSetWindowAttribute(m_hwnd, kDwmTextColor,     &txt,     sizeof(txt));
-    DwmSetWindowAttribute(m_hwnd, kDwmBorderColor,   &caption, sizeof(caption));
+// Called from the ApplyScaling trampoline when ApplyFontsImpl faults. A
+// fault mid-rebuild leaves the atlas half-built and m_font* pointing at
+// fonts Clear() already freed, so the next Render would crash. Install
+// ImGui's built-in font (compiled-in data, no file I/O) and invalidate the
+// device objects so the texture matches. If even that faults, null the
+// pointers -- Render null-checks them and ImGui falls back to its default.
+void Gui::RecoverFontsAfterCrash()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    __try
+    {
+        io.Fonts->Clear();
+        ImFont* fallback = io.Fonts->AddFontDefault();
+        io.Fonts->Build();
+        io.FontDefault = fallback;
+        m_fontRegular = fallback;
+        m_fontLarge   = fallback;
+        m_fontIcons   = nullptr;   // CaptionButton / About fall back to drawn glyphs
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        Log("Gui::ApplyScaling: built-in font installed after font-rebuild fault");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("Gui::ApplyScaling: built-in font ALSO SEH 0x%08lX -- nulling font pointers",
+            (unsigned long)GetExceptionCode());
+        m_fontRegular = nullptr;
+        m_fontLarge   = nullptr;
+        m_fontIcons   = nullptr;
+    }
 }
 
 void Gui::Shutdown()
@@ -648,8 +721,16 @@ bool Gui::EnsureSwapChain(UINT w, UINT h)
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount = 2;
-        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        // BIT-BLT model, not flip. The panel is a small UI that doesn't need
+        // flip's latency, and a flip-model window is eligible for hardware
+        // overlay-plane (MPO) / independent-flip / G-Sync-windowed promotion.
+        // Every time the panel resized (expand/collapse), appeared, closed or
+        // changed monitor, the driver re-arbitrated that path, which on some
+        // GPU driver + VRR/OLED combos blanks the WHOLE monitor for a moment.
+        // A bit-blt window is always DWM-composed, so there's nothing to
+        // re-arbitrate.
+        sd.BufferCount = 1;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
         HRESULT hr = factory->CreateSwapChainForHwnd(m_device, m_hwnd, &sd, nullptr, nullptr, &m_swap);
         if (factory) factory->Release();
         if (adapter) adapter->Release();
@@ -786,6 +867,7 @@ bool Gui::Render(GuiState& state)
                     sc("Ctrl+Alt+W", "Toggle Weaving");
                     sc("Ctrl+Alt+F", "Fullscreen / Windowed");
                     sc("Ctrl+Alt+C", "Make Active Window 3D");
+                    sc("Ctrl+Alt+R", "Recentre Head Tracking");
 
                     ImGui::Dummy(ImVec2(0, 6 * m_dpiScale));
                     // "Check for updates" link. Posts the result directly
@@ -869,6 +951,27 @@ bool Gui::Render(GuiState& state)
 
         // Drop the cursor below the title bar for the hero (absolute → window-relative).
         ImGui::SetCursorPos(ImVec2(0.0f, headerH + 4.0f * m_dpiScale - py));
+    }
+
+    // Update banner: a newer SR Loom release is on GitHub. Full-width accent
+    // button above the hero, in both compact and expanded layouts; opens the
+    // release page. Hidden when up to date.
+    if (!state.updateTag.empty())
+    {
+        const float padX = ImGui::GetStyle().WindowPadding.x;
+        char label[96];
+        _snprintf_s(label, _TRUNCATE, "Update available: %s  -  Download", state.updateTag.c_str());
+        ImGui::SetCursorPosX(padX);
+        ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_accent);
+        ImGui::PushStyleColor(ImGuiCol_Text,          g_accentText);
+        if (ImGui::Button(label, ImVec2(ImGui::GetWindowSize().x - 2.0f * padX, 0)))
+            post(ID_TRAY_OPEN_UPDATE);
+        ImGui::PopStyleColor(4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Open the SR Loom %s release page on GitHub", state.updateTag.c_str());
+        ImGui::Dummy(ImVec2(0, 2.0f * m_dpiScale));
     }
 
     // Hero weaving toggle — centred: big "Loom Weaver"/"Loom Weaving" label + switch.
@@ -1164,16 +1267,13 @@ bool Gui::Render(GuiState& state)
         {
             // Category combo (whole list, no scroll). SBS / TAB / Interleaved /
             // VR180 / VR360 expose a second "variant" combo for the layout.
-            // StereoFormat::Katanga deliberately not exposed (parked from
-            // the UI -- see Common.h's StereoFormatList comment). If the
-            // current format is Katanga (e.g. carried over from a saved
-            // state), catOf below maps it to C_SBS so the dropdown still
-            // has something coherent to display.
-            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_VR180, C_VR360, C_LFP, C_N };
+            // Katanga = actively listen for a Katanga sender (game / bridge);
+            // the STARTUP "Katanga Receiver" toggle does the same passively.
+            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_VR180, C_VR360, C_LFP, C_KATANGA, C_N };
             static const char* const kCat[C_N] = {
                 "Side-by-Side", "Top-and-Bottom", "Interleaved", "Checkerboard",
                 "Anaglyph", "Frame Sequential", "Pulfrich Effect", "Frame Packing",
-                "Quilt", "VR180", "VR360", "Lytro Light Field" };
+                "Quilt", "VR180", "VR360", "Lytro Light Field", "Katanga" };
             auto catOf = [](StereoFormat f) -> int {
                 switch (f) {
                 case StereoFormat::FullSBS: case StereoFormat::HalfSBS:        return C_SBS;
@@ -1188,6 +1288,7 @@ bool Gui::Render(GuiState& state)
                 case StereoFormat::VR180TAB: case StereoFormat::VR180SBS:    return C_VR180;
                 case StereoFormat::VR360TAB: case StereoFormat::VR360SBS:    return C_VR360;
                 case StereoFormat::LightField:      return C_LFP;
+                case StereoFormat::Katanga:         return C_KATANGA;
                 default:                            return C_SBS;
                 }
             };
@@ -1226,6 +1327,7 @@ bool Gui::Render(GuiState& state)
                         case C_VR180: postFmt(StereoFormat::VR180TAB); break;   // default TAB (YouTube convention)
                         case C_VR360: postFmt(StereoFormat::VR360TAB); break;
                         case C_LFP:   postFmt(StereoFormat::LightField); break;
+                        case C_KATANGA: postFmt(StereoFormat::Katanga); break;
                         }
                     }
                 }
@@ -1831,6 +1933,47 @@ bool Gui::Render(GuiState& state)
                     state.profileDeleteIndex = s_selected;
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Delete profile '%s'", state.profileEntries[s_selected].name.c_str());
+
+                // Row 2 (v2.2): fullscreen-only + auto-format toggles.
+                // Both are simple boolean flags on the profile so they get
+                // the same accent/dim visual treatment as the HT toggle.
+                const float halfW = (availList - spc) / 2.0f;
+                const bool  fso   = state.profileEntries[s_selected].fullscreenOnly;
+                const bool  autoFmt = state.profileEntries[s_selected].useAutoFormat;
+
+                ImGui::PushStyleColor(ImGuiCol_Text, fso ? g_accent : g_dim);
+                if (ImGui::Button(fso ? "Fullscreen: ON" : "Fullscreen: off", ImVec2(halfW, 0)))
+                    state.profileToggleFullscreenIndex = s_selected;
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                {
+                    const float maxW = 300.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(fso
+                        ? "Weave only engages when the target window is fullscreen. Turns off again on exiting fullscreen. Click to disable."
+                        : "Weave engages any time the target window is focused. Click to require fullscreen instead (media players, browser 3D viewers).");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                ImGui::SameLine(0, spc);
+                ImGui::PushStyleColor(ImGuiCol_Text, autoFmt ? g_accent : g_dim);
+                if (ImGui::Button(autoFmt ? "Auto-Format: ON" : "Auto-Format: off", ImVec2(halfW, 0)))
+                    state.profileToggleAutoFormatIndex = s_selected;
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                {
+                    const float maxW = 320.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(autoFmt
+                        ? "Detect the stereo format from the window title (HSBS, HTAB, _2x1, MVC, anaglyph, etc.); the profile's saved format becomes the fallback when nothing is recognised. Click to disable."
+                        : "Always use the profile's saved format. Click to auto-detect from title tokens instead (recommended for media players / browsers where the file name carries the format).");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
             }
             else
             {
@@ -2003,6 +2146,53 @@ bool Gui::Render(GuiState& state)
                 m_startInTray = !m_startInTray;
                 Settings::WriteStartInTray(m_startInTray);
             }
+            // Second row, same half-width pairing. Startup Head Tracking
+            // defaults ON to match the pre-toggle behaviour (head tracking has
+            // always auto-engaged on startup); users who don't use tracking
+            // can flip it off to keep the SR camera cold at launch. Katanga
+            // Receiver = auto-receive (see Settings::ReadKatangaAutoReceive).
+            // Each tooltip is attached right after its own switch, before
+            // SameLine moves on to the next item.
+            if (pairToggle2("Startup Head Tracking", m_headTrackingOnStartup, halfW))
+            {
+                m_headTrackingOnStartup = !m_headTrackingOnStartup;
+                Settings::WriteHeadTrackingOnStartup(m_headTrackingOnStartup);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(
+                    "When on (default), SR Loom turns on OpenTrack / FreeTrack / "
+                    "TrackIR head-tracking output at launch so games see head "
+                    "movement immediately. Turn off to keep the SR camera idle "
+                    "until you enable a protocol from the HEADTRACKING section.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Katanga Receiver", m_katangaAutoReceive, halfW))
+            {
+                m_katangaAutoReceive = !m_katangaAutoReceive;
+                Settings::WriteKatangaAutoReceive(m_katangaAutoReceive);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(
+                    "When on (default), SR Loom automatically shows anything sent to it "
+                    "over Katanga in 3D -- games using Katanga, or bridges like the "
+                    "3D Slicer extension. Fullscreen games fill the SR display; windowed "
+                    "ones get the 3D right over their window. Your previous setup comes "
+                    "back when the sender stops.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
         }
     }
 
@@ -2042,25 +2232,39 @@ bool Gui::Render(GuiState& state)
     ImGui::End();
 
     ImGui::Render();
+    m_lastState = state;     // so a window drag can repaint with the latest values
+
+    // Fit the window to the content BEFORE presenting. Presenting first and
+    // resizing after (the old order) left the just-presented frame on screen
+    // stretched to the new window size for a frame -- text visibly grew /
+    // shrank when expanding or collapsing the panel. If this frame says the
+    // window must change size, resize it and draw the frame again at the new
+    // size instead of showing this one. Up to two re-draws: expanding also
+    // changes the width, which re-wraps text and can change the height again.
+    if (FitHeightToContent((int)(contentH + 0.5f)) && m_refitDepth < 2)
+    {
+        ++m_refitDepth;
+        const bool changed = Render(state);
+        --m_refitDepth;
+        return convChanged || changed;
+    }
+
     const ImVec4 bgc = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
     const float clear[4] = { bgc.x, bgc.y, bgc.z, 1.0f };
     m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
     m_context->ClearRenderTargetView(m_rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     m_swap->Present(0, 0);   // no vsync: don't add a second vsync wait to the weave loop
-
-    m_lastState = state;     // so a window drag can repaint with the latest values
-    FitHeightToContent((int)(contentH + 0.5f));
     return convChanged;
 }
 
 // Resize the window to fit the content: height to the content, and width to a
 // snug collapsed size (just the on/off toggle) or a wider expanded size. Clamped to
 // the monitor; position is left alone.
-void Gui::FitHeightToContent(int clientContentH)
+bool Gui::FitHeightToContent(int clientContentH)
 {
-    if (clientContentH <= 0) return;
-    if (IsIconic(m_hwnd) || IsZoomed(m_hwnd)) return;   // don't fight minimise/maximise
+    if (clientContentH <= 0) return false;
+    if (IsIconic(m_hwnd) || IsZoomed(m_hwnd)) return false;   // don't fight minimise/maximise
     RECT wr{}, cr{};
     GetWindowRect(m_hwnd, &wr);
     GetClientRect(m_hwnd, &cr);
@@ -2078,8 +2282,12 @@ void Gui::FitHeightToContent(int clientContentH)
         if (desiredH > maxH) desiredH = maxH;
     }
     if (abs(desiredH - (wr.bottom - wr.top)) > 2 || abs(desiredW - (wr.right - wr.left)) > 2)
+    {
         SetWindowPos(m_hwnd, nullptr, 0, 0, desiredW, desiredH,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return true;
+    }
+    return false;
 }
 
 LRESULT CALLBACK Gui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2118,6 +2326,23 @@ LRESULT CALLBACK Gui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (g_gui && wParam == 1) g_gui->Render(g_gui->m_lastState);
         return 0;
+    case WM_SETTINGCHANGE:
+        // Windows light/dark app mode changed ("ImmersiveColorSet" broadcast;
+        // re-reading the value on any settings change is cheap and avoids
+        // A/W string-compare pitfalls). Rebuild the theme between frames.
+        // Only act when WINDOWS' value changed, so an unrelated settings
+        // broadcast doesn't undo the user's theme-button choice.
+        if (g_gui)
+        {
+            const bool light = Settings::ReadSystemUsesLightTheme();
+            if (light != g_gui->m_systemLightMode)
+            {
+                g_gui->m_systemLightMode = light;
+                g_gui->m_lightMode       = light;
+                g_gui->m_pendingRescale  = true;
+            }
+        }
+        break;   // let DefWindowProc see it too
     case WM_DPICHANGED:
         // Dragged to a monitor with a different DPI: resize to the OS-suggested
         // rect and rebuild fonts/style at the new scale so the panel stays the

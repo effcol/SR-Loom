@@ -59,6 +59,9 @@ namespace srw
         bool StartCaptureInternalActive();   // build pool+session for m_impl->item
         void ReleaseTarget();
         bool EnsureTarget(int width, int height);
+        bool EnsureFull(int width, int height);   // (re)create m_full at frame size
+        bool ResolveRegion(int& rx, int& ry, int& rw, int& rh) const;   // clamp m_reg* to the frame
+        bool RecropIfRegionChanged(bool& sizeChanged);   // re-crop without a new WGC frame
 
         struct Impl;                       // holds the WinRT objects
         std::unique_ptr<Impl>     m_impl;
@@ -72,6 +75,18 @@ namespace srw
         int                       m_frameW  = 0;   // full captured-frame size
         int                       m_frameH  = 0;
         int                       m_regX = 0, m_regY = 0, m_regW = 0, m_regH = 0; // crop, frame px
+        // Region actually baked into m_tex (resolved + clamped). When the
+        // requested region stops matching it (Looking Glass <-> Fullscreen,
+        // moving/resizing the loupe) we re-crop immediately from the last
+        // full frame instead of waiting for WGC's next frame -- our own
+        // window is excluded from capture, so on a still desktop that next
+        // frame may not come for a long time, leaving a stale crop
+        // stretched over the new window.
+        int                       m_appX = 0, m_appY = 0, m_appW = 0, m_appH = 0;
+        // Full-frame copy of the latest capture, kept only while cropping to
+        // a sub-region. When the crop IS the full frame, m_tex already holds
+        // it (no extra copy), and gets adopted as the source on a re-crop.
+        ID3D11Texture2D*          m_full    = nullptr;
         bool                      m_active  = false;
         bool                      m_captureCursor = false;   // composite the OS cursor into the frame
         // TYPELESS buffer so we can copy the BGRA frame into it and still create

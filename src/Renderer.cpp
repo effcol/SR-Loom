@@ -96,8 +96,15 @@ bool Renderer::Initialize(HWND hwnd)
 bool Renderer::CreateSwapChain(bool flip)
 {
     SAFE_RELEASE(m_rtv);
+    const bool replacing = (m_swapChain != nullptr);
     SAFE_RELEASE(m_swapChain);
     m_waitable = nullptr;   // owned by the swap chain; invalidated on release
+    // D3D11 destroys a released swap chain lazily, when the immediate context
+    // next flushes. Until then the HWND still "has" it, and creating another
+    // swap chain on the same window can fail (E_ACCESSDENIED) -- see MS docs,
+    // "Deferred destruction issues with flip presentation swap chains". The
+    // caller already unbound the RTV, so Flush() is enough to finish it off.
+    if (replacing && m_context) m_context->Flush();
 
     m_flip       = flip;
     m_swapFormat = flip ? DXGI_FORMAT_R8G8B8A8_UNORM        // flip can't use an _SRGB buffer
@@ -130,7 +137,11 @@ bool Renderer::CreateSwapChain(bool flip)
         if (SUCCEEDED(hr)) { m_swapFlags = f; break; }
     }
     if (FAILED(hr))
+    {
+        Log("Renderer::CreateSwapChain(%s) FAILED hr=0x%08X",
+            flip ? "flip" : "bitblt", (unsigned)hr);
         return false;
+    }
 
     // Grab the waitable object (if we got one) and keep at most one frame queued.
     if (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)

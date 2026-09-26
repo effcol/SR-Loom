@@ -14,7 +14,8 @@ namespace
     constexpr wchar_t kSettingsKey[]     = L"Software\\SRLoom";
     constexpr wchar_t kSrLoomValue[]     = L"SRLoom";
     constexpr wchar_t kStartInTrayValue[] = L"StartInTray";
-    constexpr wchar_t kAutoApplyProfilesValue[] = L"AutoApplyProfiles";
+    constexpr wchar_t kAutoApplyProfilesValue[]   = L"AutoApplyProfiles";
+    constexpr wchar_t kHeadTrackingOnStartupValue[] = L"HeadTrackingOnStartup";
 
     DWORD ReadDword(const wchar_t* path, const wchar_t* name, DWORD defaultValue)
     {
@@ -106,5 +107,37 @@ namespace srw::Settings
     void WriteAutoApplyProfiles(bool enable)
     {
         WriteDword(kSettingsKey, kAutoApplyProfilesValue, enable ? 1u : 0u);
+    }
+
+    bool ReadHeadTrackingOnStartup()
+    {
+        // Default ON -- matches the pre-toggle behaviour so upgraders see
+        // no change. Users who never touch head tracking (looking-glass /
+        // fullscreen weave only) can flip it off in the STARTUP section
+        // to keep the SR camera cold at launch.
+        return ReadDword(kSettingsKey, kHeadTrackingOnStartupValue, 1) != 0;
+    }
+
+    void WriteHeadTrackingOnStartup(bool enable)
+    {
+        WriteDword(kSettingsKey, kHeadTrackingOnStartupValue, enable ? 1u : 0u);
+    }
+
+    bool ReadKatangaAutoReceive()
+    {
+        return ReadDword(kSettingsKey, L"KatangaAutoReceive", 1) != 0;   // default ON
+    }
+
+    void WriteKatangaAutoReceive(bool enable)
+    {
+        WriteDword(kSettingsKey, L"KatangaAutoReceive", enable ? 1u : 0u);
+    }
+
+    bool ReadSystemUsesLightTheme()
+    {
+        // Windows' "Choose your default app mode" (Settings > Personalization
+        // > Colors). Missing value = pre-1809 Windows, which was light.
+        return ReadDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                         L"AppsUseLightTheme", 1) != 0;
     }
 }

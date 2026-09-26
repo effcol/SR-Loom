@@ -141,7 +141,22 @@ bool KatangaSource::TryOpenTexture(HANDLE sharedHandle)
     m_width  = (int)td.Width;
     m_height = (int)td.Height;
     m_format = td.Format;
+    ++m_generation;
     return true;
+}
+
+bool KatangaSource::PublisherPresent()
+{
+    HANDLE map = OpenFileMappingA(FILE_MAP_READ, FALSE, kMapName);
+    if (!map) return false;
+    uintptr_t value = 0;
+    if (void* view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(uintptr_t)))
+    {
+        value = *reinterpret_cast<volatile uintptr_t*>(view);
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(map);
+    return value != 0;
 }
 
 void KatangaSource::ReleaseTexture()
