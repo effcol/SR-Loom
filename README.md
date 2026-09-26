@@ -172,6 +172,14 @@ cmake --build build/x64 --config Release
 # -> build/x64/Release/SRLoom.exe
 ```
 
+## Credits
+
+- **[markleoryan79](https://github.com/markleoryan79)**: brought Katanga back into
+  SR Loom's format list and built the
+  [3D Slicer → SR Loom bridge](https://github.com/markleoryan79/3D-Slicer-Stereoscopic-Display-Extension/tree/SRLoomBridge),
+  which sends stereo views of medical scans into SR Loom over Katanga. His work
+  shaped SR Loom's Katanga receiver and auto-receive support.
+
 ## License
 
 MIT (see `LICENSE`). Bundles the **Inter** font (SIL Open Font License). Links
