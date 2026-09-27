@@ -168,13 +168,21 @@ void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn
 // which was a source of wrong disparities (and the spurious colour borrows).
 float descCost(float a16[16], float b16[16])
 {
-    float sad = 0, en = 0.15;
+    float sad = 0, ea = 0, eb = 0;
     [unroll] for (int j = 0; j < 16; ++j)
     {
         sad += abs(a16[j] - b16[j]);
-        en  += abs(a16[j]) + abs(b16[j]);
+        ea  += abs(a16[j]);
+        eb  += abs(b16[j]);
     }
-    return sad / en;
+    const float cost = sad / (ea + eb + 0.15);
+    // A candidate where either view has next to no structure can't be
+    // checked: NEUTRAL, not bad. Scored as a mismatch, the inside of a plain
+    // coloured surface (red paint is blank in the cyan view) always lost to
+    // any candidate out on textured background, however poor -- the borrow
+    // was pulled out of the surface into its surroundings: the blobs.
+    const float evidence = saturate(min(ea, eb) / 0.6);
+    return lerp(0.4, cost, evidence);
 }
 
 // Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal

@@ -1,0 +1,293 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4c990da..2990f6d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,7 +134,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
+ set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
+ set(CONVERTER_ENTRIES
+     VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
+-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0)
++    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSRecLuma:ps_5_0)
+ set(CONVERTER_SHADER_HEADERS)
+ foreach(E ${CONVERTER_ENTRIES})
+     string(REPLACE ":" ";" P "${E}")
+diff --git a/src/Converter.cpp b/src/Converter.cpp
+index d42e483..854786a 100644
+--- a/src/Converter.cpp
++++ b/src/Converter.cpp
+@@ -13,6 +13,7 @@
+ #include "Converter_PSAnaRefine.h"
+ #include "Converter_PSAnaFill.h"
+ #include "Converter_PSAnaSmooth.h"
++#include "Converter_PSRecLuma.h"
+ 
+ using namespace srw;
+ 
+@@ -87,7 +88,7 @@ namespace
+                int quiltRightIdx; float paneW; float paneH; float quiltLBlend;
+                float quiltRBlend; float vrYaw; float vrPitch; float vrZoom;
+                int vrIs360; int vrIsSBS; float temporal; float lvlToSrcX;
+-               float lvlToSrcY; float _pad_e, _pad_f, _pad_g; };
++               float lvlToSrcY; float lumaPass; float _pad_f, _pad_g; };
+ 
+ }
+ 
+@@ -112,6 +113,7 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
+         { g_Converter_PSAnaRefine,    sizeof(g_Converter_PSAnaRefine),    &m_psRefine    },
+         { g_Converter_PSAnaFill,      sizeof(g_Converter_PSAnaFill),      &m_psFill      },
+         { g_Converter_PSAnaSmooth,    sizeof(g_Converter_PSAnaSmooth),    &m_psSmooth    },
++        { g_Converter_PSRecLuma,      sizeof(g_Converter_PSRecLuma),      &m_psRecLuma   },
+     };
+     for (const auto& p : ps)
+         if (SUCCEEDED(hr)) hr = device->CreatePixelShader(p.code, p.size, nullptr, p.out);
+@@ -317,9 +319,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+                m_quiltRightBlend,
+                m_vrYaw, m_vrPitch, m_vrZoom,
+                IsVR360(m_fmt) ? 1 : 0, IsVRSBS(m_fmt) ? 1 : 0,
+-               m_dispPrevValid ? 1.0f : 0.0f,
++               (m_dispPrevValid && m_steady && !m_lumaPass) ? 1.0f : 0.0f,
+                anaRecover ? 16.0f * w16 / srcWidth : 1.0f,
+-               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, 0, 0, 0 };
++               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, m_lumaPass ? 1.0f : 0.0f, 0, 0 };
+         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
+     };
+ 
+@@ -360,49 +362,69 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+     if (anaRecover && m_disp0.rtv && m_disp1.rtv && m_disp2.rtv && m_dispF.rtv && m_src4.rtv && m_src16.rtv && m_psDown &&
+         m_psDesc && EnsureDescTargets(w4, h4))
+     {
++        // One round of the disparity search on a 1/4 and 1/16 picture: coarse
++        // full search, descriptors, refine, occlusion fill, edge-aware smooth
++        // (steadied by last frame's result when steady is set) into m_dispF.
++        auto runRound = [&](ID3D11ShaderResourceView* src4, ID3D11ShaderResourceView* src16, bool steady, bool marks)
++        {
++            m_steady = steady;
++            uploadCB((float)w16, (float)h16); runDispPass(m_psCoarse, m_disp0, nullptr, src16);   // full search 1/16
++            if (marks && tSlot >= 0) TimeMark(tSlot, 1);
++            uploadCB((float)w4,  (float)h4);
++            {
++                // Gradient descriptors of every 1/4 pixel, once (read by the refine).
++                D3D11_VIEWPORT vp{};
++                vp.Width = (FLOAT)w4; vp.Height = (FLOAT)h4; vp.MaxDepth = 1.0f;
++                m_context->PSSetShader(m_psDesc, nullptr, 0);
++                m_context->OMSetRenderTargets(4, m_descRTV, nullptr);
++                m_context->RSSetViewports(1, &vp);
++                m_context->PSSetShaderResources(0, 1, &src4);   // (the 1/4 copy: its pixels are the descriptor taps)
++                m_context->Draw(3, 0);
++                ID3D11ShaderResourceView* nul = nullptr;
++                m_context->PSSetShaderResources(0, 1, &nul);
++                m_context->OMSetRenderTargets(0, nullptr, nullptr);
++            }
++            if (marks && tSlot >= 0) TimeMark(tSlot, 2);
++            m_context->PSSetShaderResources(3, 4, m_descSRV);
++            runDispPass(m_psRefine, m_disp1, m_disp0.srv, src4);                                  // refine 1/4
++            {
++                ID3D11ShaderResourceView* nuls[4] = {};
++                m_context->PSSetShaderResources(3, 4, nuls);
++            }
++            if (marks && tSlot >= 0) TimeMark(tSlot, 3);
++            runDispPass(m_psFill, m_disp2, m_disp1.srv, src4);                                    // occlusion fill 1/4
++            if (marks && tSlot >= 0) TimeMark(tSlot, 4);
++            ID3D11ShaderResourceView* prev[2] = { m_dispPrev.srv, m_src4Prev.srv };
++            ID3D11ShaderResourceView* nuls[2] = {};
++            if (steady) m_context->PSSetShaderResources(7, 2, prev);
++            runDispPass(m_psSmooth, m_dispF, m_disp2.srv, src4);                                  // edge-aware smooth 1/4
++            m_context->PSSetShaderResources(7, 2, nuls);
++            m_steady = true;
++        };
+         // The source averaged down to 1/4 and 1/16: what the passes below read.
+         runDispPass(m_psDown, m_src4,  nullptr, source);
+         runDispPass(m_psDown, m_src16, nullptr, m_src4.srv);
+-        uploadCB((float)w16, (float)h16); runDispPass(m_psCoarse, m_disp0, nullptr, m_src16.srv);   // full search 1/16
+-        if (tSlot >= 0) TimeMark(tSlot, 1);
+-        uploadCB((float)w4,  (float)h4);
++        // Round 1: the red view against the cyan one.
++        runRound(m_src4.srv, m_src16.srv, true, true);
++        // Round 2: both eyes' colour recovered roughly with round 1's
++        // disparities, and the search run again on their luminances -- the
++        // same kind of picture in both eyes (see PSRecLuma). Most blobs on
++        // coloured objects came from matching two different colour channels.
++        if (m_twoRounds && m_psRecLuma && (EnsureDispTarget(m_lum4, w4, h4), m_lum4.rtv) && (EnsureDispTarget(m_lum16, w16, h16), m_lum16.rtv))
+         {
+-            // Gradient descriptors of every 1/4 pixel, once (read by the refine).
+-            D3D11_VIEWPORT vp{};
+-            vp.Width = (FLOAT)w4; vp.Height = (FLOAT)h4; vp.MaxDepth = 1.0f;
+-            m_context->PSSetShader(m_psDesc, nullptr, 0);
+-            m_context->OMSetRenderTargets(4, m_descRTV, nullptr);
+-            m_context->RSSetViewports(1, &vp);
+-            m_context->PSSetShaderResources(0, 1, &m_src4.srv);   // (the 1/4 copy: its pixels are the descriptor taps)
+-            m_context->Draw(3, 0);
+-            ID3D11ShaderResourceView* nul = nullptr;
+-            m_context->PSSetShaderResources(0, 1, &nul);
+-            m_context->OMSetRenderTargets(0, nullptr, nullptr);
++            uploadCB((float)w4, (float)h4);
++            runDispPass(m_psRecLuma, m_lum4, m_dispF.srv, m_src4.srv);
++            runDispPass(m_psDown, m_lum16, nullptr, m_lum4.srv);
++            m_lumaPass = true;
++            runRound(m_lum4.srv, m_lum16.srv, false, false);
++            m_lumaPass = false;
+         }
+-        if (tSlot >= 0) TimeMark(tSlot, 2);
+-        m_context->PSSetShaderResources(3, 4, m_descSRV);
+-        runDispPass(m_psRefine, m_disp1, m_disp0.srv, m_src4.srv);                                  // refine 1/4
++        // Keep this frame's for the next one.
++        if (m_dispPrev.tex && m_src4Prev.tex)
+         {
+-            ID3D11ShaderResourceView* nuls[4] = {};
+-            m_context->PSSetShaderResources(3, 4, nuls);
+-        }
+-        if (tSlot >= 0) TimeMark(tSlot, 3);
+-                                          runDispPass(m_psFill,   m_disp2, m_disp1.srv, m_src4.srv);  // occlusion fill 1/4
+-        if (tSlot >= 0) TimeMark(tSlot, 4);
+-        {
+-            // Edge-aware smooth 1/4, steadied by last frame's result (video).
+-            ID3D11ShaderResourceView* prev[2] = { m_dispPrev.srv, m_src4Prev.srv };
+-            ID3D11ShaderResourceView* nuls[2] = {};
+-            m_context->PSSetShaderResources(7, 2, prev);
+-            runDispPass(m_psSmooth, m_dispF, m_disp2.srv, m_src4.srv);
+-            m_context->PSSetShaderResources(7, 2, nuls);
+-            // Keep this frame's for the next one.
+-            if (m_dispPrev.tex && m_src4Prev.tex)
+-            {
+-                m_context->CopyResource(m_dispPrev.tex, m_dispF.tex);
+-                m_context->CopyResource(m_src4Prev.tex, m_src4.tex);
+-                m_dispPrevValid = true;
+-            }
++            m_context->CopyResource(m_dispPrev.tex, m_dispF.tex);
++            m_context->CopyResource(m_src4Prev.tex, m_src4.tex);
++            m_dispPrevValid = true;
+         }
+     }
+ 
+@@ -639,6 +661,8 @@ void Converter::ReleaseDisparity()
+     ReleaseDispTarget(m_src16);
+     ReleaseDispTarget(m_dispPrev);
+     ReleaseDispTarget(m_src4Prev);
++    ReleaseDispTarget(m_lum4);
++    ReleaseDispTarget(m_lum16);
+     m_dispPrevValid = false;
+ }
+ 
+@@ -653,6 +677,7 @@ void Converter::Shutdown()
+     SAFE_RELEASE(m_psDesc);
+     SAFE_RELEASE(m_psDown);
+     SAFE_RELEASE(m_psSmooth);
++    SAFE_RELEASE(m_psRecLuma);
+     SAFE_RELEASE(m_psFill);
+     SAFE_RELEASE(m_psRefine);
+     SAFE_RELEASE(m_psCoarse);
+diff --git a/src/Converter.h b/src/Converter.h
+index 8413388..fb111c5 100644
+--- a/src/Converter.h
++++ b/src/Converter.h
+@@ -116,6 +116,13 @@ namespace srw
+         DispTarget m_src16;   // ... and 16x (the coarse search)
+         DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
+         DispTarget m_src4Prev;   // last frame's 1/4 source (to see what changed)
++        // Recovery round 2 (PSRecLuma): both eyes' recovered luminance (.r left,
++        // .g right) at 1/4 and 1/16, searched again like the anaglyph.
++        DispTarget m_lum4, m_lum16;
++        ID3D11PixelShader* m_psRecLuma = nullptr;
++        bool m_twoRounds = true;    // (SetTwoRounds: off = round 1 only)
++        bool m_lumaPass  = false;   // (the cbuffer's g_lumaPass, set during round 2)
++        bool m_steady    = true;    // (the smoothing may use last frame's result)
+         bool       m_dispPrevValid = false;
+         ID3D11PixelShader* m_psDown = nullptr;   // 4x box downsample
+         // Packed gradient descriptors at the refine level (PSAnaDesc): 4 x uint4.
+@@ -143,6 +150,7 @@ namespace srw
+         // Diagnostics (tools/anatest): the recovery's disparity map after a stage
+         // -- 0 coarse search, 1 refine, 2 occlusion fill, 3 smoothing (what the
+         // compose reads) -- or null.
++        void SetTwoRounds(bool on) { m_twoRounds = on; }   // (diagnostics / comparison)
+         ID3D11ShaderResourceView* DebugStageSRV(int stage) const
+         {
+             const DispTarget* t[4] = { &m_disp0, &m_disp1, &m_disp2, &m_dispF };
+diff --git a/src/shaders/Converter.hlsl b/src/shaders/Converter.hlsl
+index 16fd406..c596737 100644
+--- a/src/shaders/Converter.hlsl
++++ b/src/shaders/Converter.hlsl
+@@ -49,7 +49,7 @@ cbuffer Params : register(b0)
+     float g_temporal;      // anaglyph recovery: last frame's disparity is there to steady this one (1)
+     float g_lvlToSrcX;     // anaglyph recovery: the disparity levels cover whole 16-px blocks, a little past
+     float g_lvlToSrcY;     // the picture's edge -- a level's uv x this = the picture's uv (>= 1)
+-    float _pad_e;
++    float g_lumaPass;      // anaglyph recovery, 2nd round: the source is recovered luminance (.r left eye, .g right)
+     float _pad_f;
+     float _pad_g;
+ };
+@@ -79,14 +79,18 @@ float anaEyeLuma(float3 c, int combo, int e)
+ // Anaglyph recovery: the channel matched for each view's disparity, per combo --
+ // one that carries only that eye's picture (red vs green for red/cyan: blue is
+ // left out, it adds noise). Amber/blue's left view is red+green.
++// (In the recovery's second round the matching passes read a picture of
++// recovered luminance -- .r the left eye's, .g the right's -- see PSRecLuma.)
+ float anaChanL(float3 c)
+ {
++    if (g_lumaPass > 0.5) return c.r;
+     if (g_anaCombo == 3 || g_anaCombo == 5) return c.g;          // Green/Magenta, Cyan/Magenta
+     if (g_anaCombo == 4) return (c.r + c.g) * 0.5;               // Amber/Blue
+     return c.r;                                                  // Red/Cyan, Red/Green, Red/Blue
+ }
+ float anaChanR(float3 c)
+ {
++    if (g_lumaPass > 0.5) return c.g;
+     if (g_anaCombo == 2 || g_anaCombo == 4) return c.b;          // Red/Blue, Amber/Blue
+     if (g_anaCombo == 3 || g_anaCombo == 5) return c.r;          // Green/Magenta, Cyan/Magenta
+     return c.g;                                                  // Red/Cyan, Red/Green
+@@ -168,13 +172,21 @@ void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn
+ // which was a source of wrong disparities (and the spurious colour borrows).
+ float descCost(float a16[16], float b16[16])
+ {
+-    float sad = 0, en = 0.15;
++    float sad = 0, ea = 0, eb = 0;
+     [unroll] for (int j = 0; j < 16; ++j)
+     {
+         sad += abs(a16[j] - b16[j]);
+-        en  += abs(a16[j]) + abs(b16[j]);
++        ea  += abs(a16[j]);
++        eb  += abs(b16[j]);
+     }
+-    return sad / en;
++    const float cost = sad / (ea + eb + 0.15);
++    // A candidate where either view has next to no structure can't be
++    // checked: NEUTRAL, not bad. Scored as a mismatch, the inside of a plain
++    // coloured surface (red paint is blank in the cyan view) always lost to
++    // any candidate out on textured background, however poor -- the borrow
++    // was pulled out of the surface into its surroundings: the blobs.
++    const float evidence = saturate(min(ea, eb) / 0.6);
++    return lerp(0.4, cost, evidence);
+ }
+ 
+ // Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal
+@@ -435,6 +447,31 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
+     }
+     return float4(d, myConf.x, myConf.y);
+ }
++
++// Recovery, second round. Matching the red view against the cyan one is
++// matching two different colour channels, and on colour edges they disagree:
++// the edge flips (a grey wall to red paint brightens in red, darkens in
++// green) or all but vanishes in one. There the true match scored worst, a
++// wrong one won, and its colour was borrowed: most blobs on coloured objects
++// were never matched right at any stage. So: recover both eyes' colour
++// roughly with the first round's disparities (this 1/4 level; own channels
++// as seen, the other view's borrowed), and match again on the two recovered
++// LUMINANCES -- the same kind of picture in both eyes, whose edges agree.
++// Target 1/4: .r the left eye's luminance, .g the right eye's. dispTex: the
++// first round's smoothed disparity; srcTex: the 1/4 anaglyph.
++float4 PSRecLuma(VSOut i) : SV_Target
++{
++    const float2 uv = i.uv;
++    const float4 d = dispTex.SampleLevel(samp, uv, 0.0);
++    const float3 c  = srcTex.SampleLevel(samp, uv, 0.0).rgb;
++    const float3 cL = srcTex.SampleLevel(samp, float2(uv.x + d.r, uv.y), 0.0).rgb;   // the right view where the left eye's point is
++    const float3 cR = srcTex.SampleLevel(samp, float2(uv.x + d.g, uv.y), 0.0).rgb;   // the left view where the right eye's point is
++    const float3 mL = anaFilter(float3(1, 1, 1), g_anaCombo, 0), mR = anaFilter(float3(1, 1, 1), g_anaCombo, 1);
++    const float3 L = c * mL + cL * (1.0 - mL);
++    const float3 R = c * mR + cR * (1.0 - mR);
++    const float3 Yw = float3(0.299, 0.587, 0.114);
++    return float4(dot(L, Yw), dot(R, Yw), 0, 1);
++}
+ // (There was a push-pull colour fill here -- confidence-weighted colour
+ // pyramids filling low-confidence pixels. Its sampler never read past the
+ // finest level, so it only ever returned each pixel's own colour: the look

@@ -58,3 +58,6 @@ tools/sweep_*/
 # Local scratch files (e.g. Lytro LFP schema / LFToolbox excerpts used for
 # research). Third-party and/or proprietary -- never commit.
 /*_tmp.*
+
+# Auto Stereo "debug pick" screenshots, written next to the exe.
+autostereo_debug/
