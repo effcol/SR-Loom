@@ -140,5 +140,8 @@ namespace srw
         int64_t                              m_targetIntervalNs = 0;
         std::chrono::steady_clock::time_point m_lastPresentEnd{};
         std::chrono::steady_clock::time_point m_lastFrameStart{};   // render cap counts from here
+        // The SR display's output: frames start on its vertical blank (see
+        // WaitForFrame), locking the loop to its refresh rate.
+        IDXGIOutput*                         m_vblankOutput = nullptr;
     };
 }

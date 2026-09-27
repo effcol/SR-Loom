@@ -1,6 +1,7 @@
 #include "Capture.h"
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>   // (frame dirty regions)
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
@@ -67,6 +68,8 @@ struct Capture::Impl
     // until the next one arrives (see Update).
     Direct3D11CaptureFrame       held{ nullptr };
     com_ptr<ID3D11Texture2D>     heldTex;
+    // Windows 11 24H2+: each frame says which parts of the screen changed.
+    bool                         dirtyOk = false;
 };
 
 Capture::Capture() = default;
@@ -193,6 +196,18 @@ bool Capture::StartCaptureInternalActive()
     // Apollo (#676). 1ms is small enough to track 120/144/160/240Hz content;
     // wrapped in try/catch in case the API isn't present on older Win10 builds.
     try { m_impl->session.MinUpdateInterval(std::chrono::milliseconds(1)); } catch (...) {}
+    // Which parts of the screen changed, with each frame (Windows 11 24H2+):
+    // a change outside what we weave then isn't a new picture for us (see Update).
+    m_impl->dirtyOk = false;
+    m_contentValid = false;   // (a new session: the first frame is copied whole)
+    try
+    {
+        m_impl->session.DirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+        m_impl->dirtyOk = true;
+    }
+    catch (...) {}
+    static bool s_logged = false;
+    if (!s_logged) { s_logged = true; Log("Capture: dirty regions %s", m_impl->dirtyOk ? "supported" : "not available (older Windows)"); }
     m_impl->session.StartCapture();
     m_active = true;
     return true;
@@ -236,13 +251,26 @@ bool Capture::Update(bool& sizeChanged)
         // Delivery statistics: every frame Windows hands us (even ones skipped
         // below), timed by its own capture stamp -- the SR display's real
         // capture rate, independent of how fast our loop runs.
-        auto countFrame = [this](const auto& fr) {
+        // What changed on screen (dirty regions, Windows 11 24H2+), over every
+        // frame taken this time. Unknown -> treat all of it as changed.
+        std::vector<RECT> dirty;
+        bool dirtyKnown = m_impl->dirtyOk;
+        auto countFrame = [this, &dirty, &dirtyKnown](const auto& fr) {
             int64_t t = 0;
             try { t = fr.SystemRelativeTime().count(); } catch (...) {}
-            if (!t) return;
-            if (m_statFrames == 0) m_statFirstT = t;
-            m_statLastT = t;
-            ++m_statFrames;
+            if (t)
+            {
+                if (m_statFrames == 0) m_statFirstT = t;
+                m_statLastT = t;
+                ++m_statFrames;
+            }
+            if (!dirtyKnown) return;
+            try
+            {
+                for (const auto& d : fr.DirtyRegions())
+                    dirty.push_back({ d.X, d.Y, d.X + d.Width, d.Y + d.Height });
+            }
+            catch (...) { dirtyKnown = false; }
         };
         countFrame(frame);
         // Drain any queued frames and weave only the newest — minimizes latency.
@@ -269,27 +297,45 @@ bool Capture::Update(bool& sizeChanged)
         int rx, ry, rw, rh;
         if (!ResolveRegion(rx, ry, rw, rh)) { frame.Close(); return false; }  // fully off-screen
 
+        // m_tex holds the crop (the whole frame, or the Looking Glass's part):
+        // straight from the captured frame. (The Looking Glass also HOLDS the
+        // frame -- one of the pool's buffers -- until the next one arrives, to
+        // re-crop from if the glass moves meanwhile; see below.)
         const bool fullFrame = (rx == 0 && ry == 0 && rw == m_frameW && rh == m_frameH);
-        D3D11_BOX box{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
-        if (fullFrame)
+        SAFE_RELEASE(m_full);
+        sizeChanged = EnsureTarget(rw, rh);
+        // With the dirty regions: only what changed inside the crop is copied,
+        // and a frame that changed nothing inside it isn't new content at all
+        // (a clock ticking elsewhere on screen no longer re-converts the weave).
+        const bool sameCrop = m_contentValid && !sizeChanged &&
+                              rx == m_appX && ry == m_appY && rw == m_appW && rh == m_appH;
+        bool touched = true;
+        std::vector<RECT> parts;
+        if (dirtyKnown && sameCrop)
         {
-            // m_tex will hold the whole frame -- no separate full copy needed.
-            SAFE_RELEASE(m_full);
-            sizeChanged = EnsureTarget(rw, rh);
-            if (m_tex)
-                m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
+            touched = false;
+            const RECT crop{ rx, ry, rx + rw, ry + rh };
+            for (const RECT& d : dirty)
+            {
+                RECT i{};
+                if (IntersectRect(&i, &d, &crop)) { touched = true; parts.push_back(i); }
+            }
         }
-        else
+        if (m_tex && touched)
         {
-            // Sub-region (Looking Glass): crop straight from the captured
-            // frame, and HOLD that frame (one of the pool's buffers) until the
-            // next one arrives -- if the glass moves meanwhile it re-crops
-            // from it. (This used to copy the whole 4K frame every frame just
-            // in case: a second full-screen copy per frame.)
-            SAFE_RELEASE(m_full);
-            sizeChanged = EnsureTarget(rw, rh);
-            if (m_tex)
+            if (!parts.empty() && parts.size() <= 16)
+                for (const RECT& p : parts)
+                {
+                    D3D11_BOX b{ (UINT)p.left, (UINT)p.top, 0, (UINT)p.right, (UINT)p.bottom, 1 };
+                    m_context->CopySubresourceRegion(m_tex, 0, (UINT)(p.left - rx), (UINT)(p.top - ry), 0,
+                                                     frameTex.get(), 0, &b);
+                }
+            else
+            {
+                D3D11_BOX box{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
                 m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
+            }
+            m_contentValid = true;
         }
         m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
 
@@ -312,6 +358,8 @@ bool Capture::Update(bool& sizeChanged)
             m_impl->framePool.Recreate(
                 m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, contentSize);
         }
+        if (!touched) return false;   // (nothing inside what we weave changed)
+        ++m_version;   // (new pixels in m_tex)
         return true;
     }
     catch (hresult_error const&)
@@ -349,6 +397,8 @@ bool Capture::RecropIfRegionChanged(bool& sizeChanged)
         D3D11_BOX hb{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
         m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, m_impl->heldTex.get(), 0, &hb);
         m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
+        ++m_version;
+        m_contentValid = true;
         return true;
     }
 
@@ -374,6 +424,8 @@ bool Capture::RecropIfRegionChanged(bool& sizeChanged)
     // Back to a full-frame crop: m_tex holds everything again.
     if (rx == 0 && ry == 0 && rw == m_frameW && rh == m_frameH)
         SAFE_RELEASE(m_full);
+    ++m_version;
+    m_contentValid = true;
     return true;
 }
 

@@ -121,7 +121,40 @@ add_custom_command(TARGET NPClient64 POST_BUILD
     VERBATIM
 )
 
+# Converter shaders, compiled at BUILD time: fxc (from the Windows SDK) turns
+# each entry point into a header of bytecode (g_Converter_<entry>) that the exe
+# embeds. Compiling them when SR Loom started took ~17 s the first time after
+# every change (the main shader alone is that slow to optimise).
+find_program(FXC_EXE fxc
+    HINTS "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+    REQUIRED)
+set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
+file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
+set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
+set(CONVERTER_ENTRIES
+    VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
+    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0)
+set(CONVERTER_SHADER_HEADERS)
+foreach(E ${CONVERTER_ENTRIES})
+    string(REPLACE ":" ";" P "${E}")
+    list(GET P 0 ENTRY)
+    list(GET P 1 PROFILE)
+    set(OUT "${SHADER_OUT_DIR}/Converter_${ENTRY}.h")
+    add_custom_command(OUTPUT "${OUT}"
+        COMMAND "${FXC_EXE}" /nologo /T ${PROFILE} /E ${ENTRY} /O3 /Vn g_Converter_${ENTRY} /Fh "${OUT}" "${CONVERTER_HLSL}"
+        DEPENDS "${CONVERTER_HLSL}"
+        COMMENT "fxc: Converter ${ENTRY}"
+        VERBATIM)
+    list(APPEND CONVERTER_SHADER_HEADERS "${OUT}")
+endforeach()
+# (Listed in the project for editing only -- Visual Studio must not run its own
+# shader compile on it.)
+set_source_files_properties("${CONVERTER_HLSL}" PROPERTIES VS_TOOL_OVERRIDE "None")
+
 add_executable(SRLoom WIN32
+    ${CONVERTER_SHADER_HEADERS}
+    src/shaders/Converter.hlsl
     src/main.cpp
     src/Renderer.cpp
     src/SRWeaver.cpp
@@ -183,6 +216,7 @@ endif()
 
 target_include_directories(SRLoom PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${SHADER_OUT_DIR}          # (the build-time compiled shader headers)
     ${CMAKE_SOURCE_DIR}/third_party
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
@@ -201,7 +235,7 @@ target_link_libraries(SRLoom PRIVATE
     d3d11
     dxgi
     dxguid
-    d3dcompiler   # runtime HLSL compile for the conversion shaders
+    d3dcompiler   # runtime HLSL compile for the smaller shaders (the Converter's are built ahead)
     shcore        # SetProcessDpiAwareness
     shell32       # Shell_NotifyIcon (tray)
     user32
@@ -216,3 +250,18 @@ add_dependencies(SRLoom NPClient64)
 
 # Nothing to copy beside the exe: the UI fonts are embedded as resources (app.rc) and
 # the SR runtime DLLs come from the installed SR Platform. The release is just the exe.
+
+# Offline check of the anaglyph "Recovered Colour" conversion (not shipped;
+# built only on request: cmake --build ... --target anatest). anatest runs the
+# current converter; anatest_head the one in build/anatest/head (e.g. a
+# previous commit's Converter.cpp/.h) to compare against.
+add_executable(anatest EXCLUDE_FROM_ALL tools/anatest/anatest.cpp src/Converter.cpp ${CONVERTER_SHADER_HEADERS})
+target_include_directories(anatest PRIVATE ${CMAKE_SOURCE_DIR}/src ${SHADER_OUT_DIR})
+target_compile_definitions(anatest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(anatest PRIVATE d3d11 dxgi windowscodecs ole32)
+if(EXISTS "${CMAKE_SOURCE_DIR}/build/anatest/head/Converter.cpp")
+    add_executable(anatest_head EXCLUDE_FROM_ALL tools/anatest/anatest.cpp "${CMAKE_SOURCE_DIR}/build/anatest/head/Converter.cpp")
+    target_include_directories(anatest_head PRIVATE "${CMAKE_SOURCE_DIR}/build/anatest/head" ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(anatest_head PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS ANATEST_HEAD)
+    target_link_libraries(anatest_head PRIVATE d3d11 dxgi windowscodecs ole32 d3dcompiler)
+endif()

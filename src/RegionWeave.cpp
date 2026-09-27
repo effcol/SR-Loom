@@ -152,6 +152,7 @@ void RegionWeaver::Shutdown()
     Clear();
     m_convPool.clear();
     SafeRelease(m_compSRV); SafeRelease(m_compRTV); SafeRelease(m_comp);
+    SafeRelease(m_lgSRV); SafeRelease(m_lgTex); m_lgW = m_lgH = 0;
     m_compW = m_compH = 0;
     SafeRelease(m_rs); SafeRelease(m_cb); SafeRelease(m_sampler); SafeRelease(m_psBlur); SafeRelease(m_psCrop); SafeRelease(m_vsShift); SafeRelease(m_regionCB); SafeRelease(m_ps); SafeRelease(m_vs);
     m_device = nullptr; m_context = nullptr;
@@ -239,6 +240,35 @@ bool RegionWeaver::EnsureCrop(Slot& s, int w, int h, DXGI_FORMAT texFmt, DXGI_FO
     }
     s.cropW = w; s.cropH = h; s.cropFmt = texFmt;
     return true;
+}
+
+bool RegionWeaver::CropComposite(const RECT& rIn, bool& resized)
+{
+    resized = false;
+    if (!m_comp || m_compW <= 0) return false;
+    const int fw = m_compW / 2, fh = m_compH;
+    RECT r{};
+    const RECT all{ 0, 0, fw, fh };
+    if (!IntersectRect(&r, &rIn, &all)) return false;
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (!m_lgTex || w != m_lgW || h != m_lgH)
+    {
+        SafeRelease(m_lgSRV); SafeRelease(m_lgTex);
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = (UINT)(2 * w); td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = kCompFormat; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_lgTex))) { m_lgW = m_lgH = 0; return false; }
+        m_device->CreateShaderResourceView(m_lgTex, nullptr, &m_lgSRV);
+        m_lgW = w; m_lgH = h;
+        resized = true;
+    }
+    // Left eye's part, then the right eye's (the composite's right half).
+    D3D11_BOX bl{ (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
+    D3D11_BOX br{ (UINT)(fw + r.left), (UINT)r.top, 0, (UINT)(fw + r.right), (UINT)r.bottom, 1 };
+    m_context->CopySubresourceRegion(m_lgTex, 0, 0, 0, 0, m_comp, 0, &bl);
+    m_context->CopySubresourceRegion(m_lgTex, 0, (UINT)w, 0, 0, m_comp, 0, &br);
+    return m_lgSRV != nullptr;
 }
 
 bool RegionWeaver::EnsureComposite(int w, int h)

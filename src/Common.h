@@ -225,10 +225,15 @@ namespace srw
     // Append a line to srweaver.log (next to the exe) and the debugger output.
     inline void Log(const char* fmt, ...)
     {
+        // "[hh:mm:ss.mmm] " first: how long things take (start-up, stalls).
         char buf[1024];
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        const int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "[%02u:%02u:%02u.%03u] ",
+                                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
         va_list ap;
         va_start(ap, fmt);
-        _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+        _vsnprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, fmt, ap);
         va_end(ap);
         ::OutputDebugStringA(buf);
         ::OutputDebugStringA("\n");

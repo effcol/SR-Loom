@@ -26,11 +26,16 @@ namespace srw
         ~SRWeaver();
 
         // Connect to the SR service. Waits up to maxSeconds for it to come up.
-        bool CreateContext(double maxSeconds);
+        // lensPreference false: the lens stays off (unless another app wants it)
+        // -- for asking the runtime things without switching the lenses on.
+        bool CreateContext(double maxSeconds, bool lensPreference = true);
 
         // Query the SR display's screen rectangle (virtual-desktop coords).
         // Returns false until the display is connected/ready.
         bool GetSRDisplayRect(RECT& out);
+        // The SR runtime's recommended size for the side-by-side views texture
+        // (both eyes): more detail per eye than this can't show on the panel.
+        bool GetRecommendedViewsSize(int& w, int& h);
 
         // Returns the SR Platform runtime version, in the form
         // "MAJOR.MINOR.PATCH.GITHASH" (empty string on failure). Useful in
@@ -141,6 +146,7 @@ namespace srw
         // docs -- "should not be explicitly deleted"). We keep a raw pointer
         // and null it when the context is torn down.
         SR::SwitchableLensHint*   m_lensHint = nullptr;
+        int                       m_lensReq  = -1;        // last enable(1) / disable(0) we asked for (-1: none yet)
         ID3D11Texture2D*          m_viewTex = nullptr;
         ID3D11ShaderResourceView* m_viewSRV = nullptr;
         int                       m_imgW    = 0;   // loaded image full size

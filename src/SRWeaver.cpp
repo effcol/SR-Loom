@@ -67,14 +67,14 @@ SRWeaver::~SRWeaver()
     Shutdown();
 }
 
-bool SRWeaver::CreateContext(double maxSeconds)
+bool SRWeaver::CreateContext(double maxSeconds, bool lensPreference)
 {
     const auto start = std::chrono::steady_clock::now();
     while (m_context == nullptr)
     {
         try
         {
-            m_context = SR::SRContext::create();
+            m_context = SR::SRContext::create(lensPreference);
             break;
         }
         catch (SR::ServerNotAvailableException&)
@@ -93,16 +93,20 @@ bool SRWeaver::CreateContext(double maxSeconds)
 
 void SRWeaver::LensEnable()
 {
-    if (!m_lensHint) return;
+    // Only when it changes: each call waits on the SR runtime (~17 ms+), and
+    // every source / mode pick used to repeat it -- a render-thread hitch.
+    if (!m_lensHint || m_lensReq == 1) return;
+    m_lensReq = 1;
     try { m_lensHint->enable(); }
-    catch (...) { Log("SwitchableLensHint::enable() threw"); }
+    catch (...) { Log("SwitchableLensHint::enable() threw"); m_lensReq = -1; }
 }
 
 void SRWeaver::LensDisable()
 {
-    if (!m_lensHint) return;
+    if (!m_lensHint || m_lensReq == 0) return;
+    m_lensReq = 0;
     try { m_lensHint->disable(); }
-    catch (...) { Log("SwitchableLensHint::disable() threw"); }
+    catch (...) { Log("SwitchableLensHint::disable() threw"); m_lensReq = -1; }
 }
 
 bool SRWeaver::GetPredictedEyePositions(float lEye[3], float rEye[3])
@@ -205,6 +209,26 @@ bool SRWeaver::GetSRDisplayRect(RECT& out)
     return false;
 }
 
+bool SRWeaver::GetRecommendedViewsSize(int& w, int& h)
+{
+    w = h = 0;
+    if (!m_context) return false;
+    try
+    {
+        if (SR::IDisplayManager* dm = SR::TryGetDisplayManagerInstance(*m_context))
+        {
+            SR::IDisplay* d = dm->getPrimaryActiveSRDisplay();
+            if (d && d->isValid()) { w = d->getRecommendedViewsTextureWidth(); h = d->getRecommendedViewsTextureHeight(); }
+        }
+        else if (SR::Display* d = SR::Display::create(*m_context))
+        {
+            w = d->getRecommendedViewsTextureWidth(); h = d->getRecommendedViewsTextureHeight();
+        }
+    }
+    catch (...) { w = h = 0; }
+    return w > 0 && h > 0;
+}
+
 bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
 {
     if (!m_context)
@@ -282,6 +306,7 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     // power state, separate from SR-session lifecycle. Lets us keep SR
     // session up while temporarily backing off to plain 2D (Katanga arm).
     // Owned by the SRContext per SDK docs.
+    m_lensReq = -1;
     try { m_lensHint = SR::SwitchableLensHint::create(*m_context); }
     catch (...) { m_lensHint = nullptr; }
     Log("CreateWeaver OK (weaver=%p, lensHint=%p); SR context initialized",
@@ -404,6 +429,7 @@ void SRWeaver::StopSR()
     m_window2Hwnd = nullptr;
     // SwitchableLensHint is owned by the SRContext; just drop our pointer.
     m_lensHint = nullptr;
+    m_lensReq = -1;
     if (m_weaver)
     {
         m_weaver->destroy();

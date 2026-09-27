@@ -42,7 +42,14 @@ namespace srw
         int                  width  = 0;
         int                  height = 0;
         std::vector<uint8_t> pixels;
-        std::vector<uint8_t> red, cyan;   // empty unless read back with colour
+        std::vector<uint8_t> red, green, blue;   // empty unless read back with colour
+        std::vector<uint8_t> cyan;               // (green + blue) / 2, alongside them
+        // Full-resolution interleave statistics (with colour frames): per 16x16
+        // capture-pixel tile, mean luma difference to the neighbour 1 / 2 rows
+        // down, 1 / 2 columns right and diagonal -- 5 floats (v1 v2 h1 h2 d1).
+        std::vector<float>   il;
+        int                  ilW = 0, ilH = 0;
+        static constexpr int kIlTile = 16;
         uint8_t at(int x, int y) const { return pixels[(size_t)y * width + x]; }
         bool    empty() const { return width <= 0 || height <= 0; }
         bool    hasColour() const { return !red.empty() && red.size() == pixels.size(); }
@@ -81,11 +88,18 @@ namespace srw
         ID3D11Texture2D*         m_rt = nullptr;            // luma (R8)
         ID3D11RenderTargetView*  m_rtv = nullptr;
         ID3D11ShaderResourceView* m_srv = nullptr;          // luma, for GPU tracking
-        ID3D11Texture2D*         m_rtC = nullptr;           // red, cyan (R8G8)
-        ID3D11RenderTargetView*  m_rtvC = nullptr;
+        static constexpr int kPlanes = 4;                   // colour planes: red, green, blue, cyan (R8 each)
+        ID3D11Texture2D*         m_rtC[kPlanes] = {};
+        ID3D11RenderTargetView*  m_rtvC[kPlanes] = {};
+        ID3D11PixelShader*       m_psIl = nullptr;          // interleave statistics (PSInterleave)
+        ID3D11Texture2D*         m_rtIl[2] = {};            // v1 v2 h1 h2 (RGBA32F), d1 (R32F) per tile
+        ID3D11RenderTargetView*  m_rtvIl[2] = {};
+        ID3D11Texture2D*         m_stagingIl[kRing][2] = {};
+        int                      m_ilW = 0, m_ilH = 0;
         ID3D11Texture2D*         m_staging[kRing] = {};
-        ID3D11Texture2D*         m_stagingC[kRing] = {};
+        ID3D11Texture2D*         m_stagingC[kRing][kPlanes] = {};
         bool                     m_slotColour[kRing] = {};
+        bool                     m_slotIl[kRing] = {};
         uint64_t                 m_slotFrame[kRing] = {};   // 0 = empty
         int                      m_w = 0, m_h = 0;
         uint64_t                 m_submitted = 0;           // frames submitted so far
@@ -127,8 +141,22 @@ namespace srw
     // Raw half-vs-half match strengths (for a manual pick that the tests
     // above found inconclusive).
     struct StereoScores { float sbs = 0.0f, tab = 0.0f; };
+    // An anaglyph's colour pair and best decode (the converter's combo index and
+    // shader mode value: 3 mono for a black-and-white picture, 4 recovered colour).
+    struct AnaglyphKind { int combo = 0; int mode = 4; bool known = false; };
+    // Which half of an SBS / TAB picture is the left eye: `swap` when the
+    // second half (right / bottom) looks like the LEFT eye. dx*: the right
+    // eye's shift against the left, over all / the top third / the bottom
+    // third (analysis px).
+    struct EyeOrder { bool known = false; bool swap = false; int dxAll = 0, dxTop = 0, dxBottom = 0; };
     bool ClassifyStereo(const LumaImage& img, const RECT& r, StereoFormat& format, float& score,
-                        char* diag = nullptr, size_t diagLen = 0, StereoScores* scores = nullptr);
+                        char* diag = nullptr, size_t diagLen = 0, StereoScores* scores = nullptr,
+                        AnaglyphKind* anaKind = nullptr, EyeOrder* eyeOrder = nullptr);
+
+    // Eye order of a picture already known to be `format` (SBS / TAB, or an
+    // anaglyph in colour pair `anaCombo`) -- for a layout picked by hand: the
+    // same cues Automatic Detection uses. out.known false: nothing to go on.
+    void JudgeEyeOrderOf(const LumaImage& img, const RECT& r, StereoFormat format, int anaCombo, EyeOrder& out);
 
     // Debug aid (Ctrl+Alt+Shift+A only): write the analysed grey image as an
     // 8-bit BMP with the search bounds, the found rectangle and the pick point
@@ -216,6 +244,8 @@ namespace srw
         StereoFormat format = StereoFormat::HalfSBS;
         float        score = 0.0f;
         bool         whole = false;   // the whole viewport (a player / fullscreen video)
+        AnaglyphKind ana;             // an anaglyph's colour pair / decode (when format is Anaglyph)
+        EyeOrder     eye;             // SBS / TAB: which half is the left eye
     };
     struct ScanVerify             // an existing auto-detected region to re-check
     {
@@ -257,6 +287,8 @@ namespace srw
             StereoFormat format = StereoFormat::HalfSBS;
             float        score = 0.0f;
             std::string  diag;
+            AnaglyphKind ana;
+            EyeOrder     eye;
         };
         static void Scan(const LumaImage& img, const std::vector<ScanWindow>& windows,
                          const std::vector<RECT>& exclude, ScanResult& out,

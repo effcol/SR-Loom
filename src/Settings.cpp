@@ -153,6 +153,26 @@ namespace srw::Settings
         return ReadDword(kSettingsKey, L"DiagSkipWeave", 0) != 0;
     }
 
+    bool ReadEyeOrderDetect()
+    {
+        return ReadDword(kSettingsKey, L"EyeOrderDetect", 1) != 0;
+    }
+
+    void WriteEyeOrderDetect(bool enable)
+    {
+        WriteDword(kSettingsKey, L"EyeOrderDetect", enable ? 1u : 0u);
+    }
+
+    int ReadDefaultInput()
+    {
+        return (int)ReadDword(kSettingsKey, L"DefaultInput", 0);   // default: Automatic Detection
+    }
+
+    void WriteDefaultInput(int input)
+    {
+        WriteDword(kSettingsKey, L"DefaultInput", (DWORD)(input < 0 ? 0 : input));
+    }
+
     bool ReadDirectComposition()
     {
         return ReadDword(kSettingsKey, L"DirectComposition", 1) != 0;   // default ON

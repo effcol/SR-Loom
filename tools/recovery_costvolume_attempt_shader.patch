@@ -1,0 +1,352 @@
+--- /c/Users/effie/AppData/Local/Temp/claude/D--Coding-SR-Weaver/060892a4-7a49-4f09-8781-08f83110e7d5/scratchpad/baseline.hlsl	2026-09-27 18:22:43.009902900 +0100
++++ src/shaders/Converter.hlsl	2026-09-27 20:39:36.951750200 +0100
+@@ -11,6 +11,9 @@
+ Texture2D<uint4> descTexD : register(t6);
+ Texture2D    dispPrevTex : register(t7);   // anaglyph recovery: last frame's smoothed disparity
+ Texture2D    srcPrevQ    : register(t8);   // ... and last frame's 1/4 source (what changed since)
++Texture2DArray costVolL  : register(t9);   // anaglyph recovery: coarse matching cost per candidate
++Texture2DArray costVolR  : register(t10);  // (PSAnaCost; 8 slices x 4 = 32 candidates, dLR / dRL)
++Texture2D    srcQ        : register(t11);  // anaglyph recovery: the 1/4 source (the compose's low-pass)
+ SamplerState samp    : register(s0);
+ 
+ cbuffer Params : register(b0)
+@@ -173,44 +176,6 @@
+     return sad / en;
+ }
+ 
+-// Coarse disparity pass (red/cyan anaglyph): low-resolution map of the horizontal
+-// disparity between the L (red) and R (green) views, both directions, via 4-angle
+-// gradient matching. Low resolution makes winner-take-all robust and smooth.
+-// Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
+-float4 PSAnaDisp(VSOut i) : SV_Target
+-{
+-    float2 uv  = i.uv;
+-    float  tx = 1.0 / max(g_coarseW, 1.0);
+-    float  ty = 1.0 / max(g_coarseH, 1.0);
+-    float  maxD = g_dispMaxUV;
+-    const int N = 24;
+-    float  step = maxD / (float)N;
+-
+-    float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
+-
+-    // Track the best match AND the best RIVAL (lowest cost at least 3 steps away from
+-    // the best) per direction. A unique match has its rival much higher; a repetitive
+-    // / ambiguous one (e.g. thin text strokes) has a near-equal rival -> low
+-    // uniqueness, which later flags the (confidently-wrong) borrow as low-confidence.
+-    float bestL = 1e9, dL = 0.0, secondL = 1e9; int bkL = -999;
+-    float bestR = 1e9, dR = 0.0, secondR = 1e9; int bkR = -999;
+-    [loop] for (int k = -N; k <= N; ++k)
+-    {
+-        float d = (float)k * step;
+-        float cRed[16], cGrn[16]; buildDesc(uv + float2(d, 0), tx, ty, cRed, cGrn);
+-        float bias = abs(d) / max(maxD, 1e-4) * 0.06;
+-        float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
+-        float sadR = descCost(refGrn, cRed) + bias;   // dRL: green ref vs red candidate
+-        if (sadL < bestL) { if (abs(k - bkL) > 2) secondL = bestL; bestL = sadL; dL = d; bkL = k; }
+-        else if (sadL < secondL && abs(k - bkL) > 2) secondL = sadL;
+-        if (sadR < bestR) { if (abs(k - bkR) > 2) secondR = bestR; bestR = sadR; dR = d; bkR = k; }
+-        else if (sadR < secondR && abs(k - bkR) > 2) secondR = sadR;
+-    }
+-    float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 5.0);
+-    float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 5.0);
+-    return float4(dL, dR, uniqL, uniqR);
+-}
+-
+ // 4x box downsample of the bound source (t0): each output pixel is the average
+ // of the 4x4 source pixels under it, from 4 bilinear taps (each a 2x2 average).
+ // The disparity passes read these small copies instead of picking scattered
+@@ -264,38 +229,207 @@
+     [unroll] for (int k = 0; k < 8; ++k) { d[k] = a[k]; d[k + 8] = b[k]; }
+ }
+ 
+-// Pyramid refine: start from a coarser level (dispTex = prior) and do a local
+-// 4-angle gradient search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
+-// Candidates sit on this level's pixel grid (the prior rounded to a whole
+-// pixel: the full-res pass refines to sub-pixel afterwards), so each one's
+-// descriptor comes from PSAnaDesc's targets.
++// Coarse disparity search (1/16), in two passes.
++//
++// The candidates are whole coarse pixels, +-g_dispMaxUV of the width (the
++// finer passes refine them) -- counted in pixels of THIS level, so the
++// search is the same whatever size or position the picture has on screen.
++// Up to 15 each way; a wider range steps 2 (3, ...) pixels at a time.
++void coarseRange(out int Kn, out int kStep)
++{
++    const int K = (int)ceil(g_dispMaxUV * g_coarseW);
++    kStep = max(1, (K + 14) / 15);
++    Kn = min(15, (K + kStep - 1) / kStep);
++}
++
++// Pass 1 -- matching cost of every candidate, once per pixel: 32 slots in 8
++// targets (slot j = candidate j - 15). g_propStride picks the direction:
++// 0 = dLR (this pixel's left view vs the right view there), 1 = dRL.
++struct CostOut
++{
++    float4 c0 : SV_Target0; float4 c1 : SV_Target1; float4 c2 : SV_Target2; float4 c3 : SV_Target3;
++    float4 c4 : SV_Target4; float4 c5 : SV_Target5; float4 c6 : SV_Target6; float4 c7 : SV_Target7;
++};
++CostOut PSAnaCost(VSOut i)
++{
++    const int2 p = int2(i.pos.xy);
++    const int W = (int)g_coarseW;
++    int Kn, kStep; coarseRange(Kn, kStep);
++    const bool dirR = g_propStride > 0.5;
++    float ref[16];
++    if (dirR) loadDescR(p, ref); else loadDescL(p, ref);
++    float c[32];
++    [unroll] for (int j = 0; j < 32; ++j)
++    {
++        const int k = j - 15;
++        c[j] = 10.0;   // (unused slot)
++        // (A candidate off the picture costs the most: comparing against the
++        // repeated edge pixel could look like a match, and every pixel near
++        // the edge then borrowed that one column -- streaks.)
++        [branch] if (abs(k) <= Kn && p.x + k * kStep >= 0 && p.x + k * kStep < W)
++        {
++            const int2 at = int2(clamp(p.x + k * kStep, 0, W - 1), p.y);
++            float cand[16];
++            if (dirR) loadDescL(at, cand); else loadDescR(at, cand);
++            c[j] = descCost(ref, cand);
++        }
++    }
++    CostOut o;
++    o.c0 = float4(c[0],  c[1],  c[2],  c[3]);  o.c1 = float4(c[4],  c[5],  c[6],  c[7]);
++    o.c2 = float4(c[8],  c[9],  c[10], c[11]); o.c3 = float4(c[12], c[13], c[14], c[15]);
++    o.c4 = float4(c[16], c[17], c[18], c[19]); o.c5 = float4(c[20], c[21], c[22], c[23]);
++    o.c6 = float4(c[24], c[25], c[26], c[27]); o.c7 = float4(c[28], c[29], c[30], c[31]);
++    return o;
++}
++
++// Pass 2 -- adaptive-support aggregation + winner-take-all. Each candidate's
++// cost is summed over a 9x9 window (every other coarse pixel: ~290 px of the
++// picture at 1/16), each neighbour weighted by how alike its colour is to
++// this pixel's (same surface -> same disparity) and by distance. One noisy
++// descriptor can't decide any more; repetitive texture (panelling, text) is
++// out-voted by the structure around it. This is what made the result depend
++// on the picture's size and position: single-pixel decisions flipped with
++// the downsample grid.
++// Output: .r = dLR (left->right), .g = dRL (right->left), in UV; .ba the
++// matches' uniqueness.
++float4 PSAnaDisp(VSOut i) : SV_Target
++{
++    const int2 p = int2(i.pos.xy);
++    const int W = (int)g_coarseW, Hh = (int)g_coarseH;
++    int Kn, kStep; coarseRange(Kn, kStep);
++
++    const float3 c0 = srcTex.Load(int3(p, 0)).rgb;
++    float4 sL[8], sR[8];
++    [unroll] for (int s = 0; s < 8; ++s) { sL[s] = 0; sR[s] = 0; }
++    float wsum = 0;
++    [loop] for (int a = 0; a < 81; ++a)
++    {
++        const int ax = a % 9 - 4, ay = a / 9 - 4;
++        const int2 q = clamp(p + int2(ax, ay) * 2, int2(0, 0), int2(W - 1, Hh - 1));
++        const float3 cq = srcTex.Load(int3(q, 0)).rgb;
++        const float w = exp(-dot(abs(cq - c0), float3(1, 1, 1)) * 5.0) * exp(-(float)(ax * ax + ay * ay) / 20.0);
++        wsum += w;
++        [unroll] for (int s2 = 0; s2 < 8; ++s2)
++        {
++            sL[s2] += costVolL.Load(int4(q, s2, 0)) * w;
++            sR[s2] += costVolR.Load(int4(q, s2, 0)) * w;
++        }
++    }
++    // Track the best match AND the best RIVAL (lowest cost 2+ candidates away):
++    // a near-equal rival (repetitive / ambiguous texture) means low uniqueness.
++    float bestL = 1e9, secondL = 1e9; int bkL = 0;
++    float bestR = 1e9, secondR = 1e9; int bkR = 0;
++    [unroll] for (int j = 0; j < 32; ++j)
++    {
++        const int k = j - 15;
++        [branch] if (abs(k) <= Kn)
++        {
++            const float bias = abs((float)k) / max((float)Kn, 1.0) * 0.06;
++            const float cL = sL[j / 4][j % 4] / wsum + bias;
++            const float cR = sR[j / 4][j % 4] / wsum + bias;
++            if (cL < bestL) { if (abs(k - bkL) > 1) secondL = bestL; bestL = cL; bkL = k; }
++            else if (cL < secondL && abs(k - bkL) > 1) secondL = cL;
++            if (cR < bestR) { if (abs(k - bkR) > 1) secondR = bestR; bestR = cR; bkR = k; }
++            else if (cR < secondR && abs(k - bkR) > 1) secondR = cR;
++        }
++    }
++    const float tx = 1.0 / max(g_coarseW, 1.0);
++    const float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 5.0);
++    const float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 5.0);
++    return float4((float)(bkL * kStep) * tx, (float)(bkR * kStep) * tx, uniqL, uniqR);
++}
++
++// Refine 1/4, in two passes like the coarse search. Each pixel's search is
++// centred on its coarse (1/16) parent's disparity -- the same centre for
++// the whole 4x4 block -- +-11 pixels of this level, which also reaches a
++// thin near object (a leg, a pole) whose own coarse value is the
++// background's.
++static const int kRefR = 11;
++int refineBase(int2 p, bool dirR)   // the parent's disparity, in this level's pixels
++{
++    uint cw, ch; dispTex.GetDimensions(cw, ch);
++    const int2 pp = min(int2(p.x * (int)cw / (int)g_coarseW, p.y * (int)ch / (int)g_coarseH), int2(cw - 1, ch - 1));
++    const float2 d = dispTex.Load(int3(pp, 0)).rg;
++    return (int)round((dirR ? d.g : d.r) * g_coarseW);
++}
++// Pass 1: every candidate's matching cost, once per pixel (24 slots in 6
++// targets: slot j = base + j - 11). g_propStride: 0 = dLR, 1 = dRL.
++struct RCostOut
++{
++    float4 c0 : SV_Target0; float4 c1 : SV_Target1; float4 c2 : SV_Target2;
++    float4 c3 : SV_Target3; float4 c4 : SV_Target4; float4 c5 : SV_Target5;
++};
++RCostOut PSAnaRCost(VSOut i)
++{
++    const int2 p = int2(i.pos.xy);
++    const int W = (int)g_coarseW;
++    const bool dirR = g_propStride > 0.5;
++    const int kb = refineBase(p, dirR);
++    float ref[16];
++    if (dirR) loadDescR(p, ref); else loadDescL(p, ref);
++    float c[24];
++    [unroll] for (int j = 0; j < 24; ++j)
++    {
++        c[j] = 10.0;
++        const int xc = p.x + kb + j - kRefR;
++        [branch] if (j <= 2 * kRefR && xc >= 0 && xc < W)   // (off the picture: the most, see PSAnaCost)
++        {
++            const int2 at = int2(xc, p.y);
++            float cand[16];
++            if (dirR) loadDescL(at, cand); else loadDescR(at, cand);
++            c[j] = descCost(ref, cand);
++        }
++    }
++    RCostOut o;
++    o.c0 = float4(c[0],  c[1],  c[2],  c[3]);  o.c1 = float4(c[4],  c[5],  c[6],  c[7]);
++    o.c2 = float4(c[8],  c[9],  c[10], c[11]); o.c3 = float4(c[12], c[13], c[14], c[15]);
++    o.c4 = float4(c[16], c[17], c[18], c[19]); o.c5 = float4(c[20], c[21], c[22], c[23]);
++    return o;
++}
++// Pass 2: aggregate over a 5x5 window (every third pixel), neighbours
++// weighted by likeness in each view's OWN channel (the anaglyph's colour
++// mixes the two views at every edge), then winner-take-all. A neighbour's
++// slots are lined up with this pixel's by the difference in their centres;
++// each candidate is normalised by the weight that actually covered it.
+ float4 PSAnaRefine(VSOut i) : SV_Target
+ {
+-    float2 uv  = i.uv;
+-    float  tx = 1.0 / max(g_coarseW, 1.0);
+-    int2   p  = int2(i.pos.xy);
+-    int    W  = (int)g_coarseW;
+-    float4 priorAll = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .ba uniqueness
+-    const int kL0 = (int)round(priorAll.r * g_coarseW);
+-    const int kR0 = (int)round(priorAll.g * g_coarseW);
+-    const int M = 6;
+-
+-    float refL[16], refR[16]; loadDescL(p, refL); loadDescR(p, refR);
+-
+-    float bestL = 1e9, dL = priorAll.r, bestR = 1e9, dR = priorAll.g;
+-    [loop] for (int k = -M; k <= M; ++k)
+-    {
+-        const int xL = clamp(p.x + kL0 + k, 0, W - 1);   // candidate for dLR (match the right view)
+-        const int xR = clamp(p.x + kR0 + k, 0, W - 1);   // candidate for dRL (match the left view)
+-        float candR[16], candL[16];
+-        loadDescR(int2(xL, p.y), candR);
+-        loadDescL(int2(xR, p.y), candL);
+-        float sadL = descCost(refL, candR);   // ref left view vs candidate right view
+-        float sadR = descCost(refR, candL);   // ref right view vs candidate left view
+-        if (sadL < bestL) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
+-        if (sadR < bestR) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
++    const int2 p = int2(i.pos.xy);
++    const int W = (int)g_coarseW, Hh = (int)g_coarseH;
++    const float4 priorAll = dispTex.SampleLevel(samp, i.uv, 0.0);   // (.ba: uniqueness, carried through)
++    const int kbL = refineBase(p, false), kbR = refineBase(p, true);
++    const float3 c0 = srcTex.Load(int3(p, 0)).rgb;
++
++    float4 sL[6], sR[6];
++    [unroll] for (int s = 0; s < 6; ++s) { sL[s] = 0; sR[s] = 0; }
++    float wsL = 0, wsR = 0;
++    [loop] for (int a = 0; a < 25; ++a)
++    {
++        const int ax = a % 5 - 2, ay = a / 5 - 2;
++        const int2 q = clamp(p + int2(ax, ay) * 3, int2(0, 0), int2(W - 1, Hh - 1));
++        const float3 cq = srcTex.Load(int3(q, 0)).rgb;
++        const float sp = exp(-(float)(ax * ax + ay * ay) / 8.0);
++        // (Only a neighbour searched about the same centre votes: its slots
++        // are this pixel's. The coarse map is smooth, so that is most of
++        // them; where it steps -- an object's edge -- the other side keeps
++        // out.)
++        const float wl = (refineBase(q, false) == kbL) ? exp(-abs(anaChanL(cq) - anaChanL(c0)) * 10.0) * sp : 0.0;
++        const float wr = (refineBase(q, true)  == kbR) ? exp(-abs(anaChanR(cq) - anaChanR(c0)) * 10.0) * sp : 0.0;
++        wsL += wl; wsR += wr;
++        [unroll] for (int s2 = 0; s2 < 6; ++s2)
++        {
++            if (wl > 0.0) sL[s2] += costVolL.Load(int4(q, s2, 0)) * wl;
++            if (wr > 0.0) sR[s2] += costVolR.Load(int4(q, s2, 0)) * wr;
++        }
+     }
+-    return float4(dL, dR, priorAll.b, priorAll.a);   // carry uniqueness through
++    float bestL = 1e9, bestR = 1e9; int jL = kRefR, jR = kRefR;
++    [unroll] for (int j = 0; j <= 2 * kRefR; ++j)
++    {
++        const float cl = sL[j / 4][j % 4], cr = sR[j / 4][j % 4];
++        if (cl < bestL) { bestL = cl; jL = j; }
++        if (cr < bestR) { bestR = cr; jR = j; }
++    }
++    const float tx = 1.0 / max(g_coarseW, 1.0);
++    return float4((float)(kbL + jL - kRefR) * tx, (float)(kbR + jR - kRefR) * tx, priorAll.b, priorAll.a);
+ }
+ 
+ // Occlusion fill: flag pixels failing the left-right consistency check, then fill
+@@ -551,35 +685,28 @@
+             // high contrast but a rival match) is now low-confidence and gets filled.
+             float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
+ 
+-            // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
+-            // matched centre tap defines the "patch region"; each neighbour is
+-            // exponentially down-weighted by its luminance difference from the
+-            // centre, so taps that land across an object edge at the matched
+-            // location contribute almost nothing. Plain 9-tap averaging smeared
+-            // cross-eye colour across edges -> the persistent borrow-edge
+-            // marbelling. SIRA's superpixel containment serves the same purpose;
+-            // luminance-weighting is the shader-feasible analogue.
+-            float3 centreC = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
+-            float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
+-            float3 there = 0;
+-            float  tw    = 1e-4;
+-            [unroll] for (int by = -1; by <= 1; ++by)
+-            [unroll] for (int bx = -1; bx <= 1; ++bx)
+-            {
+-                float3 s = srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+-                float  sY = dot(s, float3(0.299, 0.587, 0.114));
+-                float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
+-                there += s * w;
+-                tw    += w;
+-            }
+-            there /= tw;
+-
+-            // Own channel(s) as seen, the other view's from the aligned borrow
+-            // (red/cyan left: own red, borrowed green + blue).
+-            float3 ownMask = anaFilter(float3(1, 1, 1), g_anaCombo, eye);
+-            float3 alignedCol = c * ownMask + there * (1.0 - ownMask);
+-            float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
+-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
++            // This eye's colour: its own channel(s) as seen, the other view's
++            // from the match (red/cyan left: own red, borrowed green + blue).
++            // Detail from this eye, colour from the match: the borrowed
++            // channels are the matched spot's SMOOTH colour (the 1/4 source
++            // there) times this pixel's own detail (its own channel over that
++            // channel's smooth level here). In a plain area that is the borrow
++            // itself; on texture every edge and highlight is this eye's own,
++            // so a slightly-off match can only tint, not paint the other
++            // spot's detail over it (which it did: a mirror vanished under
++            // the bike behind it).
++            // (It used to be rescaled to the brightness of anaEyeLuma -- red
++            // alone for the left eye, (g+b)/2 for the right -- which is not
++            // luminance: warm colours glowed in the left eye and went brown
++            // in the right. Against real stereo pairs made into anaglyphs,
++            // dropping it cut the error ~3x.)
++            const float3 ownMask  = anaFilter(float3(1, 1, 1), g_anaCombo, eye);
++            const float3 lowHere  = srcQ.SampleLevel(samp, e, 0.0).rgb;
++            const float3 lowThere = srcQ.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
++            const float own    = (eye == 0) ? anaChanL(c) : anaChanR(c);
++            const float ownLow = (eye == 0) ? anaChanL(lowHere) : anaChanR(lowHere);
++            const float3 lifted = lowThere * clamp(own / max(ownLow, 0.02), 0.25, 4.0);
++            return float4(saturate(c * ownMask + lifted * (1.0 - ownMask)), conf);
+         }
+ 
+         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,

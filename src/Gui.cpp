@@ -397,6 +397,20 @@ namespace
         default:                              return "Side-by-Side";
         }
     }
+
+    // Shorter still, for "Automatic: Half SBS, Anaglyph" in the compact view.
+    const char* FormatShortLabel(StereoFormat f)
+    {
+        switch (f) {
+        case StereoFormat::FullSBS:           return "Full SBS";
+        case StereoFormat::HalfSBS:           return "Half SBS";
+        case StereoFormat::FullTAB:           return "Full TAB";
+        case StereoFormat::HalfTAB:           return "Half TAB";
+        case StereoFormat::RowInterleaved:    return "Row Interleaved";
+        case StereoFormat::ColumnInterleaved: return "Column Interleaved";
+        default:                              return FormatCatLabel(f);
+        }
+    }
 }
 
 bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context)
@@ -415,6 +429,7 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     m_directComposition     = Settings::ReadDirectComposition();
     m_lateLatching          = Settings::ReadLateLatching();
     m_perfLog               = Settings::ReadPerfLog();
+    m_eyeOrder              = Settings::ReadEyeOrderDetect();
     // The weave-skip test never survives a restart (a black 3D screen at
     // launch would look broken).
     Settings::WriteDiagSkipWeave(false);
@@ -696,8 +711,10 @@ void Gui::Toggle()
     m_visible = !m_visible;
     if (m_visible)
     {
-        ShowWindow(m_hwnd, SW_SHOW);
-        SetForegroundWindow(m_hwnd);
+        // Shown once its first frame is drawn (Render): it's fitted to its
+        // content there, so showing it now flashed the old, bigger outline.
+        m_showPending   = true;
+        m_msgSinceFrame = true;   // (draw that frame straight away)
     }
     else
     {
@@ -1020,10 +1037,30 @@ bool Gui::Render(GuiState& state)
     if (!m_expanded)
     {
         const float winW = ImGui::GetWindowSize().x;
-        const char* disp = (state.mode == OutputMode::Fullscreen)   ? "Fullscreen"
+        const char* disp = state.windowScoped ? state.sourceName
+                         : (state.mode == OutputMode::Fullscreen)   ? "Fullscreen"
                          : (state.mode == OutputMode::LookingGlass) ? "Looking Glass"
                          : (state.sourceName[0] ? state.sourceName : "Window");
-        const char* fmt  = FormatCatLabel(state.format);
+        // Automatic Detection: "Automatic", plus what it's weaving right now.
+        std::string fmtS = FormatCatLabel(state.format);
+        if (state.autoInput)
+        {
+            fmtS = "Automatic";
+            for (int i = 0; i < state.autoFmtCount; ++i)
+            {
+                fmtS += (i == 0) ? ": " : ", ";
+                fmtS += FormatShortLabel(state.autoFmts[i]);
+            }
+        }
+        {
+            const float availW = winW - 2.0f * ImGui::GetStyle().WindowPadding.x;
+            if (ImGui::CalcTextSize(fmtS.c_str()).x > availW)
+            {
+                while (!fmtS.empty() && ImGui::CalcTextSize((fmtS + "...").c_str()).x > availW) fmtS.pop_back();
+                fmtS += "...";
+            }
+        }
+        const char* fmt = fmtS.c_str();
         // Compact-view label for the tracking row. Toggle conveys
         // on/off, so we never say "On". The label describes WHAT is
         // being tracked based on the output mode:
@@ -1181,7 +1218,7 @@ bool Gui::Render(GuiState& state)
 
             // This Display → fullscreen passthrough weave of the SR display itself.
             const bool monActive = (state.source == SourceKind::CaptureMonitor &&
-                                    !state.foreignDisplay && !state.autoStereo &&
+                                    !state.foreignDisplay && !state.windowScoped &&
                                     state.mode == OutputMode::Fullscreen);
             if (monActive) {
                 ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
@@ -1208,7 +1245,7 @@ bool Gui::Render(GuiState& state)
             // Using Button + popup instead of BeginCombo so we can centre the
             // text via ButtonTextAlign (ImGui combos always left-align preview).
             const bool dispActive = (state.source == SourceKind::CaptureMonitor && state.foreignDisplay);
-            const bool winActive  = (state.source == SourceKind::CaptureWindow);
+            const bool winActive  = (state.source == SourceKind::CaptureWindow) || state.windowScoped;
 
             // Monitor list + friendly names: cached for 2 s. QueryDisplayConfig
             // (behind the friendly names) talks to the display driver and can
@@ -1283,42 +1320,11 @@ bool Gui::Render(GuiState& state)
             }
             if (winActive) popAccent();
 
-            // Row 3: "Auto Stereo" switch (left) -- find 3D pictures / videos
-            // on the SR display and weave just those, each in its own format
-            // -- and "Make Active Window 3D" (right).
-            {
-                ImGui::BeginGroup();
-                const float startX = ImGui::GetCursorPosX();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted("Auto Stereo");
-                ImGui::SameLine();
-                const float togW = ImGui::GetFrameHeight() * 1.8f;
-                ImGui::SetCursorPosX(startX + half - togW);
-                if (ToggleSwitch("##autostereo", state.autoStereo)) post(ID_TRAY_AUTO_STEREO);
-                ImGui::EndGroup();
-            }
-            if (ImGui::IsItemHovered())
-            {
-                const float maxW = 340.0f * m_dpiScale;
-                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
-                ImGui::BeginTooltip();
-                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
-                ImGui::TextUnformatted(
-                    "Finds 3D pictures and videos on this display -- side-by-side, "
-                    "top-and-bottom and red/cyan anaglyph -- and shows just those in 3D, "
-                    "following them as you scroll. Everything else stays 2D.\n\n"
-                    "Ctrl+Alt+A over one removes it (or adds one it missed). The screen "
-                    "is looked at on this PC only, in memory; nothing is saved or sent "
-                    "anywhere.");
-                ImGui::PopTextWrapPos();
-                ImGui::EndTooltip();
-            }
+            // Row 3: "Load Media..." (the standard file dialog, through the
+            // tray command) and "Make Active Window 3D".
+            if (ImGui::Button("Load Media...", ImVec2(half, 0))) post(ID_TRAY_SRC_TESTIMAGE);
             ImGui::SameLine(0, gap);
             if (ImGui::Button("Make Active Window 3D", ImVec2(half, 0))) post(ID_TRAY_CAPTURE_FOREGROUND);
-
-            // Row 4: "Load Media..." opens the standard file dialog and routes
-            // through the existing tray command.
-            if (ImGui::Button("Load Media...", ImVec2(-FLT_MIN, 0))) post(ID_TRAY_SRC_TESTIMAGE);
         }
 
         if (CollapsibleHeader("STEREO 3D INPUT", m_stereoInputSectionOpen, m_dpiScale, "##stereohdr"))
@@ -1363,14 +1369,97 @@ bool Gui::Render(GuiState& state)
             // or plenoptic angular data.
             const bool vrAvailable = (state.source == SourceKind::TestImage);
             const bool lfpAvailable = (state.source == SourceKind::TestImage);
+            // What each category's pin makes the default: the exact layout in
+            // use for the current category (e.g. Full SBS), else the one
+            // picking the category would choose.
+            auto catDefault = [&](int c) -> StereoFormat {
+                if (c == curCat && !state.autoInput) return state.format;
+                switch (c) {
+                case C_SBS:   return StereoFormat::HalfSBS;
+                case C_TAB:   return StereoFormat::HalfTAB;
+                case C_IL:    return StereoFormat::RowInterleaved;
+                case C_CHECK: return StereoFormat::Checkerboard;
+                case C_ANA:   return StereoFormat::Anaglyph;
+                case C_FSEQ:  return StereoFormat::FrameSequential;
+                case C_PULF:  return StereoFormat::Pulfrich;
+                case C_FP:    return StereoFormat::FramePacking;
+                case C_QUILT: return StereoFormat::Quilt;
+                case C_VR180: return StereoFormat::VR180TAB;
+                case C_VR360: return StereoFormat::VR360TAB;
+                case C_LFP:   return StereoFormat::LightField;
+                default:      return StereoFormat::Katanga;
+                }
+            };
+            int nFmts = 0;
+            const StereoFormatEntry* fmtList = StereoFormatList(nFmts);
+            const int pinnedCat = (state.defaultInput > 0 && state.defaultInput <= nFmts)
+                                ? catOf(fmtList[state.defaultInput - 1].fmt) : -1;   // -1: Automatic
+            // The pin at the right of each item: click to make that input the
+            // default at start-up (until another is pinned). Doesn't close
+            // the list or switch to it.
+            auto pinButton = [&](const char* id, bool pinned, int value) {
+                const float sz = ImGui::GetFrameHeight();
+                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - sz);
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                if (ImGui::InvisibleButton(id, ImVec2(sz, ImGui::GetTextLineHeightWithSpacing())) && !pinned)
+                    PostMessageA(m_mainHwnd, WM_APP_PIN_INPUT, (WPARAM)value, 0);
+                const bool hov = ImGui::IsItemHovered();
+                if (hov)
+                    ImGui::SetTooltip(pinned ? "Default input at start-up" : "Make this the default input at start-up");
+                const ImU32 col = pinned ? ImGui::GetColorU32(g_accent)
+                                         : ImGui::GetColorU32(hov ? g_text : g_dim);
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 c(p.x + sz * 0.5f, p.y + ImGui::GetTextLineHeightWithSpacing() * 0.5f);
+                if (m_fontIcons && m_fontIcons->FontSize > 0.0f)
+                {
+                    // Segoe Fluent / MDL2: PinnedFill E841, Pin E718.
+                    const char* g = pinned ? "\xEE\xA1\x81" : "\xEE\x9C\x98";
+                    const float fs = m_fontIcons->FontSize * 1.3f;
+                    const ImVec2 gs = m_fontIcons->CalcTextSizeA(fs, FLT_MAX, 0.0f, g);
+                    dl->AddText(m_fontIcons, fs, ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f), col, g);
+                }
+                else   // no icon font: a dot, filled when pinned
+                {
+                    const float r = sz * 0.16f;
+                    if (pinned) dl->AddCircleFilled(c, r, col);
+                    else        dl->AddCircle(c, r, col, 0, 1.2f);
+                }
+            };
+            const float pinW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
+
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##format", kCat[curCat], ImGuiComboFlags_HeightLargest))
+            if (ImGui::BeginCombo("##format", state.autoInput ? "Automatic Detection" : kCat[curCat],
+                                  ImGuiComboFlags_HeightLargest))
             {
+                const float itemW = ImGui::GetContentRegionAvail().x - pinW;
+                if (ImGui::Selectable("Automatic Detection", state.autoInput, 0, ImVec2(itemW, 0)))
+                    post(ID_TRAY_AUTO_STEREO);
+                if (ImGui::IsItemHovered())
+                {
+                    const float maxW = 340.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(
+                        "Fullscreen on this display: finds 3D pictures and videos -- side-by-side, "
+                        "top-and-bottom and red/cyan anaglyph -- and shows just those in 3D, "
+                        "following them as you scroll. Everything else stays 2D. "
+                        "Other sources: works out the layout of the whole picture.\n\n"
+                        "Ctrl+Alt+A over a picture removes it (or adds one it missed). The screen "
+                        "is looked at on this PC only, in memory; nothing is saved or sent anywhere.");
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+                pinButton("##pin_auto", pinnedCat < 0, 0);
                 for (int c = 0; c < C_N; ++c)
                 {
                     if (!vrAvailable && (c == C_VR180 || c == C_VR360)) continue;
                     if (!lfpAvailable && c == C_LFP) continue;
-                    if (ImGui::Selectable(kCat[c], c == curCat))
+                    ImGui::PushID(c);
+                    const bool picked = ImGui::Selectable(kCat[c], !state.autoInput && c == curCat, 0, ImVec2(itemW, 0));
+                    pinButton("##pin", pinnedCat == c, StereoFormatIndex(catDefault(c)) + 1);
+                    ImGui::PopID();
+                    if (picked)
                     {
                         switch (c) {
                         case C_SBS:   postFmt(StereoFormat::HalfSBS); break;          // default Half
@@ -1399,12 +1488,18 @@ bool Gui::Render(GuiState& state)
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 if (ImGui::BeginCombo(id, v == 0 ? a : b))
                 {
-                    if (ImGui::Selectable(a, v == 0)) postFmt(fa);
-                    if (ImGui::Selectable(b, v == 1)) postFmt(fb);
+                    // (Each with a pin: e.g. make Half Side-by-Side the default.)
+                    const float itemW = ImGui::GetContentRegionAvail().x - pinW;
+                    const int ia = StereoFormatIndex(fa) + 1, ib = StereoFormatIndex(fb) + 1;
+                    if (ImGui::Selectable(a, v == 0, 0, ImVec2(itemW, 0))) postFmt(fa);
+                    pinButton("##pin_a", state.defaultInput == ia, ia);
+                    if (ImGui::Selectable(b, v == 1, 0, ImVec2(itemW, 0))) postFmt(fb);
+                    pinButton("##pin_b", state.defaultInput == ib, ib);
                     ImGui::EndCombo();
                 }
             };
-            if      (curCat == C_SBS) variant("##sbsv", "Full", "Half", StereoFormat::FullSBS, StereoFormat::HalfSBS);
+            if (state.autoInput) {}   // (Automatic Detection: each picture has its own layout)
+            else if (curCat == C_SBS) variant("##sbsv", "Full", "Half", StereoFormat::FullSBS, StereoFormat::HalfSBS);
             else if (curCat == C_TAB) variant("##tabv", "Full", "Half", StereoFormat::FullTAB, StereoFormat::HalfTAB);
             else if (curCat == C_IL)  variant("##ilv",  "Row",  "Column", StereoFormat::RowInterleaved, StereoFormat::ColumnInterleaved);
             else if (curCat == C_VR180) variant("##vr180v", "Top-and-Bottom", "Side-by-Side", StereoFormat::VR180TAB, StereoFormat::VR180SBS);
@@ -2320,6 +2415,15 @@ bool Gui::Render(GuiState& state)
                 "everything else keeps running. With Perf Log on, compare the frame rate with "
                 "this on and off to see whether the SR weaver is what holds it back. Turn off "
                 "to weave again. Not remembered across restarts.");
+            if (pairToggle2("Detect Eye Order", m_eyeOrder, halfW))
+            {
+                m_eyeOrder = !m_eyeOrder;
+                Settings::WriteEyeOrderDetect(m_eyeOrder);
+            }
+            tip("Works out which half of a side-by-side or top-and-bottom picture is the left eye "
+                "(and which colour of an anaglyph), in Automatic Detection and in layouts you pick, "
+                "and swaps the ones that are the other way round (e.g. cross-view pictures). "
+                "Swap Eyes still flips everything.");
         }
     }
 
@@ -2382,6 +2486,12 @@ bool Gui::Render(GuiState& state)
     m_context->ClearRenderTargetView(m_rtv, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     m_swap->Present(0, 0);   // no vsync: don't add a second vsync wait to the weave loop
+    if (m_showPending && m_refitDepth == 0)
+    {
+        m_showPending = false;
+        ShowWindow(m_hwnd, SW_SHOW);
+        SetForegroundWindow(m_hwnd);
+    }
     return convChanged;
 }
 
@@ -2430,7 +2540,12 @@ LRESULT CALLBACK Gui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 LRESULT Gui::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+    // No typing into the panel: keys and characters don't reach ImGui (it
+    // would otherwise turn Ctrl+click on a slider into a text box, etc.).
+    // SR Loom's shortcuts are global hotkeys, handled elsewhere; Windows'
+    // own keys (Alt+F4, ...) still work through DefWindowProc.
+    const bool keyMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_IME_CHAR;
+    if (!keyMsg && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
         return true;
 
     switch (msg)

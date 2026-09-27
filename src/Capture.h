@@ -49,6 +49,9 @@ namespace srw
         // 100 ns units (0 = unknown). What the woven picture shows is the
         // screen as it was at this moment.
         int64_t LastFrameTime100ns() const { return m_lastFrameTime; }
+        // Bumped whenever the texture behind SRV() gets new pixels (a new frame
+        // or a re-crop), so users can tell an unchanged picture from a new one.
+        uint64_t ContentVersion() const { return m_version; }
 
         // Frames Windows delivered since the last call and their rate (by
         // capture timestamps; includes frames Update() skipped). Resets.
@@ -111,6 +114,8 @@ namespace srw
         ID3D11Texture2D*          m_full    = nullptr;
         bool                      m_active  = false;
         int64_t                   m_lastFrameTime = 0;
+        uint64_t                  m_version = 1;
+        bool                      m_contentValid = false;   // m_tex holds a whole crop (partial copies build on it)
         uint64_t                  m_statFrames = 0;
         int64_t                   m_statFirstT = 0, m_statLastT = 0;
         bool                      m_captureCursor = false;   // composite the OS cursor into the frame

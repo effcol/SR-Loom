@@ -34,7 +34,7 @@ namespace
     }
     template <class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
-    // Half-resolution luma (target 0) and red / cyan (target 1). Each output
+    // Half-resolution luma (target 0) and red / green / blue (target 1). Each output
     // pixel samples the centre of a 2x2 source block, so bilinear filtering
     // averages the four. The sRGB view decodes to linear; re-encode with
     // ~gamma 2.2 so edge thresholds behave perceptually.
@@ -47,13 +47,15 @@ VSOut VSMain(uint id : SV_VertexID)
     VSOut o; float2 t = float2((id << 1) & 2, id & 2);
     o.uv = t; o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); return o;
 }
-struct PSOut { float l : SV_Target0; float2 rc : SV_Target1; };
+struct PSOut { float l : SV_Target0; float r : SV_Target1; float g : SV_Target2; float b : SV_Target3; float c : SV_Target4; };
 PSOut PSMain(VSOut i)
 {
     float3 c = src.Sample(samp, i.uv).rgb;
     PSOut o;
     o.l  = pow(saturate(dot(c, float3(0.2126, 0.7152, 0.0722))), 1.0 / 2.2);
-    o.rc = pow(saturate(float2(c.r, (c.g + c.b) * 0.5)), 1.0 / 2.2);
+    float3 e = pow(saturate(c), 1.0 / 2.2);
+    o.r = e.r; o.g = e.g; o.b = e.b;
+    o.c = pow(saturate((c.g + c.b) * 0.5), 1.0 / 2.2);
     return o;
 }
 // Luma only (every frame while tracking; the colour target is only written
@@ -62,6 +64,41 @@ float PSLuma(VSOut i) : SV_Target0
 {
     float3 c = src.Sample(samp, i.uv).rgb;
     return pow(saturate(dot(c, float3(0.2126, 0.7152, 0.0722))), 1.0 / 2.2);
+}
+// Interleave statistics at FULL resolution (the analysis image is half-res,
+// which blurs 1-px interleaving away). One output pixel per 16x16 source
+// tile: mean luma differences to the neighbour 1 and 2 rows down (v1, v2),
+// 1 and 2 columns right (h1, h2) and diagonally (d1). A picture's nearer
+// neighbours are the more alike; in row-interleaved 3D the rows two apart
+// (same eye) are more alike than adjacent ones (the other eye); columns
+// likewise; in a checkerboard the diagonal neighbours are the same eye.
+float IlLum(int2 p)
+{
+    float3 c = src.Load(int3(p, 0)).rgb;
+    return pow(saturate(dot(c, float3(0.2126, 0.7152, 0.0722))), 1.0 / 2.2);
+}
+struct IlOut { float4 vh : SV_Target0; float d : SV_Target1; };
+IlOut PSInterleave(VSOut i)
+{
+    const int2 t0 = int2(i.pos.xy) * 16;
+    float v1 = 0, v2 = 0, h1 = 0, h2 = 0, d1 = 0;
+    [loop] for (int y = 0; y < 16; ++y)
+    {
+        [loop] for (int x = 0; x < 16; ++x)
+        {
+            const int2 p = t0 + int2(x, y);
+            const float c = IlLum(p);
+            v1 += abs(c - IlLum(p + int2(0, 1)));
+            v2 += abs(c - IlLum(p + int2(0, 2)));
+            h1 += abs(c - IlLum(p + int2(1, 0)));
+            h2 += abs(c - IlLum(p + int2(2, 0)));
+            d1 += abs(c - IlLum(p + int2(1, 1)));
+        }
+    }
+    IlOut o;
+    o.vh = float4(v1, v2, h1, h2) / 256.0;
+    o.d  = d1 / 256.0;
+    return o;
 }
 )";
 
@@ -108,6 +145,11 @@ bool ScreenAnalyzer::Initialize(ID3D11Device* device, ID3D11DeviceContext* conte
         if (SUCCEEDED(D3DCompile(kLumaHLSL, len, "ScreenAnalysis", nullptr, nullptr, "PSLuma", "ps_5_0", 0, 0, &pl, &e2)))
             m_device->CreatePixelShader(pl->GetBufferPointer(), pl->GetBufferSize(), nullptr, &m_psLuma);
         SafeRelease(pl); SafeRelease(e2);
+        if (SUCCEEDED(D3DCompile(kLumaHLSL, len, "ScreenAnalysis", nullptr, nullptr, "PSInterleave", "ps_5_0", 0, 0, &pl, &e2)))
+            m_device->CreatePixelShader(pl->GetBufferPointer(), pl->GetBufferSize(), nullptr, &m_psIl);
+        else
+            Log("ScreenAnalyzer: interleave shader failed: %s", e2 ? (const char*)e2->GetBufferPointer() : "?");
+        SafeRelease(pl); SafeRelease(e2);
     }
     SafeRelease(vsb); SafeRelease(psb);
     D3D11_SAMPLER_DESC sd{};
@@ -121,18 +163,21 @@ bool ScreenAnalyzer::Initialize(ID3D11Device* device, ID3D11DeviceContext* conte
 void ScreenAnalyzer::Release()
 {
     for (auto& s : m_staging) SafeRelease(s);
-    for (auto& s : m_stagingC) SafeRelease(s);
+    for (auto& slot : m_stagingC) for (auto& s : slot) SafeRelease(s);
     for (auto& f : m_slotFrame) f = 0;
     for (auto& c : m_slotColour) c = false;
     SafeRelease(m_srv); SafeRelease(m_rtv); SafeRelease(m_rt);
-    SafeRelease(m_rtvC); SafeRelease(m_rtC);
+    for (int p = 0; p < kPlanes; ++p) { SafeRelease(m_rtvC[p]); SafeRelease(m_rtC[p]); }
+    for (auto& slot : m_stagingIl) for (auto& s : slot) SafeRelease(s);
+    for (int k = 0; k < 2; ++k) { SafeRelease(m_rtvIl[k]); SafeRelease(m_rtIl[k]); }
+    m_ilW = m_ilH = 0;
     m_w = m_h = 0;
 }
 
 void ScreenAnalyzer::Shutdown()
 {
     Release();
-    SafeRelease(m_sampler); SafeRelease(m_psLuma); SafeRelease(m_ps); SafeRelease(m_vs);
+    SafeRelease(m_sampler); SafeRelease(m_psIl); SafeRelease(m_psLuma); SafeRelease(m_ps); SafeRelease(m_vs);
     m_device = nullptr; m_context = nullptr;
 }
 
@@ -147,17 +192,43 @@ bool ScreenAnalyzer::Ensure(int w, int h)
     if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_rt))) return false;
     m_device->CreateRenderTargetView(m_rt, nullptr, &m_rtv);
     m_device->CreateShaderResourceView(m_rt, nullptr, &m_srv);   // for GPU tracking
+    // Colour: one R8 plane each for red, green, blue and cyan -- read back
+    // with plain row copies (no splitting interleaved pixels on the CPU).
     D3D11_TEXTURE2D_DESC tc = td;
-    tc.Format = DXGI_FORMAT_R8G8_UNORM;
-    if (FAILED(m_device->CreateTexture2D(&tc, nullptr, &m_rtC))) { Release(); return false; }
-    m_device->CreateRenderTargetView(m_rtC, nullptr, &m_rtvC);
+    for (int p = 0; p < kPlanes; ++p)
+    {
+        if (FAILED(m_device->CreateTexture2D(&tc, nullptr, &m_rtC[p]))) { Release(); return false; }
+        m_device->CreateRenderTargetView(m_rtC[p], nullptr, &m_rtvC[p]);
+        if (!m_rtvC[p]) { Release(); return false; }
+    }
     td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    tc.Usage = D3D11_USAGE_STAGING; tc.BindFlags = 0; tc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     for (int i = 0; i < kRing; ++i)
-        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_staging[i])) ||
-            FAILED(m_device->CreateTexture2D(&tc, nullptr, &m_stagingC[i]))) { Release(); return false; }
+    {
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_staging[i]))) { Release(); return false; }
+        for (int p = 0; p < kPlanes; ++p)
+            if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_stagingC[i][p]))) { Release(); return false; }
+    }
+    // Interleave statistics: one texel per 16x16 source tile.
+    m_ilW = (w * Scale()) / LumaImage::kIlTile;
+    m_ilH = (h * Scale()) / LumaImage::kIlTile;
+    if (m_psIl && m_ilW > 0 && m_ilH > 0)
+    {
+        const DXGI_FORMAT fmts[2] = { DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_FLOAT };
+        for (int k = 0; k < 2; ++k)
+        {
+            D3D11_TEXTURE2D_DESC ti{};
+            ti.Width = (UINT)m_ilW; ti.Height = (UINT)m_ilH; ti.MipLevels = 1; ti.ArraySize = 1;
+            ti.Format = fmts[k]; ti.SampleDesc.Count = 1;
+            ti.Usage = D3D11_USAGE_DEFAULT; ti.BindFlags = D3D11_BIND_RENDER_TARGET;
+            if (FAILED(m_device->CreateTexture2D(&ti, nullptr, &m_rtIl[k]))) { Release(); return false; }
+            m_device->CreateRenderTargetView(m_rtIl[k], nullptr, &m_rtvIl[k]);
+            ti.Usage = D3D11_USAGE_STAGING; ti.BindFlags = 0; ti.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            for (int i = 0; i < kRing; ++i)
+                if (FAILED(m_device->CreateTexture2D(&ti, nullptr, &m_stagingIl[i][k]))) { Release(); return false; }
+        }
+    }
     m_w = w; m_h = h;
-    return m_rtv != nullptr && m_rtvC != nullptr;
+    return m_rtv != nullptr;
 }
 
 void ScreenAnalyzer::Submit(ID3D11ShaderResourceView* src, int srcW, int srcH, bool withColour)
@@ -171,8 +242,8 @@ void ScreenAnalyzer::Submit(ID3D11ShaderResourceView* src, int srcW, int srcH, b
     // Colour (red/cyan) only when asked: otherwise a luma-only pass, half the
     // output bandwidth.
     const bool colour = withColour || !m_psLuma;
-    ID3D11RenderTargetView* rtvs[2] = { m_rtv, m_rtvC };
-    m_context->OMSetRenderTargets(colour ? 2 : 1, rtvs, nullptr);
+    ID3D11RenderTargetView* rtvs[1 + kPlanes] = { m_rtv, m_rtvC[0], m_rtvC[1], m_rtvC[2], m_rtvC[3] };
+    m_context->OMSetRenderTargets(colour ? 1 + kPlanes : 1, rtvs, nullptr);
     m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_context->IASetInputLayout(nullptr);
@@ -181,12 +252,26 @@ void ScreenAnalyzer::Submit(ID3D11ShaderResourceView* src, int srcW, int srcH, b
     m_context->PSSetSamplers(0, 1, &m_sampler);
     m_context->PSSetShaderResources(0, 1, &src);
     m_context->Draw(3, 0);
+    // With colour (a scan's frame): the full-resolution interleave statistics too.
+    const bool il = withColour && m_psIl && m_rtvIl[0] && m_rtvIl[1];
+    if (il)
+    {
+        D3D11_VIEWPORT vi{ 0, 0, (float)m_ilW, (float)m_ilH, 0, 1 };
+        m_context->RSSetViewports(1, &vi);
+        m_context->OMSetRenderTargets(2, m_rtvIl, nullptr);
+        m_context->PSSetShader(m_psIl, nullptr, 0);
+        m_context->Draw(3, 0);
+    }
     ID3D11ShaderResourceView* nullSRV = nullptr;
     m_context->PSSetShaderResources(0, 1, &nullSRV);
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
 
     m_context->CopyResource(m_staging[m_next], m_rt);
-    if (withColour) m_context->CopyResource(m_stagingC[m_next], m_rtC);
+    if (withColour)
+        for (int p = 0; p < kPlanes; ++p) m_context->CopyResource(m_stagingC[m_next][p], m_rtC[p]);
+    if (il)
+        for (int k = 0; k < 2; ++k) m_context->CopyResource(m_stagingIl[m_next][k], m_rtIl[k]);
+    m_slotIl[m_next] = il;
     m_slotColour[m_next] = withColour;
     m_slotFrame[m_next] = ++m_submitted;
     m_next = (m_next + 1) % kRing;
@@ -216,21 +301,51 @@ bool ScreenAnalyzer::Latest(LumaImage& out, uint64_t& frameId, bool waitForNewes
         for (int y = 0; y < m_h; ++y)
             std::memcpy(&out.pixels[(size_t)y * m_w], srcRow + (size_t)y * m.RowPitch, (size_t)m_w);
         m_context->Unmap(m_staging[s], 0);
-        out.red.clear(); out.cyan.clear();
-        D3D11_MAPPED_SUBRESOURCE mc{};
-        if (m_slotColour[s] &&
-            SUCCEEDED(m_context->Map(m_stagingC[s], 0, D3D11_MAP_READ, wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mc)))
+        out.red.clear(); out.green.clear(); out.blue.clear(); out.cyan.clear();
+        if (m_slotColour[s])
         {
-            out.red.resize((size_t)m_w * m_h);
-            out.cyan.resize((size_t)m_w * m_h);
-            for (int y = 0; y < m_h; ++y)
+            std::vector<uint8_t>* planes[kPlanes] = { &out.red, &out.green, &out.blue, &out.cyan };
+            bool ok = true;
+            for (int p = 0; p < kPlanes && ok; ++p)
             {
-                const uint8_t* p = static_cast<const uint8_t*>(mc.pData) + (size_t)y * mc.RowPitch;
-                uint8_t* r = &out.red[(size_t)y * m_w];
-                uint8_t* c = &out.cyan[(size_t)y * m_w];
-                for (int x = 0; x < m_w; ++x) { r[x] = p[2 * x]; c[x] = p[2 * x + 1]; }
+                D3D11_MAPPED_SUBRESOURCE mc{};
+                if (FAILED(m_context->Map(m_stagingC[s][p], 0, D3D11_MAP_READ, wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mc)))
+                { ok = false; break; }
+                planes[p]->resize((size_t)m_w * m_h);
+                const uint8_t* src = static_cast<const uint8_t*>(mc.pData);
+                for (int y = 0; y < m_h; ++y)
+                    std::memcpy(&(*planes[p])[(size_t)y * m_w], src + (size_t)y * mc.RowPitch, (size_t)m_w);
+                m_context->Unmap(m_stagingC[s][p], 0);
             }
-            m_context->Unmap(m_stagingC[s], 0);
+            if (!ok) { out.red.clear(); out.green.clear(); out.blue.clear(); out.cyan.clear(); }
+        }
+        out.il.clear(); out.ilW = out.ilH = 0;
+        if (m_slotIl[s])
+        {
+            D3D11_MAPPED_SUBRESOURCE ma{}, mb{};
+            const UINT fl = wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT;
+            if (SUCCEEDED(m_context->Map(m_stagingIl[s][0], 0, D3D11_MAP_READ, fl, &ma)))
+            {
+                if (SUCCEEDED(m_context->Map(m_stagingIl[s][1], 0, D3D11_MAP_READ, fl, &mb)))
+                {
+                    out.ilW = m_ilW; out.ilH = m_ilH;
+                    out.il.resize((size_t)m_ilW * m_ilH * 5);
+                    for (int y = 0; y < m_ilH; ++y)
+                    {
+                        const float* a = reinterpret_cast<const float*>(static_cast<const uint8_t*>(ma.pData) + (size_t)y * ma.RowPitch);
+                        const float* b = reinterpret_cast<const float*>(static_cast<const uint8_t*>(mb.pData) + (size_t)y * mb.RowPitch);
+                        float* o = &out.il[(size_t)y * m_ilW * 5];
+                        for (int x = 0; x < m_ilW; ++x)
+                        {
+                            o[5 * x + 0] = a[4 * x + 0]; o[5 * x + 1] = a[4 * x + 1];
+                            o[5 * x + 2] = a[4 * x + 2]; o[5 * x + 3] = a[4 * x + 3];
+                            o[5 * x + 4] = b[x];
+                        }
+                    }
+                    m_context->Unmap(m_stagingIl[s][1], 0);
+                }
+                m_context->Unmap(m_stagingIl[s][0], 0);
+            }
         }
         m_lastRead = m_slotFrame[s];
         frameId = m_lastRead;
@@ -883,6 +998,15 @@ void RegionTracker::LearnViewport(const LumaImage& img, int dy)
     const int maxInset = oh * 2 / 5;
     const int mid = (std::max)((int)outer.top, (std::min)((int)outer.bottom - 1,
                                (int)(m_rect.top + m_rect.bottom) / 2));
+    // A header / toolbar is a solid block of rows that stay put, reaching the
+    // viewport's edge. Two still rows alone happen by chance inside scrolling
+    // content (flat backgrounds, repeated lines) -- taking those clipped a
+    // picture at a random row -- so a candidate only counts when no row
+    // between it and the edge moved with the page.
+    auto stillToEdge = [&](int from, int to) {   // [from, to) has no moving row
+        for (int y = from; y < to; ++y) if (cls(y) == 1) return false;
+        return true;
+    };
     // Upwards from the image's middle to the first run of 2 static rows.
     {
         int first = -1, run = 0, lastMoving = mid;
@@ -892,7 +1016,8 @@ void RegionTracker::LearnViewport(const LumaImage& img, int dy)
             if (k == 2) { if (run++ == 0) first = y; if (run >= 2) break; }
             else if (k == 1) { run = 0; first = -1; lastMoving = y; }
         }
-        if (run >= 2 && first + 1 - outer.top <= maxInset) m_insetTop = first + 1 - outer.top;
+        if (run >= 2 && first + 1 - outer.top <= maxInset && stillToEdge(outer.top, first))
+            m_insetTop = first + 1 - outer.top;
         else if (run < 2 && lastMoving - outer.top <= 4) m_insetTop = 0;   // page moves right up to the top
     }
     // Downwards likewise.
@@ -904,7 +1029,8 @@ void RegionTracker::LearnViewport(const LumaImage& img, int dy)
             if (k == 2) { if (run++ == 0) first = y; if (run >= 2) break; }
             else if (k == 1) { run = 0; first = -1; lastMoving = y; }
         }
-        if (run >= 2 && outer.bottom - first <= maxInset) m_insetBottom = outer.bottom - first;
+        if (run >= 2 && outer.bottom - first <= maxInset && stillToEdge(first + 1, outer.bottom))
+            m_insetBottom = outer.bottom - first;
         else if (run < 2 && outer.bottom - 1 - lastMoving <= 4) m_insetBottom = 0;
     }
 }
@@ -1118,8 +1244,8 @@ bool srw::SaveColourDebugBmp(const LumaImage& img, const wchar_t* path)
         for (int x = 0; x < W; ++x)
         {
             const size_t i = (size_t)y * W + x;
-            row[x * 3 + 0] = img.cyan[i];   // B
-            row[x * 3 + 1] = img.cyan[i];   // G
+            row[x * 3 + 0] = img.blue.empty() ? img.cyan[i] : img.blue[i];     // B
+            row[x * 3 + 1] = img.green.empty() ? img.cyan[i] : img.green[i];   // G
             row[x * 3 + 2] = img.red[i];    // R
         }
         fwrite(row.data(), 1, (size_t)rowBytes, f);
@@ -1285,6 +1411,68 @@ namespace
         return pr;
     }
 
+    // Eye order of an SBS / TAB pair whose halves matched (pr), A = the half
+    // taken as the left eye. Two cues, both reversed when the halves are the
+    // wrong way round:
+    //  - stereo pictures lie mostly behind the screen, so the right eye sees
+    //    things further right than the left eye (B shifted right of A), and
+    //  - lower in the picture is nearer than higher up (the ground), so the
+    //    shift is smaller at the bottom than at the top.
+    // Called swapped only when the evidence says so and none says otherwise.
+    EyeOrder JudgeEyeOrder(const Integral& I, HPMap& M, int& mapB, const PairResult& pr,
+                           int ax, int ay, int bx, int by, int sw, int sh)
+    {
+        EyeOrder eo;
+        const int B = (std::max)(2, (std::min)(sw, sh) / 32);
+        const int maxD = (std::max)(2, sw * 6 / 100);
+        const int mx = maxD + 2 * B;
+        if (sw <= 2 * mx + 8 * B || sh < 12 * B) return eo;
+        if (mapB != B) { M.Build(I, B); mapB = B; }
+        // Match strength of rows [y0, y1) of A against B shifted by dx (and
+        // the pair's vertical offset).
+        auto ncc = [&](int y0, int y1, int dx) -> float {
+            double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0; int n = 0;
+            for (int y = y0; y + B <= y1; y += B)
+            {
+                const int yb = y + pr.dy;
+                if (yb < 0 || yb + B > sh) continue;
+                for (int x = mx; x + B + mx <= sw; x += B)
+                {
+                    const float a = M.at(ax + x, ay + y), b = M.at(bx + x + dx, by + yb);
+                    sa += a; sb += b; saa += (double)a * a; sbb += (double)b * b; sab += (double)a * b; ++n;
+                }
+            }
+            if (n < 32) return -2.0f;
+            const double ma = sa / n, mb = sb / n, va = saa / n - ma * ma, vb = sbb / n - mb * mb;
+            if (va <= 1e-6 || vb <= 1e-6) return -2.0f;
+            return (float)((sab / n - ma * mb) / std::sqrt(va * vb));
+        };
+        auto bestDx = [&](int y0, int y1, int& dxOut) {
+            float best = -2.0f;
+            for (int dx = -maxD; dx <= maxD; ++dx)
+            {
+                const float v = ncc(y0, y1, dx);
+                if (v > best) { best = v; dxOut = dx; }
+            }
+            return best;
+        };
+        const int band = sh / 3;
+        int dt = 0, db = 0;
+        const float ct = bestDx(B, band, dt);
+        const float cb = bestDx(sh - band, sh - B, db);
+        eo.dxAll = pr.dx; eo.dxTop = dt; eo.dxBottom = db;
+        int pos = 0, neg = 0;
+        if (pr.dx >= 2) ++pos; else if (pr.dx <= -2) ++neg;
+        if (ct > 0.3f && cb > 0.3f)
+        {
+            const int g = dt - db;
+            if (g >= 2) ++pos; else if (g <= -2) ++neg;
+        }
+        eo.known = (pos + neg) > 0 && !(pos && neg);
+        eo.swap  = eo.known && neg > 0;
+        return eo;
+    }
+
     constexpr float kPairNcc      = 0.35f;  // halves must match at least this well ...
     constexpr float kPairMargin   = 0.25f;  // ... and this much better than at a wrong offset
     constexpr float kPairMinStd   = 1.2f;   // enough detail to judge
@@ -1294,10 +1482,222 @@ namespace
     constexpr float kAnaMaxAligned    = 0.70f; // red/cyan edges line up worse than this unshifted ...
     constexpr float kAnaShiftGain     = 0.20f; // ... a horizontal shift improves that by this much ...
     constexpr float kAnaHorizOverVert = 0.15f; // ... and by this much more than a vertical shift (same range) does
+
+    // Anaglyph signature of two colour planes A and B over picture r (w x h):
+    // mean block |correlation| of their horizontal gradients unshifted (a0),
+    // at the best horizontal shift (aH) and at the best vertical shift (aV,
+    // the control). Two planes showing the SAME eye line up unshifted; two
+    // eyes line up only after a horizontal shift. Gradients over 2 px of a
+    // 2-row sum: steadier than 1-px steps on JPEG'd, detailed pictures.
+    // (+ which way the second plane is shifted against the first, where a block
+    // clearly matched better shifted: median over all / the top third / the
+    // bottom third of the blocks. Positive: the second plane sees it further right.)
+    struct AnaSig { float a0 = 0.0f, aH = 0.0f, aV = 0.0f; int blocks = 0; float medDx = 0, topDx = 0, botDx = 0; int nSigned = 0, nTop = 0, nBot = 0; };
+    AnaSig AnaSignature(const uint8_t* A, const uint8_t* B, size_t W, const RECT& r, int w, int h)
+    {
+        constexpr int kBlk = 32;
+        const int maxD = (std::max)(8, (std::min)(32, w * 5 / 100));
+        const int gw = w, gh = h;
+        std::vector<float> GR((size_t)gw * gh, 0.0f), GC((size_t)gw * gh, 0.0f);
+        for (int y = 0; y < gh - 1; ++y)
+        {
+            const size_t row = (size_t)(r.top + y) * W + r.left;
+            const uint8_t* r0 = &A[row]; const uint8_t* r1 = r0 + W;
+            const uint8_t* c0 = &B[row]; const uint8_t* c1 = c0 + W;
+            float* gr = &GR[(size_t)y * gw];
+            float* gc = &GC[(size_t)y * gw];
+            for (int x = 1; x < gw - 2; ++x)
+            {
+                gr[x] = (float)(r0[x + 2] + r1[x + 2] + r0[x + 1] + r1[x + 1]) - (float)(r0[x] + r1[x] + r0[x - 1] + r1[x - 1]);
+                gc[x] = (float)(c0[x + 2] + c1[x + 2] + c0[x + 1] + c1[x + 1]) - (float)(c0[x] + c1[x] + c0[x - 1] + c1[x - 1]);
+            }
+        }
+        // Block origin (bx,by) in picture coords; A's block stats fixed per block.
+        struct BlockA { double ma, va; };
+        auto corr = [&](int bx, int by, const BlockA& Ab, int dx, int dy) {
+            double sb = 0, sbb = 0, sab = 0; int n = 0;
+            for (int y = by; y < by + kBlk; y += 2)
+            {
+                const float* a = &GR[(size_t)y * gw];
+                const float* b = &GC[(size_t)(y + dy) * gw + dx];
+                for (int x = bx; x < bx + kBlk; x += 2)
+                {
+                    const float bv = b[x];
+                    sb += bv; sbb += bv * bv; sab += a[x] * bv; ++n;
+                }
+            }
+            const double mb = sb / n, vb = sbb / n - mb * mb;
+            if (vb < 16.0) return -1.0f;
+            return (float)std::fabs((sab / n - Ab.ma * mb) / std::sqrt(Ab.va * vb));
+        };
+        auto bestAlong = [&](int bx, int by, const BlockA& Ab, bool horiz, float c0v, int* bdOut = nullptr) {
+            float best = c0v; int bd = 0;
+            for (int d = -maxD; d <= maxD; d += 2)
+            {
+                if (d == 0) continue;
+                const float v = horiz ? corr(bx, by, Ab, d, 0) : corr(bx, by, Ab, 0, d);
+                if (v > best) { best = v; bd = d; }
+            }
+            const int coarse = bd;
+            for (int d = coarse - 1; d <= coarse + 1; d += 2)
+            {
+                if (d == 0 || std::abs(d) > maxD) continue;
+                const float v = horiz ? corr(bx, by, Ab, d, 0) : corr(bx, by, Ab, 0, d);
+                if (v > best) { best = v; bd = d; }
+            }
+            if (bdOut) *bdOut = bd;
+            return best;
+        };
+        AnaSig s;
+        double s0 = 0, sH = 0, sV = 0;
+        std::vector<int> allD, topD, botD;   // signed horizontal shifts of clearly-shifted blocks
+        const int m = maxD + 3;
+        for (int by = m; by + kBlk + m + 1 < gh; by += kBlk)
+            for (int bx = m; bx + kBlk + m + 2 < gw; bx += kBlk)
+            {
+                double sa = 0, saa = 0; int n = 0;
+                for (int y = by; y < by + kBlk; y += 2)
+                    for (int x = bx; x < bx + kBlk; x += 2) { const float a = GR[(size_t)y * gw + x]; sa += a; saa += a * a; ++n; }
+                BlockA Ab{ sa / n, saa / n - (sa / n) * (sa / n) };
+                if (Ab.va < 16.0) continue;   // too little detail to judge
+                const float c0v = corr(bx, by, Ab, 0, 0);
+                if (c0v < 0.0f) continue;
+                s0 += c0v;
+                int bd = 0;
+                const float bh = bestAlong(bx, by, Ab, true, c0v, &bd);
+                sH += bh;
+                sV += bestAlong(bx, by, Ab, false, c0v);
+                ++s.blocks;
+                if (bd != 0 && bh - c0v >= 0.05f)
+                {
+                    allD.push_back(bd);
+                    if (by < gh / 3)          topD.push_back(bd);
+                    else if (by >= gh * 2 / 3) botD.push_back(bd);
+                }
+            }
+        if (s.blocks > 0) { s.a0 = (float)(s0 / s.blocks); s.aH = (float)(sH / s.blocks); s.aV = (float)(sV / s.blocks); }
+        auto median = [](std::vector<int>& v) -> float {
+            if (v.empty()) return 0.0f;
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            return (float)v[v.size() / 2];
+        };
+        s.nSigned = (int)allD.size(); s.nTop = (int)topD.size(); s.nBot = (int)botD.size();
+        s.medDx = median(allD); s.topDx = median(topD); s.botDx = median(botD);
+        return s;
+    }
+    // Row / column interleaved or checkerboard, from the full-resolution
+    // tile statistics (LumaImage::il) inside picture r (analysis px). Tiles
+    // with next to no detail are skipped (flat areas look the same either
+    // way). Only a picture shown pixel for pixel keeps its interleaving.
+    constexpr int   kIlMinTiles  = 12;     // detailed tiles needed to judge
+    constexpr float kIlMinDetail = 0.015f; // mean 2-px difference below this: flat tile
+    constexpr float kIlRatio     = 1.25f;  // 1-px difference beats the 2-px one by this much
+    bool DetectInterleave(const LumaImage& img, const RECT& r, StereoFormat& fmt, char* note, size_t noteLen)
+    {
+        if (img.il.empty() || img.ilW <= 0) return false;
+        const int s = ScreenAnalyzer::Scale(), T = LumaImage::kIlTile;
+        // Whole tiles inside the picture.
+        const int tx0 = (std::max)(0, (int)((r.left * s + T - 1) / T)), ty0 = (std::max)(0, (int)((r.top * s + T - 1) / T));
+        const int tx1 = (std::min)(img.ilW, (int)(r.right * s / T)),     ty1 = (std::min)(img.ilH, (int)(r.bottom * s / T));
+        double v1 = 0, v2 = 0, h1 = 0, h2 = 0, d1 = 0; int n = 0;
+        for (int ty = ty0; ty < ty1; ++ty)
+            for (int tx = tx0; tx < tx1; ++tx)
+            {
+                const float* t = &img.il[((size_t)ty * img.ilW + tx) * 5];
+                if (t[1] + t[3] < 2.0f * kIlMinDetail) continue;
+                v1 += t[0]; v2 += t[1]; h1 += t[2]; h2 += t[3]; d1 += t[4]; ++n;
+            }
+        if (n < kIlMinTiles) return false;
+        if (note && noteLen)
+            snprintf(note, noteLen, "IL tiles=%d v1/v2=%.2f h1/h2=%.2f d1/min=%.2f", n,
+                     v1 / (std::max)(v2, 1e-6), h1 / (std::max)(h2, 1e-6), d1 / (std::max)((std::min)(h1, v1), 1e-6));
+        const bool rowsSplit = v1 > kIlRatio * v2;   // adjacent rows: the other eye
+        const bool colsSplit = h1 > kIlRatio * h2;   // adjacent columns: the other eye
+        if (rowsSplit && colsSplit && d1 < 0.85 * (std::min)(h1, v1)) { fmt = StereoFormat::Checkerboard; return true; }
+        if (rowsSplit && !colsSplit) { fmt = StereoFormat::RowInterleaved; return true; }
+        if (colsSplit && !rowsSplit) { fmt = StereoFormat::ColumnInterleaved; return true; }
+        return false;
+    }
+
+    // Eye order of an anaglyph from its signature, the first plane taken as
+    // the left eye's filter (red for red/cyan): the same two cues as SBS
+    // (JudgeEyeOrder) -- the second eye's view shifted right (behind the
+    // screen), and less so lower down (nearer). `invert`: the first plane is
+    // really the right eye's.
+    EyeOrder AnaEyeOrder(const AnaSig& s, bool invert)
+    {
+        EyeOrder eo;
+        eo.dxAll = (int)s.medDx; eo.dxTop = (int)s.topDx; eo.dxBottom = (int)s.botDx;
+        int pos = 0, neg = 0;
+        if (s.nSigned >= 6) { if (s.medDx >= 2) ++pos; else if (s.medDx <= -2) ++neg; }
+        if (s.nTop >= 3 && s.nBot >= 3)
+        {
+            const float g = s.topDx - s.botDx;
+            if (g >= 2) ++pos; else if (g <= -2) ++neg;
+        }
+        eo.known = (pos + neg) > 0 && !(pos && neg);
+        eo.swap  = eo.known && (neg > 0) != invert;
+        return eo;
+    }
+
+    bool AnaSplit(const AnaSig& s)   // the two planes are two different eyes
+    {
+        return s.blocks >= kAnaMinBlocks && s.a0 <= kAnaMaxAligned &&
+               s.aH - s.a0 >= kAnaShiftGain && s.aH - s.aV >= kAnaHorizOverVert;
+    }
+
+    // Which anaglyph colour pair, and whether the picture under it was colour
+    // or black-and-white. Each channel pair is tested: channels that carry
+    // the same eye line up, different eyes need a horizontal shift. A channel
+    // with (almost) no detail isn't used by the pair (red/green, red/blue).
+    // Black-and-white source: the eye seen through two channels shows the
+    // same picture in both (red/cyan: green == blue), so there's no colour
+    // to recover -- Mono decodes it best.
+    AnaglyphKind DetectAnaglyphKind(const LumaImage& img, const RECT& r, int w, int h)
+    {
+        AnaglyphKind k;
+        if (img.green.size() != img.pixels.size() || img.blue.size() != img.pixels.size()) return k;
+        const size_t W = (size_t)img.width;
+        const uint8_t* R = img.red.data();
+        const uint8_t* G = img.green.data();
+        const uint8_t* B = img.blue.data();
+        // Detail (mean |horizontal step|) per channel, and the mean channel differences.
+        double eR = 0, eG = 0, eB = 0, dGB = 0, dRB = 0, dRG = 0; long n = 0;
+        for (int y = r.top; y < r.bottom; y += 2)
+            for (int x = r.left; x + 1 < r.right; x += 2)
+            {
+                const size_t i = (size_t)y * W + x;
+                eR += std::abs((int)R[i + 1] - (int)R[i]);
+                eG += std::abs((int)G[i + 1] - (int)G[i]);
+                eB += std::abs((int)B[i + 1] - (int)B[i]);
+                dGB += std::abs((int)G[i] - (int)B[i]);
+                dRB += std::abs((int)R[i] - (int)B[i]);
+                dRG += std::abs((int)R[i] - (int)G[i]);
+                ++n;
+            }
+        if (n == 0) return k;
+        eR /= n; eG /= n; eB /= n; dGB /= n; dRB /= n; dRG /= n;
+        const double eMax = (std::max)(eR, (std::max)(eG, eB));
+        const bool emptyG = eG < 0.15 * eMax, emptyB = eB < 0.15 * eMax;
+        constexpr double kGreySame = 6.0;   // mean |difference| below this: the same (grey) picture
+        if (emptyG) { k.combo = 2; k.mode = 3; k.known = true; return k; }   // red/blue: one channel per eye
+        if (emptyB) { k.combo = 1; k.mode = 3; k.known = true; return k; }   // red/green
+        const bool sRG = AnaSplit(AnaSignature(R, G, W, r, w, h));
+        const bool sRB = AnaSplit(AnaSignature(R, B, W, r, w, h));
+        const bool sGB = AnaSplit(AnaSignature(G, B, W, r, w, h));
+        k.known = true;
+        if (sRG && sRB && !sGB)      { k.combo = 0; k.mode = dGB < kGreySame ? 3 : 4; }   // red | green+blue
+        else if (sRG && sGB && !sRB) { k.combo = 3; k.mode = dRB < kGreySame ? 3 : 4; }   // green | red+blue
+        else if (sRB && sGB && !sRG) { k.combo = 4; k.mode = dRG < kGreySame ? 3 : 4; }   // red+green | blue
+        else if (sRG && !sRB && !sGB) { k.combo = 5; k.mode = 4; }                        // cyan | magenta (blue shared)
+        else                         { k.combo = 0; k.mode = dGB < kGreySame ? 3 : 4; k.known = false; }
+        return k;
+    }
 }
 
 bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& format, float& score,
-                         char* diag, size_t diagLen, StereoScores* scores)
+                         char* diag, size_t diagLen, StereoScores* scores, AnaglyphKind* anaKind,
+                         EyeOrder* eyeOrder)
 {
     score = 0.0f;
     if (img.empty()) return false;
@@ -1327,103 +1727,79 @@ bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& fo
                p.stdA >= kPairMinStd && p.madBest >= kRepeatRatio * p.madWrong;
     };
 
-    // Anaglyph (colour only). In an ordinary photo the red and cyan channels
-    // have their edges in the same places (block by block, strongly
-    // correlated). In an anaglyph they are two different eyes: where there's
-    // depth they don't line up -- but a small HORIZONTAL shift lines them up
-    // again (a vertical one doesn't). Compared on horizontal gradients, in
-    // blocks, as mean |correlation| unshifted / best horizontal shift / best
-    // vertical shift (the control).
-    float a0 = 0.0f, aH = 0.0f, aV = 0.0f; int aBlocks = 0;
-    if (img.hasColour() && !passes(sbs) && !passes(tab))   // (skipped once a layout matched)
+    // Interleaved / checkerboard: judged on its own full-resolution
+    // statistics (the halves of such a picture don't match as SBS / TAB).
+    if (!passes(sbs) && !passes(tab))
     {
-        // Cheap first: grey content (red == cyan) can't be an anaglyph.
-        double chroma = 0; long nc = 0;
-        for (int y = r.top; y < r.bottom; y += 4)
-            for (int x = r.left; x < r.right; x += 4)
-            {
-                const size_t i = (size_t)y * img.width + x;
-                chroma += std::abs((int)img.red[i] - (int)img.cyan[i]);
-                ++nc;
-            }
-        if (nc > 0 && chroma / nc >= kAnaMinChroma)
+        StereoFormat ilf{};
+        char note[128] = "";
+        if (DetectInterleave(img, r, ilf, note, sizeof(note)))
         {
-            // Gradients over 2 px of a 2-row sum: steadier than 1-px steps
-            // on JPEG'd, detailed pictures. Computed once for the whole
-            // picture, so each block/shift is then a plain dot product.
-            constexpr int kBlk = 32;
-            const int maxD = (std::max)(8, (std::min)(32, w * 5 / 100));
-            const size_t W = (size_t)img.width;
-            const int gw = w, gh = h;
-            std::vector<float> GR((size_t)gw * gh, 0.0f), GC((size_t)gw * gh, 0.0f);
-            for (int y = 0; y < gh - 1; ++y)
-            {
-                const size_t row = (size_t)(r.top + y) * W + r.left;
-                const uint8_t* r0 = &img.red[row];  const uint8_t* r1 = r0 + W;
-                const uint8_t* c0 = &img.cyan[row]; const uint8_t* c1 = c0 + W;
-                float* gr = &GR[(size_t)y * gw];
-                float* gc = &GC[(size_t)y * gw];
-                for (int x = 1; x < gw - 2; ++x)
-                {
-                    gr[x] = (float)(r0[x + 2] + r1[x + 2] + r0[x + 1] + r1[x + 1]) - (float)(r0[x] + r1[x] + r0[x - 1] + r1[x - 1]);
-                    gc[x] = (float)(c0[x + 2] + c1[x + 2] + c0[x + 1] + c1[x + 1]) - (float)(c0[x] + c1[x] + c0[x - 1] + c1[x - 1]);
-                }
-            }
-            // Block origin (bx,by) in picture coords; red block stats fixed per block.
-            struct BlockA { double ma, va; };
-            auto corr = [&](int bx, int by, const BlockA& A, int dx, int dy) {
-                double sb = 0, sbb = 0, sab = 0; int n = 0;
-                for (int y = by; y < by + kBlk; y += 2)
-                {
-                    const float* a = &GR[(size_t)y * gw];
-                    const float* b = &GC[(size_t)(y + dy) * gw + dx];
-                    for (int x = bx; x < bx + kBlk; x += 2)
-                    {
-                        const float bv = b[x];
-                        sb += bv; sbb += bv * bv; sab += a[x] * bv; ++n;
-                    }
-                }
-                const double mb = sb / n, vb = sbb / n - mb * mb;
-                if (vb < 16.0) return -1.0f;
-                return (float)std::fabs((sab / n - A.ma * mb) / std::sqrt(A.va * vb));
-            };
-            auto bestAlong = [&](int bx, int by, const BlockA& A, bool horiz, float c0v) {
-                float best = c0v; int bd = 0;
-                for (int d = -maxD; d <= maxD; d += 2)
-                {
-                    if (d == 0) continue;
-                    const float v = horiz ? corr(bx, by, A, d, 0) : corr(bx, by, A, 0, d);
-                    if (v > best) { best = v; bd = d; }
-                }
-                for (int d = bd - 1; d <= bd + 1; d += 2)
-                {
-                    if (d == 0 || std::abs(d) > maxD) continue;
-                    best = (std::max)(best, horiz ? corr(bx, by, A, d, 0) : corr(bx, by, A, 0, d));
-                }
-                return best;
-            };
-            double s0 = 0, sH = 0, sV = 0;
-            const int m = maxD + 3;
-            for (int by = m; by + kBlk + m + 1 < gh; by += kBlk)
-                for (int bx = m; bx + kBlk + m + 2 < gw; bx += kBlk)
-                {
-                    double sa = 0, saa = 0; int n = 0;
-                    for (int y = by; y < by + kBlk; y += 2)
-                        for (int x = bx; x < bx + kBlk; x += 2) { const float a = GR[(size_t)y * gw + x]; sa += a; saa += a * a; ++n; }
-                    BlockA A{ sa / n, saa / n - (sa / n) * (sa / n) };
-                    if (A.va < 16.0) continue;   // too little detail to judge
-                    const float c0v = corr(bx, by, A, 0, 0);
-                    if (c0v < 0.0f) continue;
-                    s0 += c0v;
-                    sH += bestAlong(bx, by, A, true, c0v);
-                    sV += bestAlong(bx, by, A, false, c0v);
-                    ++aBlocks;
-                }
-            if (aBlocks > 0) { a0 = (float)(s0 / aBlocks); aH = (float)(sH / aBlocks); aV = (float)(sV / aBlocks); }
+            if (diag && diagLen) snprintf(diag, diagLen, "rect=(%ld,%ld %dx%d) %s", r.left, r.top, w, h, note);
+            format = ilf;
+            score  = 1.0f;
+            return true;
         }
     }
-    const bool ana = aBlocks >= kAnaMinBlocks && a0 <= kAnaMaxAligned &&
-                     aH - a0 >= kAnaShiftGain && aH - aV >= kAnaHorizOverVert;
+
+    // Anaglyph (colour only). In an ordinary photo the colour channels have
+    // their edges in the same places (block by block, strongly correlated).
+    // In an anaglyph two of them are different eyes: where there's depth
+    // they don't line up -- but a small HORIZONTAL shift lines them up again
+    // (a vertical one doesn't). See AnaSignature. Red against cyan first
+    // (the common pair); with nothing there, green against magenta and
+    // amber against blue.
+    float a0 = 0.0f, aH = 0.0f, aV = 0.0f; int aBlocks = 0;
+    EyeOrder anaEye;
+    bool ana = false;
+    if (img.hasColour())   // (also when a layout matched: an anaglyph can pass as SBS -- see below)
+    {
+        const size_t W = (size_t)img.width;
+        const bool rgb = img.green.size() == img.pixels.size() && img.blue.size() == img.pixels.size();
+        // Cheap first: grey content (the two planes equal) can't be an anaglyph.
+        auto chromaOf = [&](const uint8_t* A, const uint8_t* B) {
+            double c = 0; long nc = 0;
+            for (int y = r.top; y < r.bottom; y += 4)
+                for (int x = r.left; x < r.right; x += 4)
+                {
+                    const size_t i = (size_t)y * W + x;
+                    c += std::abs((int)A[i] - (int)B[i]);
+                    ++nc;
+                }
+            return nc ? c / nc : 0.0;
+        };
+        AnaSig passSig; int passPair = 0;   // (the pair that showed it: 0 red|cyan, 1 green|magenta, 2 amber|blue)
+        auto tryPair = [&](const uint8_t* A, const uint8_t* B) {
+            if (chromaOf(A, B) < kAnaMinChroma) return false;
+            const AnaSig s = AnaSignature(A, B, W, r, w, h);
+            if (aBlocks == 0 || AnaSplit(s)) { a0 = s.a0; aH = s.aH; aV = s.aV; aBlocks = s.blocks; passSig = s; }
+            return AnaSplit(s);
+        };
+        ana = tryPair(img.red.data(), img.cyan.data());
+        if (!ana && rgb)
+        {
+            // (Planes made on the spot: green vs magenta, amber vs blue.)
+            const size_t n = img.pixels.size();
+            std::vector<uint8_t> P(n), Q(n);
+            for (size_t i = 0; i < n; ++i) P[i] = (uint8_t)((img.red[i] + img.blue[i] + 1) >> 1);
+            ana = tryPair(img.green.data(), P.data());
+            if (ana) passPair = 1;
+            if (!ana)
+            {
+                for (size_t i = 0; i < n; ++i) Q[i] = (uint8_t)((img.red[i] + img.green[i] + 1) >> 1);
+                ana = tryPair(Q.data(), img.blue.data());
+                if (ana) passPair = 2;
+            }
+        }
+        if (ana)
+        {
+            AnaglyphKind k = DetectAnaglyphKind(img, r, w, h);
+            if (anaKind) *anaKind = k;
+            // The pair's first plane is the left filter's -- except cyan/magenta,
+            // found through red|cyan, where red belongs to the right (magenta).
+            anaEye = AnaEyeOrder(passSig, k.known && k.combo == 5 && passPair == 0);
+        }
+    }
 
     if (diag && diagLen)
         snprintf(diag, diagLen,
@@ -1437,6 +1813,16 @@ bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& fo
     // ambiguous (e.g. a repeating grid) and nothing is detected -- the two
     // results are never weighed against each other to pick one.
     const bool isSbs = passes(sbs), isTab = passes(tab);
+    // Anaglyph first: colour fringes that only line up with a horizontal
+    // shift are specific evidence, while an anaglyph video's two halves can
+    // happen to look alike enough to pass as SBS.
+    if (ana)
+    {
+        format = StereoFormat::Anaglyph;
+        score  = aH - a0;
+        if (eyeOrder) *eyeOrder = anaEye;
+        return true;
+    }
     if (isSbs && isTab) return false;
     if (isSbs)
     {
@@ -1445,6 +1831,7 @@ bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& fo
         const float eyeAspect = (float)(w / 2) / (float)h;
         format = eyeAspect >= 1.1f ? StereoFormat::FullSBS : StereoFormat::HalfSBS;
         score  = sbs.ncc;
+        if (eyeOrder) *eyeOrder = JudgeEyeOrder(I, M, mapB, sbs, 0, 0, w / 2, 0, w / 2, h);
         return true;
     }
     if (isTab)
@@ -1452,15 +1839,59 @@ bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& fo
         const float eyeAspect = (float)w / (float)(h / 2);
         format = eyeAspect >= 2.6f ? StereoFormat::HalfTAB : StereoFormat::FullTAB;
         score  = tab.ncc;
-        return true;
-    }
-    if (ana)
-    {
-        format = StereoFormat::Anaglyph;
-        score  = aH - a0;
+        if (eyeOrder) *eyeOrder = JudgeEyeOrder(I, M, mapB, tab, 0, 0, 0, h / 2, w, h / 2);
         return true;
     }
     return false;
+}
+
+void srw::JudgeEyeOrderOf(const LumaImage& img, const RECT& rIn, StereoFormat format, int anaCombo, EyeOrder& out)
+{
+    out = EyeOrder{};
+    if (img.empty()) return;
+    RECT r{};
+    const RECT all{ 0, 0, img.width, img.height };
+    if (!IntersectRect(&r, &rIn, &all)) return;
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (w < 64 || h < 48) return;
+    const bool sbs = format == StereoFormat::FullSBS || format == StereoFormat::HalfSBS;
+    const bool tab = format == StereoFormat::FullTAB || format == StereoFormat::HalfTAB;
+    if (sbs || tab)
+    {
+        Integral I;
+        I.Build(w, h, [&](int x, int y) { return img.at(r.left + x, r.top + y); });
+        HPMap M; int mapB = 0;
+        const PairResult pr = sbs ? MatchHalves(img, r, I, M, mapB, 0, 0, w / 2, 0, w / 2, h)
+                                  : MatchHalves(img, r, I, M, mapB, 0, 0, 0, h / 2, w, h / 2);
+        if (pr.ncc < 0.3f) return;   // the halves don't match well enough to measure
+        out = sbs ? JudgeEyeOrder(I, M, mapB, pr, 0, 0, w / 2, 0, w / 2, h)
+                  : JudgeEyeOrder(I, M, mapB, pr, 0, 0, 0, h / 2, w, h / 2);
+        return;
+    }
+    if (format != StereoFormat::Anaglyph || !img.hasColour() ||
+        img.green.size() != img.pixels.size() || img.blue.size() != img.pixels.size())
+        return;
+    // The combo's left-filter plane first, the right's second (as the
+    // converter's anaChanL / anaChanR, but with both channels where a filter
+    // passes two).
+    const size_t n = img.pixels.size();
+    std::vector<uint8_t> A(n), B(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const int R = img.red[i], G = img.green[i], Bl = img.blue[i];
+        switch (anaCombo)
+        {
+        case 1:  A[i] = (uint8_t)R;                  B[i] = (uint8_t)G;                  break;   // red/green
+        case 2:  A[i] = (uint8_t)R;                  B[i] = (uint8_t)Bl;                 break;   // red/blue
+        case 3:  A[i] = (uint8_t)G;                  B[i] = (uint8_t)((R + Bl + 1) >> 1); break;  // green/magenta
+        case 4:  A[i] = (uint8_t)((R + G + 1) >> 1); B[i] = (uint8_t)Bl;                 break;   // amber/blue
+        case 5:  A[i] = (uint8_t)G;                  B[i] = (uint8_t)R;                  break;   // cyan/magenta (blue shared)
+        default: A[i] = (uint8_t)R;                  B[i] = (uint8_t)((G + Bl + 1) >> 1); break;  // red/cyan
+        }
+    }
+    const AnaSig s = AnaSignature(A.data(), B.data(), (size_t)img.width, r, w, h);
+    if (s.blocks < kAnaMinBlocks) return;
+    out = AnaEyeOrder(s, false);
 }
 
 // ============================================================================
@@ -1592,7 +2023,14 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
                 // Only a confident rect (page background on 3+ sides) is
                 // judged and covers its seeds; a seed sitting right on an
                 // image's edge line can produce a rect straddling two things.
-                if (res[i].sides < 3) { seen.push_back({ pts[i].x - half, pts[i].y - half, pts[i].x + half, pts[i].y + half }); continue; }
+                // A side on the viewport's own edge counts too: a picture
+                // part-scrolled out of view has no page background there.
+                int sides = res[i].sides;
+                if (r.top <= b.top + 2)       ++sides;
+                if (r.bottom >= b.bottom - 2) ++sides;
+                if (r.left <= b.left + 2)     ++sides;
+                if (r.right >= b.right - 2)   ++sides;
+                if (sides < 3) { seen.push_back({ pts[i].x - half, pts[i].y - half, pts[i].x + half, pts[i].y + half }); continue; }
                 seen.push_back(r);
                 if (r.right - r.left < kMinHitW || r.bottom - r.top < kMinHitH) continue;
                 if (blocked(r, 0.1f)) continue;
@@ -1611,7 +2049,7 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
 
     // 2) Judge them all (in parallel) -- reusing the verdict from an earlier
     //    scan when the same place still holds the same content.
-    struct Job { int win; RECT rect; bool whole; int verifyIdx; uint64_t hash; bool st; StereoFormat fmt; float score; std::string diag; };
+    struct Job { int win; RECT rect; bool whole; int verifyIdx; uint64_t hash; bool st; StereoFormat fmt; float score; std::string diag; AnaglyphKind ana; EyeOrder eye; };
     std::vector<Job> jobs;
     for (size_t i = 0; i < verify.size(); ++i) jobs.push_back({ -1, verify[i].rect, false, (int)i });
     for (auto& v : perWin) for (const Cand& c : v) jobs.push_back({ c.win, c.rect, false, -1 });
@@ -1623,12 +2061,12 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
                 for (const CachedVerdict& c : *cache)
                     if (c.hash == j.hash && EqualRect(&c.rect, &j.rect))
                     {
-                        j.st = c.stereo; j.fmt = c.format; j.score = c.score; j.diag = c.diag;
+                        j.st = c.stereo; j.fmt = c.format; j.score = c.score; j.diag = c.diag; j.ana = c.ana; j.eye = c.eye;
                         return;
                     }
             char diag[512] = "";
             j.fmt = StereoFormat::HalfSBS; j.score = 0.0f;
-            j.st = ClassifyStereo(img, j.rect, j.fmt, j.score, diag, sizeof(diag));
+            j.st = ClassifyStereo(img, j.rect, j.fmt, j.score, diag, sizeof(diag), nullptr, &j.ana, &j.eye);
             j.diag = diag;
         });
     };
@@ -1650,7 +2088,7 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
     std::vector<CachedVerdict> used;
     for (const Job& j : jobs)
     {
-        used.push_back({ j.rect, j.hash, j.st, j.fmt, j.score, j.diag });
+        used.push_back({ j.rect, j.hash, j.st, j.fmt, j.score, j.diag, j.ana, j.eye });
         if (j.verifyIdx >= 0)
         {
             const ScanVerify& v = verify[j.verifyIdx];
@@ -1663,7 +2101,7 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
         if (j.st)
         {
             const ScanWindow& sw = windows[j.win];
-            out.hits.push_back({ sw.host, sw.view, j.rect, j.fmt, j.score, j.whole });
+            out.hits.push_back({ sw.host, sw.view, j.rect, j.fmt, j.score, j.whole, j.ana, j.eye });
         }
     }
     if (cache) *cache = std::move(used);   // keep only what's still on screen

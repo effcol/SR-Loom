@@ -4,6 +4,7 @@
 
 #include "Common.h"
 #include <d3d11.h>
+#include <cstdint>
 
 namespace srw
 {
@@ -58,6 +59,12 @@ namespace srw
         // Convert the source view into the internal SBS texture. Sets
         // outputResized=true when the SBS texture was (re)created (the caller
         // must then re-register OutputSRV() with the weaver).
+        // Which picture the next Convert's source holds (e.g. the capture's
+        // content version): with the same version and settings as last time
+        // the previous output is still right and Convert skips the work.
+        // 0 = unknown (always convert).
+        void SetSourceVersion(uint64_t v) { m_srcVersion = v; }
+
         bool Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcHeight,
                      bool& outputResized);
 
@@ -83,6 +90,9 @@ namespace srw
         bool EnsureDispTarget(DispTarget& t, int width, int height);
         void ReleaseDispTarget(DispTarget& t);
         void ReleaseDisparity();   // releases all disparity levels
+        bool EnsureDescTargets(int width, int height);
+        void ReleaseDescTargets();
+        uint64_t SettingsKey(ID3D11ShaderResourceView* source, int srcWidth, int srcHeight) const;
 
         static const int kHistory = 6;  // frame-history ring depth (delay 1..5)
 
@@ -94,8 +104,6 @@ namespace srw
         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
         ID3D11PixelShader*       m_psSmooth  = nullptr;  // edge-aware disparity smoothing
-        ID3D11PixelShader*       m_psSplit   = nullptr;  // SBS half -> premultiplied per-eye pyramid
-        ID3D11PixelShader*       m_psCompose = nullptr;  // push-pull colorize -> final SBS
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -104,6 +112,48 @@ namespace srw
         DispTarget m_disp1;   // refined   (1/4)
         DispTarget m_disp2;   // occlusion-filled (1/4)
         DispTarget m_dispF;   // edge-aware smoothed (1/4); the compose pass reads this
+        DispTarget m_src4;    // the source averaged down 4x (4x4 blocks) -- what the 1/4 passes read
+        DispTarget m_src16;   // ... and 16x (the coarse search)
+        DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
+        DispTarget m_src4Prev;   // last frame's 1/4 source (to see what changed)
+        bool       m_dispPrevValid = false;
+        ID3D11PixelShader* m_psDown = nullptr;   // 4x box downsample
+        // Packed gradient descriptors at the refine level (PSAnaDesc): 4 x uint4.
+        ID3D11PixelShader*        m_psDesc = nullptr;
+        ID3D11Texture2D*          m_descTex[4] = {};
+        ID3D11RenderTargetView*   m_descRTV[4] = {};
+        ID3D11ShaderResourceView* m_descSRV[4] = {};
+        int                       m_descW = 0, m_descH = 0;
+
+        // GPU time of the anaglyph recovery's stages, for the perf log: a small
+        // ring of timestamp sets, read back a few frames later (never stalls).
+        static constexpr int kTimeRing = 4, kTimeMarks = 9;
+        struct TimeSet { ID3D11Query* disjoint = nullptr; ID3D11Query* ts[kTimeMarks] = {}; bool pending = false; };
+        TimeSet m_times[kTimeRing];
+        int     m_timeNext = 0;
+        double  m_timeSum[kTimeMarks - 1] = {};
+        int     m_timeCount = 0;
+        void    TimeMark(int slot, int mark);
+        void    CollectTimes();
+    public:
+        // Average ms per recovery stage since the last call (coarse search,
+        // descriptors, refine, occlusion fill, smoothing, full-res decode,
+        // colour pyramid, colour fill); false if none ran.
+        bool TakeRecoveryTimes(double ms[kTimeMarks - 1], int& count);
+        // Diagnostics (tools/anatest): the recovery's disparity map after a stage
+        // -- 0 coarse search, 1 refine, 2 occlusion fill, 3 smoothing (what the
+        // compose reads) -- or null.
+        ID3D11ShaderResourceView* DebugStageSRV(int stage) const
+        {
+            const DispTarget* t[4] = { &m_disp0, &m_disp1, &m_disp2, &m_dispF };
+            return (stage >= 0 && stage < 4) ? t[stage]->srv : nullptr;
+        }
+    private:
+
+        // Unchanged-source skip (SetSourceVersion).
+        uint64_t                  m_srcVersion  = 0;
+        uint64_t                  m_lastVersion = 0;
+        uint64_t                  m_lastKey     = 0;
 
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;
@@ -114,13 +164,6 @@ namespace srw
         // Per-eye colour pyramids (mip-chained, RGBA16F, premultiplied) for the
         // push-pull colorization of anaglyph recovery. GenerateMips on premultiplied
         // colour gives a confidence-weighted average at each level.
-        ID3D11Texture2D*          m_ppLeftTex  = nullptr;
-        ID3D11RenderTargetView*   m_ppLeftRTV  = nullptr;   // mip 0
-        ID3D11ShaderResourceView* m_ppLeftSRV  = nullptr;   // full chain
-        ID3D11Texture2D*          m_ppRightTex = nullptr;
-        ID3D11RenderTargetView*   m_ppRightRTV = nullptr;
-        ID3D11ShaderResourceView* m_ppRightSRV = nullptr;
-        int                       m_ppMips = 0;
 
         // Frame-history ring (for Pulfrich time delay), source-sized, sRGB.
         ID3D11Texture2D*          m_hist[kHistory]    = {};

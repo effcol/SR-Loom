@@ -148,22 +148,22 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     if (!s.updateTag.empty())
     {
         char label[96];
-        _snprintf_s(label, _TRUNCATE, "Update available: %s  (download)", s.updateTag.c_str());
+        _snprintf_s(label, _TRUNCATE, "Update available: %s", s.updateTag.c_str());
         AppendMenuA(menu, MF_STRING, ID_TRAY_OPEN_UPDATE, label);
     }
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
 
     AppendMenuA(menu, MF_STRING | (weavingEnabled ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_TOGGLE_WEAVE, "Weaving enabled");
+                ID_TRAY_TOGGLE_WEAVE, "Weaving enabled\tCtrl+Alt+W");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::Fullscreen ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_MODE_FULLSCREEN, "Fullscreen");
+                ID_TRAY_MODE_FULLSCREEN, "Fullscreen\tCtrl+Alt+F");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::Windowed ? MF_CHECKED : MF_UNCHECKED),
                 ID_TRAY_MODE_WINDOWED, "Windowed");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::WindowOverlay ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_MODE_OVERLAY, "Overlay source window (in-place 3D)");
+                ID_TRAY_MODE_OVERLAY, "Overlay source window");
     AppendMenuA(menu, MF_STRING | (mode == OutputMode::LookingGlass ? MF_CHECKED : MF_UNCHECKED),
-                ID_TRAY_LOOKING_GLASS, "Looking glass (passthrough; drag title bar / edges to move/resize)");
+                ID_TRAY_LOOKING_GLASS, "Looking Glass");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(menu, MF_STRING, ID_TRAY_CAPTURE_FOREGROUND, "Make active window 3D\tCtrl+Alt+C");
     AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
@@ -171,7 +171,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     // Source submenu: monitor + the live window list.
     HMENU srcMenu = CreatePopupMenu();
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::CaptureMonitor ? MF_CHECKED : 0),
-                ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor (passthrough)");
+                ID_TRAY_SRC_MONITOR, "Simulated Reality Monitor");
     AppendMenuA(srcMenu, MF_STRING | (source == SourceKind::TestImage ? MF_CHECKED : 0),
                 ID_TRAY_SRC_TESTIMAGE, "Load media...");
     AppendMenuA(srcMenu, MF_SEPARATOR, 0, nullptr);
@@ -203,9 +203,9 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
         return (format == a || format == b) ? (UINT)MF_CHECKED : 0u;
     };
 
-    // Auto-detect disabled for now (kept in code for later):
-    // AppendMenuA(fmtMenu, MF_STRING, ID_TRAY_DETECT, "Auto-detect\tCtrl+Alt+D");
-    // AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
+    // Automatic Detection first (as in the panel's Stereo 3D Input list).
+    AppendMenuA(fmtMenu, MF_STRING | (s.autoInput ? MF_CHECKED : 0), ID_TRAY_AUTO_STEREO, "Automatic Detection");
+    AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU sbsMenu = CreatePopupMenu();
     addFmt(sbsMenu, StereoFormat::FullSBS, "Full");
@@ -275,7 +275,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
 
     // Frame Packing: single entry now (720p and 1080p HDMI 1.4 share the same proportions
     // so the decode is identical -- no per-resolution submenu needed).
-    addFmt(fmtMenu, StereoFormat::FramePacking, "Frame Packing (HDMI 1.4)");
+    addFmt(fmtMenu, StereoFormat::FramePacking, "Frame Packing");
 
     // Quilt: cols x rows grid of views; picks centre pair by default.
     addFmt(fmtMenu, StereoFormat::Quilt, "Quilt");
@@ -297,6 +297,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
         const bool htAnyOn = s.htOpenTrack || s.htFreeTrack || s.htTrackIR;
         AppendMenuA(htMenu, MF_STRING | (htAnyOn ? MF_CHECKED : MF_UNCHECKED),
                     ID_TRAY_HT_TOGGLE, "Tracking enabled");
+        AppendMenuA(htMenu, MF_STRING, ID_TRAY_HT_RECENTER, "Recenter\tCtrl+Alt+R");
         AppendMenuA(htMenu, MF_SEPARATOR, 0, nullptr);
         // Protocols submenu. Each checkable independently; if all are
         // unchecked the master toggle's checkmark reflects "off".

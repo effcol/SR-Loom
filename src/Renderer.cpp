@@ -65,6 +65,14 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
                     o->Release();
                 }
                 if (drivesTarget && !srAdapter) { srAdapter = a; srAdapter->AddRef(); }
+                if (drivesTarget && !m_vblankOutput)
+                    for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; ++j)
+                    {
+                        DXGI_OUTPUT_DESC od{};
+                        o->GetDesc(&od);
+                        if (od.Monitor == target && !m_vblankOutput) { m_vblankOutput = o; continue; }
+                        o->Release();
+                    }
                 a->Release();
             }
             f1->Release();
@@ -577,6 +585,17 @@ void Renderer::WaitForFrame()
             // else < 200µs: tight spin for sub-ms accuracy
         }
     }
+    // Then start the frame on the SR display's vertical blank: one frame per
+    // refresh, locked to the display (the cap alone drifted, 155-163 frames/s
+    // at 160 Hz). Not when this frame is already late -- a whole refresh
+    // since the last one started -- where waiting would skip a refresh.
+    if (m_vblankOutput && m_targetIntervalNs > 0)
+    {
+        using namespace std::chrono;
+        const auto since = duration_cast<nanoseconds>(steady_clock::now() - m_lastFrameStart).count();
+        if (since < (int64_t)(m_targetIntervalNs / 0.98))
+            m_vblankOutput->WaitForVBlank();
+    }
     m_lastFrameStart = std::chrono::steady_clock::now();
 }
 
@@ -620,6 +639,7 @@ void Renderer::Shutdown()
     SAFE_RELEASE(m_swapChain);
     SAFE_RELEASE(m_maskCB); SAFE_RELEASE(m_maskBlend); SAFE_RELEASE(m_maskPS); SAFE_RELEASE(m_maskVS);
     SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
+    SAFE_RELEASE(m_vblankOutput);
     SAFE_RELEASE(m_factory);
     SAFE_RELEASE(m_context);
     SAFE_RELEASE(m_device);

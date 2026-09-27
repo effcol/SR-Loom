@@ -31,6 +31,8 @@ namespace srw
         bool         swapEyes = false;
         int          anaglyphCombo = 0;
         int          anaglyphMode  = 0;
+        bool         anaAuto  = false;        // its anaglyph colour pair / decode were detected (not the panel's)
+        bool         autoSwap = false;        // detected with its eyes the other way round (flips the panel's Swap Eyes)
         HWND         trackWindow = nullptr;   // follow this window's client area, or null
         bool         trackContent = false;    // follow the image content itself (scrolling)
         HWND         host = nullptr;          // top-level window the image is in (content regions)
@@ -80,6 +82,14 @@ namespace srw
         int                       Height()          const { return m_compH; }
         DXGI_FORMAT               CompositeFormat() const { return kCompFormat; }
 
+        // Looking Glass: the part of the composite under the glass (`r`, capture
+        // frame px) as its own side-by-side texture -- the weave input there.
+        // Returns false on failure; `resized` when the texture was remade.
+        bool CropComposite(const RECT& r, bool& resized);
+        ID3D11ShaderResourceView* CroppedSRV()      const { return m_lgSRV; }
+        int                       CroppedPerEyeWidth() const { return m_lgW; }
+        int                       CroppedHeight()   const { return m_lgH; }
+
     private:
         struct Slot   // per-region GPU resources, keyed by region id
         {
@@ -119,6 +129,9 @@ namespace srw
         ID3D11Texture2D*          m_comp    = nullptr;
         ID3D11RenderTargetView*   m_compRTV = nullptr;
         ID3D11ShaderResourceView* m_compSRV = nullptr;
+        ID3D11Texture2D*          m_lgTex = nullptr;     // CropComposite output (2 x m_lgW wide)
+        ID3D11ShaderResourceView* m_lgSRV = nullptr;
+        int                       m_lgW = 0, m_lgH = 0;
         int                       m_compW = 0, m_compH = 0;   // full SBS size
 
         std::vector<WeaveRegion>  m_regions;

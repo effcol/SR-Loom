@@ -51,6 +51,10 @@ namespace srw
     // from inside the WM_SIZE of the maximise itself).
     constexpr UINT WM_APP_APPLY_MODE = WM_APP + 10;
 
+    // GUI -> main window: make a Stereo 3D Input the default (the panel's pin).
+    // WPARAM = 0 for Automatic Detection, else StereoFormatIndex + 1.
+    constexpr UINT WM_APP_PIN_INPUT = WM_APP + 11;
+
     // Menu command IDs (also reused as WM_COMMAND ids from the popup menu).
     enum TrayCommand : UINT
     {
@@ -105,6 +109,7 @@ namespace srw
     constexpr UINT ID_TRAY_HT_PROTO_TIR  = 43303; // TrackIR (NPClient)
     constexpr UINT ID_TRAY_HT_MODE_BASE  = 43310; // +0..+4 -> outputMode 1..5
     constexpr UINT ID_TRAY_HT_MODE_MAX   = 43319;
+    constexpr UINT ID_TRAY_HT_RECENTER   = 43320; // recenter head tracking (Ctrl+Alt+R)
 
     // Profiles submenu (NTM-style per-game auto-apply).
     constexpr UINT ID_TRAY_PROFILES_AUTO     = 43400;  // master "auto-apply" toggle
@@ -143,6 +148,8 @@ namespace srw
         // Newer release tag (e.g. "v2.2") when an update is available, else
         // empty. Shown as an "Update available" item at the top of the menu.
         std::string              updateTag;
+        // Stereo 3D Input is Automatic Detection (checked at the top of 3D format).
+        bool                     autoInput = false;
     };
 
     class TrayIcon

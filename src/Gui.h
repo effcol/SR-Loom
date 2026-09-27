@@ -35,6 +35,11 @@ namespace srw
         HMONITOR     captureMonitor = nullptr; // the monitor currently being captured
         bool         foreignDisplay = false;   // a picked (non-SR) display is the active source
         bool         autoStereo     = false;   // Auto Stereo detection is on
+        bool         autoInput      = true;    // Stereo 3D Input is "Automatic Detection"
+        bool         windowScoped   = false;   // Automatic is finding 3D pictures in a chosen window (shown as the Window source)
+        int          defaultInput   = 0;       // pinned default: 0 = Automatic, else StereoFormatIndex + 1
+        int          autoFmtCount   = 0;       // Automatic Detection: layouts being woven right now ...
+        StereoFormat autoFmts[4]    = {};      // ... (distinct; for the compact status line)
         int          quiltCols      = 8;       // current quilt grid columns (1..12)
         int          quiltRows      = 6;       // current quilt grid rows    (1..9)
         bool         hasTestImage   = false;   // true once a TestImage has been loaded
@@ -152,6 +157,7 @@ namespace srw
         bool FitHeightToContent(int clientContentH);   // shrink/grow window to fit content; true = resized
         int                      m_refitDepth = 0;     // Render re-entry guard for the fit-before-present redraw
         bool                     m_msgSinceFrame = true;  // the panel got a message (input, resize...) since its last frame
+        bool                     m_showPending = false;   // Toggle()d visible: show once the first frame is drawn
         std::chrono::steady_clock::time_point m_lastFrame{};   // when the panel last drew
         static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
         static LRESULT WndProcImpl(HWND, UINT, WPARAM, LPARAM);
@@ -205,6 +211,7 @@ namespace srw
         bool                     m_directComposition     = true;   // presenter (restart to apply)
         bool                     m_lateLatching          = true;   // SR weaver late latching
         bool                     m_perfLog               = true;   // frame / GPU timing in the log
+        bool                     m_eyeOrder              = true;   // Automatic works out the eye order
         bool                     m_skipWeave             = false;  // diagnostic: no SR weave call
         // Inline state for the About popup's "Check for updates" link.
         // Idle by default; switches to Checking on click, then settles to

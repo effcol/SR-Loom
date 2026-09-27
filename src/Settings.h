@@ -3,6 +3,8 @@
 // no third-party deps; just a couple of registry calls per setting.
 #pragma once
 
+#include <windows.h>   // RECT
+
 namespace srw::Settings
 {
     // Whether SR Loom is registered to launch on user login (a value in
@@ -55,6 +57,16 @@ namespace srw::Settings
     // tuning). HKCU\Software\SRLoom\PerfLog.
     bool ReadPerfLog();
     void WritePerfLog(bool enable);
+
+    // Automatic Detection works out which half of an SBS / TAB picture is the
+    // left eye (and swaps it when it's the other way round). Default on.
+    bool ReadEyeOrderDetect();
+    void WriteEyeOrderDetect(bool enable);
+
+    // The Stereo 3D Input pinned as the default (the panel's pin button):
+    // 0 = Automatic Detection (the default), else StereoFormatIndex + 1.
+    int  ReadDefaultInput();
+    void WriteDefaultInput(int input);
 
     bool ReadDirectComposition();
     void WriteDirectComposition(bool enable);
