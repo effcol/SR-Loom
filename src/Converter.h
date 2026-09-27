@@ -116,6 +116,13 @@ namespace srw
         DispTarget m_src16;   // ... and 16x (the coarse search)
         DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
         DispTarget m_src4Prev;   // last frame's 1/4 source (to see what changed)
+        // Where the 3D picture is inside the captured area (PSPicCols/Rows/Rect):
+        // each 1/16 column's and row's share of anaglyph fringes, and the
+        // rectangle (1x1) the recovery and compose read at t10.
+        DispTarget m_picCols, m_picRows, m_picRect;
+        ID3D11PixelShader* m_psPicCols = nullptr;
+        ID3D11PixelShader* m_psPicRows = nullptr;
+        ID3D11PixelShader* m_psPicRect = nullptr;
         bool       m_dispPrevValid = false;
         ID3D11PixelShader* m_psDown = nullptr;   // 4x box downsample
         // Packed gradient descriptors at the refine level (PSAnaDesc): 4 x uint4.

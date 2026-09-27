@@ -705,6 +705,58 @@ int wmain(int argc, wchar_t** argv)
                         }
                         if (const wchar_t* gp2 = _wgetenv(L"ANATEST_GFOUT")) SavePNG(gp2, gfOut.data(), picW, picH, picW * 4);
                     }
+                    // ANATEST_ROBUST=R,tau,delta: prototype "least wrong" --
+                    // each left-eye pixel's HUE (chromaticity) compared with the
+                    // weighted median hue of neighbours within R px whose own
+                    // channel (the anaglyph's red, as seen) is within tau; if
+                    // it's off by more than delta, the neighbours' hue replaces
+                    // it at the pixel's own brightness. No detection needed.
+                    if (const char* rs = getenv("ANATEST_ROBUST"))
+                    {
+                        int R = 12; float tau = 0.06f, delta = 0.12f; sscanf_s(rs, "%d,%f,%f", &R, &tau, &delta);
+                        const int W = (int)picW, Hh = (int)picH;
+                        std::vector<uint8_t> src(gfOut.empty() ? std::vector<uint8_t>() : gfOut);
+                        if (src.empty())
+                        {
+                            src.resize((size_t)W * Hh * 4);
+                            for (int y = 0; y < Hh; ++y) memcpy(&src[(size_t)y * W * 4], base + (size_t)(picY + y) * m.RowPitch + (size_t)picX * 4, (size_t)W * 4);
+                        }
+                        gfOut = src;
+                        auto own = [&](int x, int y) { return px[((size_t)(picY + y) * w + picX + x) * 4] / 255.0f; };   // the anaglyph's red here
+                        size_t changed = 0;
+                        for (int y = 0; y < Hh; ++y) for (int x = 0; x < W; ++x)
+                        {
+                            const uint8_t* p = &src[((size_t)y * W + x) * 4];
+                            const float sp = (float)p[0] + p[1] + p[2];
+                            if (sp < 30) continue;
+                            const float r0 = own(x, y);
+                            float cg[80], cb[80], cw[80]; int n = 0;
+                            for (int dy = -R; dy <= R && n < 80; dy += 3) for (int dx = -R; dx <= R && n < 80; dx += 3)
+                            {
+                                const int qx = x + dx, qy = y + dy;
+                                if ((dx == 0 && dy == 0) || qx < 0 || qy < 0 || qx >= W || qy >= Hh) continue;
+                                if (std::abs(own(qx, qy) - r0) > tau) continue;
+                                const uint8_t* q = &src[((size_t)qy * W + qx) * 4];
+                                const float sq = (float)q[0] + q[1] + q[2]; if (sq < 30) continue;
+                                cg[n] = q[1] / sq; cb[n] = q[2] / sq; cw[n] = 1.0f; ++n;
+                            }
+                            if (n < 6) continue;
+                            // weighted median of each chromaticity coordinate
+                            auto med = [&](float* v) { std::vector<float> t(v, v + n); std::nth_element(t.begin(), t.begin() + n / 2, t.end()); return t[n / 2]; };
+                            const float mg = med(cg), mb = med(cb);
+                            const float pg = p[1] / sp, pb = p[2] / sp;
+                            if (std::abs(pg - mg) + std::abs(pb - mb) > delta)
+                            {
+                                // keep brightness (sum) and the pixel's red share scaled to fit
+                                const float mr = 1.0f - mg - mb;
+                                uint8_t* o = &gfOut[((size_t)y * W + x) * 4];
+                                o[0] = (uint8_t)std::clamp(std::lround(mr * sp), 0L, 255L); o[1] = (uint8_t)std::clamp(std::lround(mg * sp), 0L, 255L); o[2] = (uint8_t)std::clamp(std::lround(mb * sp), 0L, 255L);
+                                ++changed;
+                            }
+                        }
+                        wprintf(L"robust hue: changed %.2f%% of px\n", 100.0 * changed / (W * Hh));
+                        if (const wchar_t* gp2 = _wgetenv(L"ANATEST_GFOUT")) SavePNG(gp2, gfOut.data(), picW, picH, picW * 4);
+                    }
                     std::vector<float> gd1;
                     {
                         std::wstring p1(gp); const size_t at = p1.rfind(L"disp0"); if (at != std::wstring::npos) p1.replace(at, 5, L"disp1");
@@ -719,9 +771,49 @@ int wmain(int argc, wchar_t** argv)
                         const UINT tx = (UINT)std::clamp((int)(sx / ppt), 0, (int)s.w - 1), ty = (UINT)std::clamp((int)(sy / ppt), 0, (int)s.h - 1);
                         return s.v[((size_t)ty * s.w + tx) * 4] * s.w * ppt;
                     };
+                    // ANATEST_OCCORACLE: upper bound for occlusion handling -- the
+                    // TRULY occluded left-eye pixels (ground truth) take the hue of
+                    // the nearest non-occluded pixel on the background side (left)
+                    // whose own channel is within 0.06, at their own brightness.
+                    if (getenv("ANATEST_OCCORACLE") && !gd1.empty())
+                    {
+                        const int W = (int)picW, Hh = (int)picH;
+                        if (gfOut.empty()) { gfOut.resize((size_t)W * Hh * 4); for (int y = 0; y < Hh; ++y) memcpy(&gfOut[(size_t)y * W * 4], base + (size_t)(picY + y) * m.RowPitch + (size_t)picX * 4, (size_t)W * 4); }
+                        std::vector<uint8_t> occ((size_t)W * Hh, 0);
+                        for (int y = 0; y < Hh; ++y) for (int x = 0; x < W; ++x)
+                        {
+                            const float g = gd[(size_t)(gh - 1 - y * k) * gw + x * k + shift];
+                            if (!(g < 1e9f) || g <= 0) continue;
+                            const int xR = (int)(x * k + shift) - (int)std::lround(g);
+                            if (xR >= 0 && xR < gw) { const float g1 = gd1[(size_t)(gh - 1 - y * k) * gw + xR]; if (g1 < 1e9f && g1 > g + 1.5f) occ[(size_t)y * W + x] = 1; }
+                        }
+                        auto own = [&](int x, int y) { return px[((size_t)(picY + y) * w + picX + x) * 4] / 255.0f; };
+                        const std::vector<uint8_t> src = gfOut;
+                        size_t fixed = 0;
+                        for (int y = 0; y < Hh; ++y) for (int x = 0; x < W; ++x)
+                        {
+                            if (!occ[(size_t)y * W + x]) continue;
+                            const float r0 = own(x, y);
+                            for (int s = 1; s <= 200; ++s)
+                            {
+                                const int qx = x - s; if (qx < 0) break;
+                                if (occ[(size_t)y * W + qx] || std::abs(own(qx, y) - r0) > 0.06f) continue;
+                                const uint8_t* q = &src[((size_t)y * W + qx) * 4]; uint8_t* o = &gfOut[((size_t)y * W + x) * 4];
+                                const float sq = (float)q[0] + q[1] + q[2], so = (float)o[0] + o[1] + o[2];
+                                if (sq < 1) break;
+                                for (int c = 0; c < 3; ++c) o[c] = (uint8_t)std::clamp(std::lround(q[c] / sq * so), 0L, 255L);
+                                ++fixed; break;
+                            }
+                        }
+                        wprintf(L"oracle: recoloured %.2f%% of px\n", 100.0 * fixed / (W * Hh));
+                    }
                     const char* cat[7] = { "occluded", "never-found", "lost@refine", "lost@fill", "lost@smooth", "lost@full-res", "depth-right" };
                     size_t cb[7] = {}, ca[7] = {}, nb = 0, na = 0;
                     std::vector<uint8_t> bm((size_t)picW * picH * 4, 0);
+                    // ANATEST_OCCSTATS (a build writing an occlusion flag to alpha): how
+                    // well the flag finds the truly occluded pixels.
+                    const bool occStats = getenv("ANATEST_OCCSTATS") != nullptr;
+                    size_t oFl = 0, oGt = 0, oTp = 0, oFlBlob = 0, oGtBlob = 0, oTpBlob = 0;
                     for (size_t i = 3; i < bm.size(); i += 4) bm[i] = 255;
                     for (UINT y = 0; y < picH; ++y)
                         for (UINT x = 0; x < picW; ++x)
@@ -747,6 +839,7 @@ int wmain(int argc, wchar_t** argv)
                                 const float g1 = gd1[(size_t)(gh - 1 - y * k) * gw + xR];
                                 if (g1 < 1e9f && g1 > g + 1.5f) c = 0;
                             }
+                            if (occStats) { const bool fl = o[3] > 127; if (fl) ++oFl; if (c == 0) ++oGt; if (fl && c == 0) ++oTp; if (fl && blob) ++oFlBlob; if (blob && c == 0) ++oGtBlob; if (fl && blob && c == 0) ++oTpBlob; }
                             if (c != 0)
                             {
                                 const float sx = picX + x + 0.5f, sy = picY + y + 0.5f;
@@ -767,6 +860,9 @@ int wmain(int argc, wchar_t** argv)
                     for (int i = 0; i < 7; ++i) wprintf(L"  %S %.0f%%", cat[i], 100.0 * ca[i] / (std::max)(na, (size_t)1));
                     wprintf(L")\n");
                     if (const wchar_t* bp = _wgetenv(L"ANATEST_BLOBMAP")) SavePNG(bp, bm.data(), picW, picH, picW * 4);
+                    if (occStats)
+                        wprintf(L"occlusion flag: flags %.2f%% of px; finds %.0f%% of the truly occluded (%.0f%% of occluded BLOB px); %.0f%% of flagged px are truly occluded; flagged px that are blobs %.0f%%\n",
+                                100.0 * oFl / (std::max)(na, (size_t)1), 100.0 * oTp / (std::max)(oGt, (size_t)1), 100.0 * oTpBlob / (std::max)(oGtBlob, (size_t)1), 100.0 * oTp / (std::max)(oFl, (size_t)1), 100.0 * oFlBlob / (std::max)(oFl, (size_t)1));
                 }
 #endif
             }

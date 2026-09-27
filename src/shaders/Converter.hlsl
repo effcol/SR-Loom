@@ -12,6 +12,9 @@ Texture2D<uint4> descTexD : register(t6);
 Texture2D    dispPrevTex : register(t7);   // anaglyph recovery: last frame's smoothed disparity
 Texture2D    srcPrevQ    : register(t8);   // ... and last frame's 1/4 source (what changed since)
 Texture2D    srcQ        : register(t9);   // anaglyph recovery: the 1/4 source again (the compose's edge-aware upsampling)
+Texture2D    picRectTex  : register(t10);  // anaglyph recovery: where the 3D picture is (PSPicRect: .xy top-left, .zw bottom-right, source uv)
+Texture2D    profColTex  : register(t11);  // ... (PSPicCols / PSPicRows: each column's / row's share of anaglyph fringes)
+Texture2D    profRowTex  : register(t12);
 SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
@@ -90,6 +93,13 @@ float anaChanR(float3 c)
     if (g_anaCombo == 2 || g_anaCombo == 4) return c.b;          // Red/Blue, Amber/Blue
     if (g_anaCombo == 3 || g_anaCombo == 5) return c.r;          // Green/Magenta, Cyan/Magenta
     return c.g;                                                  // Red/Cyan, Red/Green
+}
+
+// The picture's rectangle (see PSPicRect), in the source's uv; unset -> all.
+float4 picRectSrc()
+{
+    const float4 r = picRectTex.Load(int3(0, 0, 0));
+    return (r.z > r.x && r.w > r.y) ? r : float4(0, 0, 1, 1);
 }
 
 float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
@@ -194,7 +204,11 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     float2 uv  = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     float  ty = 1.0 / max(g_coarseH, 1.0);
-    float  maxD = g_dispMaxUV;
+    // Search 6% of the PICTURE's width (see PSPicRect), in this level's uv,
+    // and never outside the picture.
+    const float4 pr = picRectSrc();
+    const float picL = pr.x / g_lvlToSrcX, picR = pr.z / g_lvlToSrcX;
+    float  maxD = g_dispMaxUV * (picR - picL);
     // Candidates every 8 source pixels (half a coarse texel), however wide
     // the area is: tying the step to the area's width searched the same
     // picture on a different candidate grid whenever the captured area
@@ -216,7 +230,7 @@ float4 PSAnaDisp(VSOut i) : SV_Target
         // (A candidate off the picture is never a match: its descriptor there is
         // the edge pixel repeated, which can look like one -- and then a whole
         // band beside the edge borrowed that single column: streaks.)
-        if (uv.x + d < 0.0 || uv.x + d > 1.0 / g_lvlToSrcX) continue;
+        if (uv.x + d < picL || uv.x + d > picR) continue;
         float cRed[16], cGrn[16]; buildDesc(uv + float2(d, 0), tx, ty, cRed, cGrn);
         float bias = abs(d) * 16.0 * g_coarseW * 0.0004;   // (a preference for small disparities, per pixel -- also not tied to the area's width)
         float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
@@ -309,7 +323,8 @@ float4 PSAnaRefine(VSOut i) : SV_Target
     int2   p  = int2(i.pos.xy);
     int    W  = (int)g_coarseW;
     float4 priorAll = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .ba uniqueness
-    const float lim = W / g_lvlToSrcX;                       // (the picture's right edge, in this level's px)
+    const float4 pr = picRectSrc();                          // (the picture, in this level's px -- see PSPicRect)
+    const float limL = pr.x / g_lvlToSrcX * W, lim = pr.z / g_lvlToSrcX * W;
 
     float refL[16], refR[16]; loadDescL(p, refL); loadDescR(p, refR);
 
@@ -350,8 +365,8 @@ float4 PSAnaRefine(VSOut i) : SV_Target
             float sadL = descCost(refL, candR) + tie;   // ref left view vs candidate right view
             float sadR = descCost(refR, candL) + tie;   // ref right view vs candidate left view
             // (Off the picture: never, see PSAnaDisp.)
-            if (sadL < bestL && rawL >= 0 && rawL < lim) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
-            if (sadR < bestR && rawR >= 0 && rawR < lim) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
+            if (sadL < bestL && rawL >= limL && rawL < lim) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
+            if (sadR < bestR && rawR >= limL && rawR < lim) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
         }
     }
     return float4(dL, dR, priorAll.b, priorAll.a);   // carry uniqueness through
@@ -455,6 +470,71 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
         d = lerp(d, dispPrevTex.SampleLevel(samp, uv, 0.0).rg, keep);
     }
     return float4(d, myConf.x, myConf.y);
+}
+
+// ----- Where the picture is (anaglyph recovery) ----------------------------
+// The captured area can be more than the 3D picture: a page around it, black
+// bars, a desktop. The search range was 6% of the AREA's width (reaching far
+// past a small picture's real depth: far matches, blobs), matches could land
+// on the page, and the page itself got "recovered" -- colour borrowed into
+// plain grey. These passes find the picture from the anaglyph's own
+// signature: inside it the two eyes' channels disagree at many spots (the
+// colour fringes of anything with depth); a page, bars or plain UI are
+// neutral. Per column and row of the 1/16 picture, the share of such spots;
+// the picture is the span well above the page's. The recovery then searches
+// 6% of the PICTURE's width, keeps matches inside it, and leaves everything
+// outside it as it is. (A whole-screen anaglyph just gives the whole screen.)
+// (A spot counts as picture if the eyes' channels disagree there OR it has any
+// structure -- a page, bars or plain UI are flat. Being generous matters: a
+// real row left out of the rectangle is shown unrecovered.)
+float anaSignature(float3 c) { return abs(anaChanL(c) - anaChanR(c)) > 0.03 ? 1.0 : 0.0; }
+float picEvidence(int x, int y)
+{
+    const float3 c = srcTex.Load(int3(x, y, 0)).rgb;
+    uint W, H; srcTex.GetDimensions(W, H);   // (neighbours clamped: past the edge reads black)
+    const float3 r = srcTex.Load(int3(min(x + 1, (int)W - 1), y, 0)).rgb, d = srcTex.Load(int3(x, min(y + 1, (int)H - 1), 0)).rgb;
+    const float s = max(max(abs(c.r - r.r), abs(c.g - r.g)), max(abs(c.r - d.r), abs(c.g - d.g)));
+    return max(anaSignature(c), s > 0.01 ? 1.0 : 0.0);
+}
+// Target W16 x 1: each column's share.
+float4 PSPicCols(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int x = (int)i.pos.x; float n = 0;
+    [loop] for (int y = 0; y < (int)H; ++y) n += picEvidence(x, y);
+    return float4(n / H, 0, 0, 0);
+}
+// Target 1 x H16: each row's share.
+float4 PSPicRows(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int y = (int)i.pos.y; float n = 0;
+    [loop] for (int x = 0; x < (int)W; ++x) n += picEvidence(x, y);
+    return float4(n / W, 0, 0, 0);
+}
+// Target 1x1: the rectangle, in the source's uv. First and last column (row)
+// above a quarter of the busiest one's share (and 2%), padded by one coarse
+// texel (the picture's edge lies somewhere inside that texel). Nothing clear:
+// the whole area.
+float2 picSpan(Texture2D prof, int n, bool rows)
+{
+    float mx = 0;
+    [loop] for (int k = 0; k < n; ++k) mx = max(mx, prof.Load(int3(rows ? 0 : k, rows ? k : 0, 0)).r);
+    const float thr = max(0.1 * mx, 0.01);
+    int a = -1, b = -1;
+    [loop] for (int k2 = 0; k2 < n; ++k2)
+        if (prof.Load(int3(rows ? 0 : k2, rows ? k2 : 0, 0)).r >= thr) { if (a < 0) a = k2; b = k2; }
+    if (a < 0) return float2(0, n);
+    return float2(a, b + 1);   // (texels [a, b] inclusive: the one holding the picture's edge has the edge's structure)
+}
+float4 PSPicRect(VSOut i) : SV_Target
+{
+    uint cw, one, rh, one2;
+    profRowTex.GetDimensions(one, rh); profColTex.GetDimensions(cw, one2);
+    const float2 sx = picSpan(profColTex, (int)cw, false), sy = picSpan(profRowTex, (int)rh, true);
+    // (Coarse texels are 16 source px: to the source's uv.)
+    const float2 k = float2(16.0 / g_srcW, 16.0 / g_srcH);
+    return saturate(float4(sx.x * k.x, sy.x * k.y, sx.y * k.x, sy.y * k.y));
 }
 // (There was a push-pull colour fill here -- confidence-weighted colour
 // pyramids filling low-confidence pixels. Its sampler never read past the
@@ -561,6 +641,26 @@ float4 ConvertCore(VSOut i)
         {
             float px = 1.0 / g_srcW;
             float py = 1.0 / g_srcH;
+            // Outside the 3D picture (a page, bars -- see PSPicRect) nothing is
+            // recovered: it's shown as it is, the same in both eyes. (It used to
+            // borrow colour from the picture next to it: blobs on the page.)
+            const float4 picR = picRectSrc();
+            if (e.x < picR.x || e.x > picR.z || e.y < picR.y || e.y > picR.w) return float4(c, 1);
+            // Where both eyes see the same plain grey here -- the anaglyph flat and
+            // neutral around this pixel -- what's shown already IS each eye's
+            // colour: nothing to recover (a page beside the picture, plain grey
+            // sky), and a borrow could only bring the wrong colour in.
+            {
+                float dev = max(abs(c.r - c.g), abs(c.r - c.b));
+                [unroll] for (int fy = -1; fy <= 1; ++fy)
+                [unroll] for (int fx = -1; fx <= 1; ++fx)
+                {
+                    const float3 q = srcTex.SampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * float2(1.0 / g_srcW, 1.0 / g_srcH), 0).rgb;
+                    dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
+                    dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
+                }
+                if (dev < 0.01) return float4(c, 1);
+            }
             // (The disparity levels cover whole 16-px blocks past the picture's
             // edge: their uv, and their disparities, are the picture's / g_lvlToSrc.)
             // Edge-aware upsampling (joint bilateral, Kopf et al. 2007): the
@@ -632,6 +732,8 @@ float4 ConvertCore(VSOut i)
                 float delta = (abs(den) > 1e-5) ? 0.5 * (cm - cp) / den : 0.0;
                 dRef += clamp(delta, -1.0, 1.0) * px;
             }
+            // (The borrow stays inside the picture: beyond its edge is the page.)
+            dRef = clamp(e.x + dRef, picR.x, picR.z - px) - e.x;
 
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
 

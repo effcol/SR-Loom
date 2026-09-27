@@ -13,6 +13,9 @@
 #include "Converter_PSAnaRefine.h"
 #include "Converter_PSAnaFill.h"
 #include "Converter_PSAnaSmooth.h"
+#include "Converter_PSPicCols.h"
+#include "Converter_PSPicRows.h"
+#include "Converter_PSPicRect.h"
 
 using namespace srw;
 
@@ -112,6 +115,9 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         { g_Converter_PSAnaRefine,    sizeof(g_Converter_PSAnaRefine),    &m_psRefine    },
         { g_Converter_PSAnaFill,      sizeof(g_Converter_PSAnaFill),      &m_psFill      },
         { g_Converter_PSAnaSmooth,    sizeof(g_Converter_PSAnaSmooth),    &m_psSmooth    },
+        { g_Converter_PSPicCols,      sizeof(g_Converter_PSPicCols),      &m_psPicCols   },
+        { g_Converter_PSPicRows,      sizeof(g_Converter_PSPicRows),      &m_psPicRows   },
+        { g_Converter_PSPicRect,      sizeof(g_Converter_PSPicRect),      &m_psPicRect   },
     };
     for (const auto& p : ps)
         if (SUCCEEDED(hr)) hr = device->CreatePixelShader(p.code, p.size, nullptr, p.out);
@@ -300,6 +306,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         EnsureDispTarget(m_dispF, w4,  h4);
         EnsureDispTarget(m_src4,  w4,  h4);
         EnsureDispTarget(m_src16, w16, h16);
+        EnsureDispTarget(m_picCols, w16, 1);
+        EnsureDispTarget(m_picRows, 1, h16);
+        EnsureDispTarget(m_picRect, 1, 1);
         // (A remade previous-frame target holds nothing yet.)
         if (EnsureDispTarget(m_dispPrev, w4, h4) | EnsureDispTarget(m_src4Prev, w4, h4)) m_dispPrevValid = false;
     }
@@ -363,6 +372,20 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         // The source averaged down to 1/4 and 1/16: what the passes below read.
         runDispPass(m_psDown, m_src4,  nullptr, source);
         runDispPass(m_psDown, m_src16, nullptr, m_src4.srv);
+        // Where the 3D picture is (PSPicRect): bound at t10 for the recovery
+        // passes below and the compose (released after it).
+        if (m_psPicCols && m_psPicRows && m_psPicRect && m_picCols.rtv && m_picRows.rtv && m_picRect.rtv)
+        {
+            uploadCB((float)w16, (float)h16);
+            runDispPass(m_psPicCols, m_picCols, nullptr, m_src16.srv);
+            runDispPass(m_psPicRows, m_picRows, nullptr, m_src16.srv);
+            ID3D11ShaderResourceView* profs[2] = { m_picCols.srv, m_picRows.srv };
+            ID3D11ShaderResourceView* nul2[2] = {};
+            m_context->PSSetShaderResources(11, 2, profs);
+            runDispPass(m_psPicRect, m_picRect, nullptr, nullptr);
+            m_context->PSSetShaderResources(11, 2, nul2);
+            m_context->PSSetShaderResources(10, 1, &m_picRect.srv);
+        }
         uploadCB((float)w16, (float)h16); runDispPass(m_psCoarse, m_disp0, nullptr, m_src16.srv);   // full search 1/16
         if (tSlot >= 0) TimeMark(tSlot, 1);
         uploadCB((float)w4,  (float)h4);
@@ -424,6 +447,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
         m_context->PSSetShaderResources(0, 3, nulls);
         m_context->PSSetShaderResources(9, 1, nulls);
+        m_context->PSSetShaderResources(10, 1, nulls);   // (the picture's rectangle, from the recovery)
     }
     // (No colour-pyramid fill after it any more: see the note in
     // Converter.hlsl -- it never changed the picture. The perf log's
@@ -639,6 +663,9 @@ void Converter::ReleaseDisparity()
     ReleaseDispTarget(m_src16);
     ReleaseDispTarget(m_dispPrev);
     ReleaseDispTarget(m_src4Prev);
+    ReleaseDispTarget(m_picCols);
+    ReleaseDispTarget(m_picRows);
+    ReleaseDispTarget(m_picRect);
     m_dispPrevValid = false;
 }
 
@@ -653,6 +680,9 @@ void Converter::Shutdown()
     SAFE_RELEASE(m_psDesc);
     SAFE_RELEASE(m_psDown);
     SAFE_RELEASE(m_psSmooth);
+    SAFE_RELEASE(m_psPicCols);
+    SAFE_RELEASE(m_psPicRows);
+    SAFE_RELEASE(m_psPicRect);
     SAFE_RELEASE(m_psFill);
     SAFE_RELEASE(m_psRefine);
     SAFE_RELEASE(m_psCoarse);

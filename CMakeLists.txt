@@ -134,7 +134,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
 set(CONVERTER_ENTRIES
     VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0)
+    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSPicCols:ps_5_0 PSPicRows:ps_5_0 PSPicRect:ps_5_0)
 set(CONVERTER_SHADER_HEADERS)
 foreach(E ${CONVERTER_ENTRIES})
     string(REPLACE ":" ";" P "${E}")
