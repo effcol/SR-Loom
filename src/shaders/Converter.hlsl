@@ -416,20 +416,33 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
     float  y0 = anaChanL(c0) + anaChanR(c0);       // both views' channels: luminance proxy
     float2 myConf = dispTex.SampleLevel(samp, uv, 0.0).ba;   // per-eye confidence (.b left, .a right)
 
-    float2 acc = 0; float wsum = 0;
+    // Weighted median (medoid) of the 5x5, not a weighted mean: the result is
+    // one of the neighbours' actual disparities -- the one that agrees best
+    // with the rest. A mean blended a near object's disparity with the
+    // background's at every edge (a value belonging to neither), and dragged
+    // a correct value toward wrong neighbours; on real stereo pairs that is
+    // where ~9% of the blob pixels, right until here, were lost.
+    float2 nds[25]; float nws[25];
     const int R = 2;
     [unroll] for (int dy = -R; dy <= R; ++dy)
     [unroll] for (int dx = -R; dx <= R; ++dx)
     {
+        const int idx = (dy + R) * 5 + (dx + R);
         float2 nuv = uv + float2((float)dx * tx, (float)dy * ty);
         float4 nd  = dispTex.SampleLevel(samp, nuv, 0.0);
         float3 nc  = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
         float  ws  = exp(-(float)(dx * dx + dy * dy) / 8.0);   // spatial
         float  wl  = exp(-abs(y0 - (anaChanL(nc) + anaChanR(nc))) * 6.0);      // luminance (edge-aware)
-        float  w   = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
-        acc += nd.rg * w; wsum += w;
+        nds[idx] = nd.rg; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
     }
-    float2 d = acc / max(wsum, 1e-4);
+    float2 d = nds[12]; float bestL = 1e9, bestR = 1e9;
+    [loop] for (int a = 0; a < 25; ++a)
+    {
+        float sL = 0, sR = 0;
+        [unroll] for (int b = 0; b < 25; ++b) { sL += nws[b] * abs(nds[a].x - nds[b].x); sR += nws[b] * abs(nds[a].y - nds[b].y); }
+        if (sL < bestL) { bestL = sL; d.x = nds[a].x; }
+        if (sR < bestR) { bestR = sR; d.y = nds[a].y; }
+    }
     // Video: each frame's disparity is estimated afresh and wobbles a little,
     // which showed as shimmering borrowed colour. Where this spot looks as it
     // did last frame, keep most of last frame's disparity; where it changed
@@ -670,7 +683,14 @@ float4 ConvertCore(VSOut i)
             float3 ownMask = anaFilter(float3(1, 1, 1), g_anaCombo, eye);
             float3 alignedCol = c * ownMask + there * (1.0 - ownMask);
             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
+            // (Brought to this eye's brightness -- but if that pushes a channel
+            // past full, the whole colour is scaled back rather than that channel
+            // cut off: clipping one channel changed the hue, red paint going
+            // pink or white even where the match was right.)
+            float3 scaled = alignedCol * (eyeY / aY);
+            const float peak = max(max(scaled.r, scaled.g), scaled.b);
+            if (peak > 1.0) scaled /= peak;
+            return float4(saturate(scaled), conf);
         }
 
         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,

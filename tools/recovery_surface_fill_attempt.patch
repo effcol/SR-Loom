@@ -1,0 +1,254 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4c990da..414c4d2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,7 +134,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
+ set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
+ set(CONVERTER_ENTRIES
+     VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
+-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0)
++    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSSurfInit:ps_5_0 PSSurfJump:ps_5_0 PSSurfOut:ps_5_0)
+ set(CONVERTER_SHADER_HEADERS)
+ foreach(E ${CONVERTER_ENTRIES})
+     string(REPLACE ":" ";" P "${E}")
+diff --git a/src/Converter.cpp b/src/Converter.cpp
+index d42e483..9b8fe99 100644
+--- a/src/Converter.cpp
++++ b/src/Converter.cpp
+@@ -3,6 +3,7 @@
+ #include <vector>
+ #include <cstdint>
+ #include <cstdio>
++#include <utility>
+ 
+ // The shaders, compiled at build time (shaders/Converter.hlsl; see CMakeLists.txt).
+ #include "Converter_VSMain.h"
+@@ -13,6 +14,9 @@
+ #include "Converter_PSAnaRefine.h"
+ #include "Converter_PSAnaFill.h"
+ #include "Converter_PSAnaSmooth.h"
++#include "Converter_PSSurfInit.h"
++#include "Converter_PSSurfJump.h"
++#include "Converter_PSSurfOut.h"
+ 
+ using namespace srw;
+ 
+@@ -112,6 +116,9 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
+         { g_Converter_PSAnaRefine,    sizeof(g_Converter_PSAnaRefine),    &m_psRefine    },
+         { g_Converter_PSAnaFill,      sizeof(g_Converter_PSAnaFill),      &m_psFill      },
+         { g_Converter_PSAnaSmooth,    sizeof(g_Converter_PSAnaSmooth),    &m_psSmooth    },
++        { g_Converter_PSSurfInit,     sizeof(g_Converter_PSSurfInit),     &m_psSurfInit  },
++        { g_Converter_PSSurfJump,     sizeof(g_Converter_PSSurfJump),     &m_psSurfJump  },
++        { g_Converter_PSSurfOut,      sizeof(g_Converter_PSSurfOut),      &m_psSurfOut   },
+     };
+     for (const auto& p : ps)
+         if (SUCCEEDED(hr)) hr = device->CreatePixelShader(p.code, p.size, nullptr, p.out);
+@@ -396,6 +403,26 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
+             m_context->PSSetShaderResources(7, 2, prev);
+             runDispPass(m_psSmooth, m_dispF, m_disp2.srv, m_src4.srv);
+             m_context->PSSetShaderResources(7, 2, nuls);
++            // Surface fill: trustworthy matches spread across their own plain
++            // surfaces (see PSSurfInit) -- jump flooding, strides 32..1.
++            if (m_surfaceFill && m_psSurfInit && m_psSurfJump && m_psSurfOut &&
++                (EnsureDispTarget(m_surfA, w4, h4), m_surfA.rtv) && (EnsureDispTarget(m_surfB, w4, h4), m_surfB.rtv))
++            {
++                uploadCB((float)w4, (float)h4);
++                runDispPass(m_psSurfInit, m_surfA, m_dispF.srv, m_src4.srv);
++                DispTarget* cur = &m_surfA; DispTarget* nxt = &m_surfB;
++                for (int s = 32; s >= 1; s /= 2)
++                {
++                    uploadCB((float)w4, (float)h4, (float)s);
++                    runDispPass(m_psSurfJump, *nxt, cur->srv, m_src4.srv);
++                    std::swap(cur, nxt);
++                }
++                uploadCB((float)w4, (float)h4);
++                m_context->PSSetShaderResources(7, 1, &m_dispF.srv);   // (the confidence to carry through)
++                runDispPass(m_psSurfOut, m_disp1, cur->srv, m_src4.srv);
++                m_context->PSSetShaderResources(7, 1, nuls);
++                m_context->CopyResource(m_dispF.tex, m_disp1.tex);
++            }
+             // Keep this frame's for the next one.
+             if (m_dispPrev.tex && m_src4Prev.tex)
+             {
+@@ -639,6 +666,8 @@ void Converter::ReleaseDisparity()
+     ReleaseDispTarget(m_src16);
+     ReleaseDispTarget(m_dispPrev);
+     ReleaseDispTarget(m_src4Prev);
++    ReleaseDispTarget(m_surfA);
++    ReleaseDispTarget(m_surfB);
+     m_dispPrevValid = false;
+ }
+ 
+@@ -653,6 +682,9 @@ void Converter::Shutdown()
+     SAFE_RELEASE(m_psDesc);
+     SAFE_RELEASE(m_psDown);
+     SAFE_RELEASE(m_psSmooth);
++    SAFE_RELEASE(m_psSurfInit);
++    SAFE_RELEASE(m_psSurfJump);
++    SAFE_RELEASE(m_psSurfOut);
+     SAFE_RELEASE(m_psFill);
+     SAFE_RELEASE(m_psRefine);
+     SAFE_RELEASE(m_psCoarse);
+diff --git a/src/Converter.h b/src/Converter.h
+index 8413388..7186eb2 100644
+--- a/src/Converter.h
++++ b/src/Converter.h
+@@ -116,6 +116,12 @@ namespace srw
+         DispTarget m_src16;   // ... and 16x (the coarse search)
+         DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
+         DispTarget m_src4Prev;   // last frame's 1/4 source (to see what changed)
++        // Surface fill (PSSurfInit/Jump/Out): jump-flooding state, ping-ponged.
++        DispTarget m_surfA, m_surfB;
++        ID3D11PixelShader* m_psSurfInit = nullptr;
++        ID3D11PixelShader* m_psSurfJump = nullptr;
++        ID3D11PixelShader* m_psSurfOut  = nullptr;
++        bool m_surfaceFill = true;   // (SetSurfaceFill: off for comparison)
+         bool       m_dispPrevValid = false;
+         ID3D11PixelShader* m_psDown = nullptr;   // 4x box downsample
+         // Packed gradient descriptors at the refine level (PSAnaDesc): 4 x uint4.
+@@ -143,6 +149,7 @@ namespace srw
+         // Diagnostics (tools/anatest): the recovery's disparity map after a stage
+         // -- 0 coarse search, 1 refine, 2 occlusion fill, 3 smoothing (what the
+         // compose reads) -- or null.
++        void SetSurfaceFill(bool on) { m_surfaceFill = on; }   // (diagnostics / comparison)
+         ID3D11ShaderResourceView* DebugStageSRV(int stage) const
+         {
+             const DispTarget* t[4] = { &m_disp0, &m_disp1, &m_disp2, &m_dispF };
+diff --git a/src/shaders/Converter.hlsl b/src/shaders/Converter.hlsl
+index 1874411..9ffecba 100644
+--- a/src/shaders/Converter.hlsl
++++ b/src/shaders/Converter.hlsl
+@@ -416,20 +416,33 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
+     float  y0 = anaChanL(c0) + anaChanR(c0);       // both views' channels: luminance proxy
+     float2 myConf = dispTex.SampleLevel(samp, uv, 0.0).ba;   // per-eye confidence (.b left, .a right)
+ 
+-    float2 acc = 0; float wsum = 0;
++    // Weighted median (medoid) of the 5x5, not a weighted mean: the result is
++    // one of the neighbours' actual disparities -- the one that agrees best
++    // with the rest. A mean blended a near object's disparity with the
++    // background's at every edge (a value belonging to neither), and dragged
++    // a correct value toward wrong neighbours; on real stereo pairs that is
++    // where ~9% of the blob pixels, right until here, were lost.
++    float2 nds[25]; float nws[25];
+     const int R = 2;
+     [unroll] for (int dy = -R; dy <= R; ++dy)
+     [unroll] for (int dx = -R; dx <= R; ++dx)
+     {
++        const int idx = (dy + R) * 5 + (dx + R);
+         float2 nuv = uv + float2((float)dx * tx, (float)dy * ty);
+         float4 nd  = dispTex.SampleLevel(samp, nuv, 0.0);
+         float3 nc  = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
+         float  ws  = exp(-(float)(dx * dx + dy * dy) / 8.0);   // spatial
+         float  wl  = exp(-abs(y0 - (anaChanL(nc) + anaChanR(nc))) * 6.0);      // luminance (edge-aware)
+-        float  w   = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
+-        acc += nd.rg * w; wsum += w;
++        nds[idx] = nd.rg; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
++    }
++    float2 d = nds[12]; float bestL = 1e9, bestR = 1e9;
++    [loop] for (int a = 0; a < 25; ++a)
++    {
++        float sL = 0, sR = 0;
++        [unroll] for (int b = 0; b < 25; ++b) { sL += nws[b] * abs(nds[a].x - nds[b].x); sR += nws[b] * abs(nds[a].y - nds[b].y); }
++        if (sL < bestL) { bestL = sL; d.x = nds[a].x; }
++        if (sR < bestR) { bestR = sR; d.y = nds[a].y; }
+     }
+-    float2 d = acc / max(wsum, 1e-4);
+     // Video: each frame's disparity is estimated afresh and wobbles a little,
+     // which showed as shimmering borrowed colour. Where this spot looks as it
+     // did last frame, keep most of last frame's disparity; where it changed
+@@ -443,6 +456,79 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
+     }
+     return float4(d, myConf.x, myConf.y);
+ }
++
++// ----- Surface fill (anaglyph recovery) ------------------------------------
++// Inside a plain surface -- red paint, a wall -- there is nothing to match:
++// one view's channel is blank there, and every candidate is a guess. The
++// surface's OUTLINE shows in both views, though, and matches well. So (after
++// SIRA's "one disparity per segment"): pixels whose own match is trustworthy
++// are anchors -- structure on both sides of the match, the two eyes agreeing,
++// a unique winner -- and every other pixel takes its disparity from the
++// nearest anchor, "nearest" counting the colour change crossed on the way
++// (a geodesic distance). A plain surface is reached from its own outline,
++// never across an edge into another object. Jump flooding: strides 32..1
++// texels, 9 neighbours each, so a large surface fills in six passes.
++// State: .x/.y disparity (left/right eye), .z/.w each one's cost (distance).
++
++float surfStructure(float2 uv, float tx, bool rightView)
++{
++    const float3 a = srcTex.SampleLevel(samp, uv - float2(tx, 0), 0).rgb, b = srcTex.SampleLevel(samp, uv + float2(tx, 0), 0).rgb;
++    const float3 c = srcTex.SampleLevel(samp, uv - float2(0, tx), 0).rgb, d = srcTex.SampleLevel(samp, uv + float2(0, tx), 0).rgb;
++    return rightView ? abs(anaChanR(a) - anaChanR(b)) + abs(anaChanR(c) - anaChanR(d))
++                     : abs(anaChanL(a) - anaChanL(b)) + abs(anaChanL(c) - anaChanL(d));
++}
++// dispTex: the smoothed disparity (.rg) and confidence (.ba); srcTex: 1/4 anaglyph.
++float4 PSSurfInit(VSOut i) : SV_Target
++{
++    const float2 uv = i.uv;
++    const float tx = 1.0 / max(g_coarseW, 1.0);
++    const float4 d = dispTex.SampleLevel(samp, uv, 0.0);
++    // Evidence per eye: structure here in this eye's channel AND at the
++    // matched spot in the other's, times the match's own confidence.
++    const float eL = saturate(surfStructure(uv, tx, false) / 0.03) * saturate(surfStructure(uv + float2(d.r, 0), tx, true) / 0.03) * d.b;
++    const float eR = saturate(surfStructure(uv, tx, true) / 0.03) * saturate(surfStructure(uv + float2(d.g, 0), tx, false) / 0.03) * d.a;
++    return float4(d.rg, (1.0 - eL) * 1.0, (1.0 - eR) * 1.0);
++}
++// One jump pass, stride g_propStride texels. dispTex: the state.
++float4 PSSurfJump(VSOut i) : SV_Target
++{
++    const float2 uv = i.uv;
++    const float2 t = float2(1.0 / max(g_coarseW, 1.0), 1.0 / max(g_coarseH, 1.0));
++    const float s = g_propStride;
++    const float3 c0 = srcTex.SampleLevel(samp, uv, 0).rgb;
++    float4 best = dispTex.SampleLevel(samp, uv, 0.0);
++    [unroll] for (int k = 0; k < 9; ++k)
++    {
++        if (k == 4) continue;
++        const float2 o = float2(k % 3 - 1, k / 3 - 1) * s;
++        const float2 q = uv + o * t;
++        if (any(q < 0.0) || any(q > 1.0)) continue;
++        const float4 n = dispTex.SampleLevel(samp, q, 0.0);
++        // (Point-to-point colour change stands in for the path's: at the big
++        // strides it can hop over a thin line of another colour, but the
++        // small strides after it pull back to local anchors.)
++        const float3 cq = srcTex.SampleLevel(samp, q, 0).rgb;
++        const float step = dot(abs(cq - c0), float3(1, 1, 1)) * 6.0 + length(o) * 0.005;
++        if (n.z + step < best.z) { best.x = n.x; best.z = n.z + step; }
++        if (n.w + step < best.w) { best.y = n.y; best.w = n.w + step; }
++    }
++    return best;
++}
++// The result: the filled disparities, the original confidence. dispTex: the
++// state; srcPrevQ... (t8 unused). The confidence comes from t7 (the smoothed map).
++float4 PSSurfOut(VSOut i) : SV_Target
++{
++    // Only a pixel whose own match couldn't be checked takes the filled
++    // disparity; any match with structure behind it keeps its own (the fill
++    // is for the plain insides of surfaces, not a second opinion on edges).
++    const float2 uv = i.uv;
++    const float tx = 1.0 / max(g_coarseW, 1.0);
++    const float4 s = dispTex.SampleLevel(samp, uv, 0.0);
++    const float4 o = dispPrevTex.SampleLevel(samp, uv, 0.0);
++    const float vL = saturate(surfStructure(uv, tx, false) / 0.03) * saturate(surfStructure(uv + float2(o.r, 0), tx, true) / 0.03);
++    const float vR = saturate(surfStructure(uv, tx, true) / 0.03) * saturate(surfStructure(uv + float2(o.g, 0), tx, false) / 0.03);
++    return float4(vL >= 0.1 ? o.r : s.x, vR >= 0.1 ? o.g : s.y, o.ba);
++}
+ // (There was a push-pull colour fill here -- confidence-weighted colour
+ // pyramids filling low-confidence pixels. Its sampler never read past the
+ // finest level, so it only ever returned each pixel's own colour: the look
+@@ -670,7 +756,14 @@ float4 ConvertCore(VSOut i)
+             float3 ownMask = anaFilter(float3(1, 1, 1), g_anaCombo, eye);
+             float3 alignedCol = c * ownMask + there * (1.0 - ownMask);
+             float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
+-            return float4(saturate(alignedCol * (eyeY / aY)), conf);
++            // (Brought to this eye's brightness -- but if that pushes a channel
++            // past full, the whole colour is scaled back rather than that channel
++            // cut off: clipping one channel changed the hue, red paint going
++            // pink or white even where the match was right.)
++            float3 scaled = alignedCol * (eyeY / aY);
++            const float peak = max(max(scaled.r, scaled.g), scaled.b);
++            if (peak > 1.0) scaled /= peak;
++            return float4(saturate(scaled), conf);
+         }
+ 
+         if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
