@@ -4334,7 +4334,8 @@ namespace
         {
             if (app.fsJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
             const AppState::FsVerdict v = app.fsJob.get();
-            if (v.is3D && v.window == fs) EnterFullscreenAuto(app, fs, v.fmt, v.ana, v.eye.known && v.eye.swap, v.diag.c_str());
+            if (v.is3D && v.window == fs)   // (an anaglyph's eye order is fixed: red is the left eye)
+                EnterFullscreenAuto(app, fs, v.fmt, v.ana, v.fmt != StereoFormat::Anaglyph && v.eye.known && v.eye.swap, v.diag.c_str());
             return;
         }
         if ((LONG)(now - app.fsNextCheck) < 0) return;
@@ -4372,7 +4373,7 @@ namespace
     {
         const StereoFormat f = app.format;
         const bool layout = f == StereoFormat::FullSBS || f == StereoFormat::HalfSBS ||
-                            f == StereoFormat::FullTAB || f == StereoFormat::HalfTAB || f == StereoFormat::Anaglyph;
+                            f == StereoFormat::FullTAB || f == StereoFormat::HalfTAB;   // (not an anaglyph: red is always the left eye)
         // What's being woven (without ResolveSource: that also steps a video).
         ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0;
         if (app.source == SourceKind::TestImage)
@@ -4404,7 +4405,7 @@ namespace
         if (app.manualEyePhase == 0)
         {
             if ((LONG)(now - app.manualEyeNext) < 0) return;
-            app.analyzer.Submit(srv, w, h, f == StereoFormat::Anaglyph);   // (colour: for an anaglyph)
+            app.analyzer.Submit(srv, w, h, false);   // (SBS / TAB: luminance is enough)
             app.manualEyePhase = 1;
             return;
         }
@@ -5140,7 +5141,10 @@ namespace
             Log("Auto Stereo: anaglyph is %s, %s -> %s decode", AnaComboName(ana->combo),
                 ana->mode == 3 ? "black-and-white" : "colour", ana->mode == 3 ? "mono" : "recovered colour");
         }
-        if (eye && eye->known && app.eyeOrderDetect)
+        // (Not for an anaglyph: red is the left eye by the convention anaglyphs
+        // are made to -- the glasses fix it -- so a "detected" swap was only ever
+        // a misjudgement.)
+        if (eye && eye->known && app.eyeOrderDetect && fmt != StereoFormat::Anaglyph)
         {
             // The second half is the left eye (e.g. a cross-view SBS picture).
             r.autoSwap = eye->swap;

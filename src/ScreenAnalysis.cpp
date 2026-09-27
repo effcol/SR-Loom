@@ -1482,6 +1482,9 @@ namespace
     constexpr float kAnaMaxAligned    = 0.70f; // red/cyan edges line up worse than this unshifted ...
     constexpr float kAnaShiftGain     = 0.20f; // ... a horizontal shift improves that by this much ...
     constexpr float kAnaHorizOverVert = 0.15f; // ... and by this much more than a vertical shift (same range) does
+    constexpr float kAnaColourMaxAligned = 0.35f; // (AnaSplitByColour) red/cyan edges line up this badly or worse ...
+    constexpr float kAnaColourShiftGain  = 0.08f; // ... a horizontal shift helps at least this much ...
+    constexpr float kAnaColourAxis       = 2.0f;  // ... and the colour lies this much more along the filters' axis than across it
 
     // Anaglyph signature of two colour planes A and B over picture r (w x h):
     // mean block |correlation| of their horizontal gradients unshifted (a0),
@@ -1646,6 +1649,21 @@ namespace
                s.aH - s.a0 >= kAnaShiftGain && s.aH - s.aV >= kAnaHorizOverVert;
     }
 
+    // A second way to recognise an anaglyph (after the cues in Gallagher's
+    // anaglyph detector, Kodak US8384774 -- expired, and its claims only cover
+    // viewing glasses). A picture with big plain colour areas and little fine
+    // detail (floating cubes, flat CG) has red and cyan edges that clearly do NOT
+    // line up, yet a horizontal shift only helps a little -- too little for
+    // AnaSplit. Its colour then settles it: an anaglyph's colour lies along the
+    // two filters' axis (red vs cyan) far more than across it (green vs blue),
+    // while an ordinary photo whose red and cyan edges line up this badly
+    // doesn't exist (every 2D photo tested lines up at 0.77+).
+    bool AnaSplitByColour(const AnaSig& s, float axis)
+    {
+        return s.blocks >= kAnaMinBlocks && s.a0 <= kAnaColourMaxAligned &&
+               s.aH - s.a0 >= kAnaColourShiftGain && s.aH >= s.aV && axis >= kAnaColourAxis;
+    }
+
     // Which anaglyph colour pair, and whether the picture under it was colour
     // or black-and-white. Each channel pair is tested: channels that carry
     // the same eye line up, different eyes need a horizontal shift. A channel
@@ -1769,26 +1787,67 @@ bool srw::ClassifyStereo(const LumaImage& img, const RECT& rIn, StereoFormat& fo
             return nc ? c / nc : 0.0;
         };
         AnaSig passSig; int passPair = 0;   // (the pair that showed it: 0 red|cyan, 1 green|magenta, 2 amber|blue)
-        auto tryPair = [&](const uint8_t* A, const uint8_t* B) {
-            if (chromaOf(A, B) < kAnaMinChroma) return false;
+        // X, Y: the two channels making up the pair's mixed plane (cyan = green
+        // + blue ...), for AnaSplitByColour's "colour across the axis"; null
+        // without colour planes.
+        auto tryPair = [&](const uint8_t* A, const uint8_t* B, const uint8_t* X, const uint8_t* Y) {
+            const double along = chromaOf(A, B);
+            if (along < kAnaMinChroma) return false;
             const AnaSig s = AnaSignature(A, B, W, r, w, h);
-            if (aBlocks == 0 || AnaSplit(s)) { a0 = s.a0; aH = s.aH; aV = s.aV; aBlocks = s.blocks; passSig = s; }
-            return AnaSplit(s);
+            const float axis = (X && Y) ? (float)(along / (std::max)(chromaOf(X, Y), 1.0)) : 0.0f;
+            const bool split = AnaSplit(s) || AnaSplitByColour(s, axis);
+            if (aBlocks == 0 || split) { a0 = s.a0; aH = s.aH; aV = s.aV; aBlocks = s.blocks; passSig = s; }
+            return split;
         };
-        ana = tryPair(img.red.data(), img.cyan.data());
+        ana = tryPair(img.red.data(), img.cyan.data(), rgb ? img.green.data() : nullptr, rgb ? img.blue.data() : nullptr);
         if (!ana && rgb)
         {
             // (Planes made on the spot: green vs magenta, amber vs blue.)
             const size_t n = img.pixels.size();
             std::vector<uint8_t> P(n), Q(n);
             for (size_t i = 0; i < n; ++i) P[i] = (uint8_t)((img.red[i] + img.blue[i] + 1) >> 1);
-            ana = tryPair(img.green.data(), P.data());
+            ana = tryPair(img.green.data(), P.data(), img.red.data(), img.blue.data());
             if (ana) passPair = 1;
             if (!ana)
             {
                 for (size_t i = 0; i < n; ++i) Q[i] = (uint8_t)((img.red[i] + img.green[i] + 1) >> 1);
-                ana = tryPair(Q.data(), img.blue.data());
+                ana = tryPair(Q.data(), img.blue.data(), img.red.data(), img.green.data());
                 if (ana) passPair = 2;
+            }
+        }
+        // A large picture: the test above works in 32 px blocks and shifts of up
+        // to 32 px, tuned for pictures a few hundred px across -- on a big one
+        // the eyes' offsets outgrow the search and the blocks hold too little.
+        // So (red|cyan) again on the picture shrunk 2x, and 4x if still large.
+        for (int sc = 2; !ana && rgb && w / sc >= 240 && sc <= 4; sc *= 2)
+        {
+            const int w2 = w / sc, h2 = h / sc;
+            if (h2 < 64) break;
+            std::vector<uint8_t> R2((size_t)w2 * h2), C2(R2.size()), G2(R2.size()), B2(R2.size());
+            double along = 0, across = 0;
+            for (int y = 0; y < h2; ++y)
+                for (int x = 0; x < w2; ++x)
+                {
+                    int sr = 0, sg = 0, sb = 0;
+                    for (int yy = 0; yy < sc; ++yy)
+                        for (int xx = 0; xx < sc; ++xx)
+                        {
+                            const size_t i = (size_t)(r.top + y * sc + yy) * W + r.left + x * sc + xx;
+                            sr += img.red[i]; sg += img.green[i]; sb += img.blue[i];
+                        }
+                    const int n2 = sc * sc; const size_t o = (size_t)y * w2 + x;
+                    R2[o] = (uint8_t)(sr / n2); G2[o] = (uint8_t)(sg / n2); B2[o] = (uint8_t)(sb / n2); C2[o] = (uint8_t)((G2[o] + B2[o] + 1) >> 1);
+                    along += std::abs((int)R2[o] - (int)C2[o]); across += std::abs((int)G2[o] - (int)B2[o]);
+                }
+            if (along / R2.size() < kAnaMinChroma) break;
+            const RECT r2{ 0, 0, w2, h2 };
+            const AnaSig s = AnaSignature(R2.data(), C2.data(), (size_t)w2, r2, w2, h2);
+            if (AnaSplit(s) || AnaSplitByColour(s, (float)(along / (std::max)(across, 1.0))))
+            {
+                ana = true; passPair = 0; passSig = s;
+                // (Its offsets are at the shrunk scale: back to the picture's.)
+                passSig.medDx *= sc; passSig.topDx *= sc; passSig.botDx *= sc;
+                a0 = s.a0; aH = s.aH; aV = s.aV; aBlocks = s.blocks;
             }
         }
         if (ana)
@@ -2071,6 +2130,59 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
         });
     };
     judgeAll(0);
+    // Twins: an SBS (TAB) picture whose scene has a strip of the page's own
+    // colour at one edge -- a white sky on a white page -- has that strip in
+    // BOTH eyes: at the picture's outer edge, where it passes for page, and
+    // between the eyes, where it passes for a gap between two pictures. So it
+    // was found as two separate pictures, neither of them 3D (or, with the
+    // strip at the outer edge only, as one box cut short on that side, its
+    // eyes split in the wrong place). Two same-size pictures side by side
+    // (stacked) a small gap apart are tried as one: the second eye starts one
+    // eye-width after the first, so the box is widened by the gap on the
+    // outside -- whichever end the strip is really at, the eyes line up
+    // exactly. Kept only if it IS side-by-side (top-and-bottom) stereo.
+    const size_t twinFrom = jobs.size();
+    std::vector<char> twinVert;
+    auto fillsWindow = [](const RECT& t, const RECT& b) {
+        return t.left <= b.left + 4 && t.top <= b.top + 4 && t.right >= b.right - 4 && t.bottom >= b.bottom - 4;
+    };
+    for (size_t a = 0; a < twinFrom; ++a)
+        for (size_t c = 0; c < twinFrom; ++c)
+        {
+            const Job& A = jobs[a]; const Job& B = jobs[c];
+            if (a == c || A.win < 0 || A.win != B.win || A.st || B.st || A.whole || B.whole) continue;
+            const RECT& ra = A.rect; const RECT& rb = B.rect;
+            const RECT wb = windows[A.win].bounds;
+            const int wa = ra.right - ra.left, ha = ra.bottom - ra.top, wB = rb.right - rb.left, hB = rb.bottom - rb.top;
+            if (std::abs(ra.top - rb.top) <= 3 && std::abs(ra.bottom - rb.bottom) <= 3 && std::abs(wa - wB) <= (std::max)(4, wa / 50) &&
+                rb.left >= ra.right && rb.left - ra.right <= wa * 35 / 100)
+            {
+                const int eye = rb.left - ra.left;
+                RECT t{ ra.left, (std::min)(ra.top, rb.top), ra.left + 2 * eye, (std::max)(ra.bottom, rb.bottom) };
+                if (t.right > wb.right) t = { rb.right - 2 * eye, t.top, rb.right, t.bottom };   // (the strip at the other end)
+                if (t.left < wb.left) continue;
+                if (fillsWindow(t, wb)) continue;   // (a player filled by its video: the whole-viewport check below)
+                jobs.push_back({ A.win, t, false, -1 }); twinVert.push_back(0);
+            }
+            if (std::abs(ra.left - rb.left) <= 3 && std::abs(ra.right - rb.right) <= 3 && std::abs(ha - hB) <= (std::max)(4, ha / 50) &&
+                rb.top >= ra.bottom && rb.top - ra.bottom <= ha * 35 / 100)
+            {
+                const int eye = rb.top - ra.top;
+                RECT t{ (std::min)(ra.left, rb.left), ra.top, (std::max)(ra.right, rb.right), ra.top + 2 * eye };
+                if (t.bottom > wb.bottom) t = { t.left, rb.bottom - 2 * eye, t.right, rb.bottom };
+                if (t.top < wb.top) continue;
+                if (fillsWindow(t, wb)) continue;
+                jobs.push_back({ A.win, t, false, -1 }); twinVert.push_back(1);
+            }
+        }
+    judgeAll(twinFrom);
+    for (size_t t = twinFrom; t < jobs.size(); ++t)
+    {
+        Job& j = jobs[t];
+        const bool sbs = j.fmt == StereoFormat::FullSBS || j.fmt == StereoFormat::HalfSBS;
+        const bool tab = j.fmt == StereoFormat::FullTAB || j.fmt == StereoFormat::HalfTAB;
+        if (j.st && !(twinVert[t - twinFrom] ? tab : sbs)) j.st = false;
+    }
     // Whole viewports of windows where nothing inside was 3D.
     std::vector<char> winHit(windows.size(), 0);
     for (const Job& j : jobs) if (j.win >= 0 && j.st) winHit[j.win] = 1;
