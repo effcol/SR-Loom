@@ -10,6 +10,16 @@
 #include "Capture.h"
 #include "CaptureDXGI.h"
 #include "Converter.h"
+#include "RegionWeave.h"
+#include "ScreenAnalysis.h"
+#include "GpuTrack.h"
+#include <map>
+#include <deque>
+#include <future>
+#include <unordered_map>
+#include <atomic>
+#include <thread>
+#include <mutex>
 #include "Detector.h"
 #include "Gui.h"
 #include "Settings.h"
@@ -25,6 +35,7 @@
 
 #include <shellscalingapi.h>
 #include <dwmapi.h>
+#include <timeapi.h>   // timeBeginPeriod
 #include <commdlg.h>
 #include <windowsx.h>
 #include <shellapi.h>      // DragAcceptFiles, DragQueryFile, DragFinish
@@ -34,6 +45,7 @@
 #include <algorithm>
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "winmm.lib")   // timeBeginPeriod
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "advapi32.lib")  // RegOpenKeyEx / RegCreateKeyEx / RegSetValueEx
 
@@ -97,7 +109,106 @@ namespace
     constexpr int   kHotkeyCapture   = 3;   // Ctrl+Alt+C : make active window 3D
     constexpr int   kHotkeyDetect    = 5;   // Ctrl+Alt+D : auto-detect stereo format
     constexpr int   kHotkeyCalibrate = 6;   // Ctrl+Alt+R : recenter head tracking
+    constexpr int   kHotkeyAutoRegion = 7;  // Ctrl+Alt+A : Auto Stereo -- toggle region under cursor
+    constexpr int   kHotkeyAutoRegionDbg = 8; // Ctrl+Alt+Shift+A : same, and save what the finder saw (debug)
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
+
+    // Hitch watchdog: time a section of the render thread and log it when it
+    // takes too long (a frame of ~6 ms at 160 Hz; 20 ms+ is a visible hitch).
+    struct HitchWatch
+    {
+        const char* what;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        double cpu0 = ThreadCpuMs();
+        explicit HitchWatch(const char* w) : what(w) {}
+        ~HitchWatch()
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (ms > 20.0) Log("Hitch: %s took %.1f ms (running %.1f ms of it)", what, ms, ThreadCpuMs() - cpu0);
+        }
+    };
+
+    // GPU timestamps around each loop's work, for the frame profile: how long
+    // the GPU spends on our part (capture copy, analysis, tracking, crops,
+    // conversions), the SR weave, and the mask + present. A ring of query
+    // sets, read back a few frames later without ever stalling.
+    struct GpuFrameTimer
+    {
+        // Timestamps, in frame order. Any not reached in a frame (e.g. the
+        // Auto Stereo ones in other modes) are stamped at End (zero length).
+        enum Mark { kStart, kCapture, kAnalysis, kTracking, kOurs, kWeave, kMask, kEnd, kCount };
+        static constexpr int kRing = 6;
+        struct Set { ID3D11Query* disjoint = nullptr; ID3D11Query* ts[kCount] = {}; bool pending = false; };
+        Set                  sets[kRing];
+        int                  cur = 0;
+        bool                 active = false;   // this frame is being timed
+        bool                 marked[kCount] = {};
+        ID3D11DeviceContext* ctx = nullptr;
+        double               seg[kCount] = {}; // seg[i] = ts[i] - ts[i-1], summed
+        int                  n = 0;
+
+        bool Init(ID3D11Device* dev, ID3D11DeviceContext* c)
+        {
+            ctx = c;
+            D3D11_QUERY_DESC dj{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+            D3D11_QUERY_DESC ts{ D3D11_QUERY_TIMESTAMP, 0 };
+            for (Set& s : sets)
+            {
+                if (FAILED(dev->CreateQuery(&dj, &s.disjoint))) return false;
+                for (auto& q : s.ts) if (FAILED(dev->CreateQuery(&ts, &q))) return false;
+            }
+            return true;
+        }
+        void Begin()
+        {
+            Collect();
+            if (active) { ctx->End(sets[cur].disjoint); active = false; }   // last frame bailed out early: drop it
+            Set& s = sets[cur];
+            active = ctx && s.disjoint && !s.pending;
+            if (!active) return;
+            for (bool& m : marked) m = false;
+            ctx->Begin(s.disjoint);
+            Stamp(kStart);
+        }
+        void Stamp(int i)
+        {
+            if (!active || marked[i]) return;
+            // Earlier marks this frame skipped get the same moment (zero length).
+            for (int k = 0; k < i; ++k) if (!marked[k]) { ctx->End(sets[cur].ts[k]); marked[k] = true; }
+            ctx->End(sets[cur].ts[i]);
+            marked[i] = true;
+        }
+        void End()
+        {
+            if (!active) return;
+            Stamp(kEnd);
+            ctx->End(sets[cur].disjoint);
+            sets[cur].pending = true;
+            cur = (cur + 1) % kRing;
+            active = false;
+        }
+        void Collect()
+        {
+            for (Set& s : sets)
+            {
+                if (!s.pending) continue;
+                D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+                if (ctx->GetData(s.disjoint, &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+                UINT64 t[kCount] = {};
+                bool ok = true;
+                for (int i = 0; i < kCount && ok; ++i)
+                    ok = ctx->GetData(s.ts[i], &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+                if (!ok) continue;
+                s.pending = false;
+                if (dj.Disjoint || dj.Frequency == 0) continue;
+                const double k = 1000.0 / (double)dj.Frequency;
+                for (int i = 1; i < kCount; ++i) seg[i] += (double)(t[i] - t[i - 1]) * k;
+                ++n;
+            }
+        }
+        double Avg(int i) const { return n ? seg[i] / n : 0.0; }
+        void Reset() { for (double& v : seg) v = 0; n = 0; }
+    };
 
     struct AppState
     {
@@ -108,6 +219,89 @@ namespace
         Capture      capture;        // WGC: default; only API that can do per-window + window-exclusion
         CaptureDXGI  captureDxgi;    // Output Duplication fallback for exclusive-fullscreen sources
         Converter    converter;
+        // Auto Stereo (region weaving). While autoStereo is on, the weave
+        // window covers the SR display (Fullscreen mode, click-through) but
+        // is clipped to the regions in regionWeaver; each region is converted
+        // with its own format into a composite that the weaver weaves.
+        // Stage 1 (foundation): regions are added by hand with Ctrl+Alt+A
+        // (the window under the cursor, in the current format) and follow
+        // that window. Detection of image regions / 3D formats comes next.
+        RegionWeaver regionWeaver;
+        bool         autoStereo      = false;
+        bool         regionsDirty    = false;   // region set/rects changed -> rebuild + re-clip
+        bool         autoStereoLensOn = false;  // lens hint state while in Auto Stereo
+        // Screen analysis (half-res luma readback) + per-region content
+        // trackers. The analyser only runs while a pick is pending or a
+        // content-tracked region exists.
+        ScreenAnalyzer               analyzer;
+        LumaImage                    analysisImg;
+        std::map<int, RegionTracker> regionTrackers;   // region id -> tracker
+        // Ctrl+Alt+A "pick": find the image under this point on the next
+        // analysed frame (falls back to the whole window if none / timeout).
+        bool         pickPending   = false;
+        POINT        pickPoint{};
+        HWND         pickWindow    = nullptr;
+        DWORD        pickStartMs   = 0;
+        StereoFormat pickFormat    = StereoFormat::HalfSBS;
+        bool         pickDebug     = false;   // Ctrl+Alt+Shift+A: also save what the finder saw
+        // Per-region window bookkeeping: the windows above each region's
+        // host (cut out of the weave -- never weave over a window that's in
+        // front), and when to try re-growing an image a window was covering.
+        std::map<int, std::vector<RECT>> regionOcc;     // region id -> screen rects in front of it
+        std::map<int, uint64_t>          regionOccSig;  // region id -> layout signature
+        std::map<int, long long>         regionOccArea; // region id -> covered area (px)
+        std::map<int, DWORD>             regrowAt;      // content region id -> when to try
+        std::map<int, POINT>             regionViewPos; // content region id -> its viewport's top-left at the last track (analysis px)
+        // Background image-rectangle searches per content region (see
+        // LaunchAsyncFind / PollAsyncFinds).
+        struct AsyncFind
+        {
+            bool regrow = false;
+            RECT old{};
+            std::shared_ptr<LumaImage> img;
+            std::future<std::pair<bool, RECT>> fut;
+        };
+        std::map<int, AsyncFind> asyncFinds;
+        std::map<int, std::deque<std::pair<int64_t, RECT>>> regionAnchorHist;   // region id -> (QPC 100 ns, anchor screen rect)
+        // Auto-detect (the panel's "Auto Stereo" button): a background
+        // scanner looks for stereo images on the SR display every
+        // kScanIntervalMs and weaves them itself. A find is only woven when
+        // the next scan agrees (same place, same format); woven auto regions
+        // are re-checked each scan and dropped after 3 misses. Everything
+        // stays in memory; nothing is saved.
+        bool                         autoDetect     = false;
+        StereoScanner                scanner;
+        DWORD                        lastScanMs     = 0;
+        bool                         scanWantColour = false;   // next analysed frame carries colour
+        bool                         screenChangedSinceScan = true;
+        std::vector<ScanHit>         scanPending;              // found once, awaiting confirmation
+        std::map<int, int>           autoMisses;               // auto region id -> scans not seen as 3D
+        std::map<int, RegionTracker> suppressed;               // auto finds the user removed
+        std::vector<HWND>            suppressedWindows;        // whole-window finds the user removed
+        int                          nextSuppressId = 1;
+        size_t                       lastScanLogKey = 0;       // log a scan only when its result changes
+        bool                         analysisWaitNewest = false; // this frame: wait for its own analysis
+        double                       autoTimeAnalysisMs = 0;   // frame profile (below)
+        bool                         paceOnCapture = false;    // this loop is paced by capture frames, not DwmFlush
+        // GPU scroll tracking (DirectComposition presenter only): content
+        // pictures are positioned on the GPU each frame; see GpuTrack.h.
+        GpuTracker                   gpuTracker;
+        bool                         gpuTracking = false;
+        // Frame profile, logged every 5 s while weaving: where each loop's
+        // time goes (for tuning latency / dropped frames), in every mode.
+        struct FrameProfile
+        {
+            std::chrono::steady_clock::time_point t0{}, tWait{};
+            double wait = 0, work = 0, weave = 0, present = 0, total = 0, analysis = 0, worst = 0;
+            double gui = 0, outside = 0;                     // panel drawing; all time outside the weave
+            std::chrono::steady_clock::time_point lastEnd{}; // end of the previous weave
+            int    loops = 0, frames = 0;
+            DWORD  last = 0;
+        } prof;
+        GpuFrameTimer                gpuTimer;   // GPU side of the frame profile
+        int                          lateLatchingApplied = -1;   // SR weaver late latching as set (-1 unknown)
+        bool                         diagSkipWeave = false;      // diagnostics: no SR weave call
+        bool                         perfLog = true;             // frame / GPU timing lines (Settings::ReadPerfLog)
         Detector     detector;
         Gui          gui;
         VideoSource  video;          // active video file source (mp4/mov/etc), if any
@@ -176,12 +370,20 @@ namespace
         // Game Bar, Alt+Tab...). taskbarCutActive = any cut-out is applied.
         bool                  taskbarCutActive = false;
         std::vector<RECT>     weaveCuts;
+        std::vector<int>      weaveCutRad;          // corner radius per hole (rounded windows)
         RECT                  taskbarCutWindow{};   // our window rect the cuts were made for
         // System-UI rects recently seen above the weave, with the time last
         // seen. A hole lingers ~200ms after its window goes: the capture runs
         // a frame or two behind, so closing the hole instantly would weave a
         // ghost of e.g. the Start menu's last position (the "trail").
-        std::vector<std::pair<RECT, DWORD>> recentUiCuts;
+        struct LingerCut { RECT r; DWORD t; int rad; };
+        std::vector<LingerCut> recentUiCuts;
+        // 2D windows / windows in front of Auto Stereo pictures: where they were
+        // recently (QPC 100 ns timestamps), to cut them where the displayed
+        // capture still shows them (see UpdateTaskbarCutout).
+        struct TimedCuts { int64_t t = 0; std::vector<RECT> r; std::vector<int> rad; };
+        std::map<HWND, std::deque<TimedCuts>> keepHistory;
+        std::deque<TimedCuts>  occHistory;
         DWORD                 lastFullscreenPollMs = 0;
         // WinEventHook handle for EVENT_SYSTEM_FOREGROUND. Posts back to
         // the main window via WM_APP_FOREGROUND_CHANGED with the new HWND
@@ -325,6 +527,7 @@ namespace
         HWND       lastForeground = nullptr; // last real foreground window (for "make active window 3D")
         bool       loupeInteractive = false; // looking glass: currently grabbable (not click-through)
         bool       loupeDragging  = false;   // looking glass: in a move/resize loop
+        struct { bool active = false; int hit = 0; POINT start{}; RECT startRect{}; } loupeDrag;   // our own move/resize
         bool       loupeActive    = false;   // looking glass shown (keep its position across re-applies)
         // Last Looking Glass window rect, saved whenever we leave it (e.g. to
         // Fullscreen) so coming back restores the exact position + size.
@@ -1387,7 +1590,13 @@ namespace
     }
 
     void UpdateTaskbarCutout(AppState& app, bool force);   // fwd decl (defined below)
+    RECT FrameToScreen(const AppState& app, const RECT& f); // fwd decl (Auto Stereo, below)
+    bool IsKeep2DWindow(const AppState& app, HWND h);       // fwd decl (below)
+    bool VisibleFrameRect(HWND h, RECT& r);                 // fwd decl (below)
+    void SetAutoDetect(AppState& app, bool on);             // fwd decl (Auto Stereo, below)
+    void EndLoupeOwnDrag(AppState& app);                    // fwd decl (below)
     void ApplyMode(AppState& app);                         // fwd decl (defined below)
+    void EndAutoStereo(AppState& app, const char* why);    // fwd decl (defined below)
 
     // Native title bar (Looking Glass / Windowed) in Windows' light/dark app
     // mode, with ONE fixed caption colour for active and inactive. Without a
@@ -1453,6 +1662,9 @@ namespace
             app.modeApplyDeferred = true;
             return;
         }
+        // Auto Stereo lives in the Fullscreen weave window; any other mode ends it.
+        if (app.autoStereo && app.mode != OutputMode::Fullscreen)
+            EndAutoStereo(app, "display mode changed");
         if (app.mode != OutputMode::LookingGlass)
         {
             // Leaving the Looking Glass: the window still has the loupe's
@@ -1590,6 +1802,9 @@ namespace
         // render loop shows it when the first frame arrives.
         const bool katangaArmed = (app.format == StereoFormat::Katanga &&
                                    !app.katanga.IsReceiving());
+        // (DirectComposition: the window was created without a redirection
+        // bitmap; keep that flag through every restyle.)
+        if (app.renderer.IsDComp()) exStyle |= WS_EX_NOREDIRECTIONBITMAP;
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
         SetWindowLongPtr(hwnd, GWL_STYLE, style | (katangaArmed ? 0 : WS_VISIBLE));
         // Looking Glass / Windowed use the native title bar: theme it BEFORE
@@ -1612,6 +1827,7 @@ namespace
         // stale region left over from a prior WindowOverlay session.
         if (app.mode != OutputMode::WindowOverlay)
             SetWindowRgn(hwnd, nullptr, FALSE);
+        app.renderer.SetVisibleAll();
         app.taskbarCutActive = false;   // region cleared; recomputed at the end
         UINT flags = SWP_FRAMECHANGED | (katangaArmed ? SWP_HIDEWINDOW : SWP_SHOWWINDOW);
         // The Looking Glass never needs focus when it appears (it's click-
@@ -1633,6 +1849,46 @@ namespace
     // the cursor is over its chrome (title bar / resize edges) or during a move/
     // resize — then returns to click-through. The cursor is polled directly so this
     // works even while the window is click-through.
+    void EndLoupeOwnDrag(AppState& app)
+    {
+        if (!app.loupeDrag.active) return;
+        app.loupeDrag.active = false;
+        app.loupeDragging = false;
+        if (GetCapture() == app.hwnd) ReleaseCapture();
+    }
+
+    // Our own Looking Glass move / resize (see WM_NCLBUTTONDOWN): each frame,
+    // put the window where the mouse has taken it. Runs in the render loop,
+    // so the glass keeps weaving at full rate while it's dragged.
+    void UpdateLoupeOwnDrag(AppState& app)
+    {
+        if (!app.loupeDrag.active) return;
+        if (app.mode != OutputMode::LookingGlass || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+        {
+            EndLoupeOwnDrag(app);
+            return;
+        }
+        POINT pt{};
+        GetCursorPos(&pt);
+        const int dx = pt.x - app.loupeDrag.start.x, dy = pt.y - app.loupeDrag.start.y;
+        RECT r = app.loupeDrag.startRect;
+        const int hit = app.loupeDrag.hit;
+        constexpr int kMin = 200;   // (as WM_GETMINMAXINFO)
+        if (hit == HTCAPTION) OffsetRect(&r, dx, dy);
+        else
+        {
+            if (hit == HTLEFT  || hit == HTTOPLEFT    || hit == HTBOTTOMLEFT)  r.left   = (std::min)(r.left + dx, r.right - kMin);
+            if (hit == HTRIGHT || hit == HTTOPRIGHT   || hit == HTBOTTOMRIGHT) r.right  = (std::max)(r.right + dx, r.left + kMin);
+            if (hit == HTTOP   || hit == HTTOPLEFT    || hit == HTTOPRIGHT)    r.top    = (std::min)(r.top + dy, r.bottom - kMin);
+            if (hit == HTBOTTOM|| hit == HTBOTTOMLEFT || hit == HTBOTTOMRIGHT) r.bottom = (std::max)(r.bottom + dy, r.top + kMin);
+        }
+        RECT cur{};
+        GetWindowRect(app.hwnd, &cur);
+        if (!EqualRect(&cur, &r))
+            SetWindowPos(app.hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     void UpdateLoupeInteractivity(AppState& app)
     {
         if (app.mode != OutputMode::LookingGlass || app.modeApplyDeferred) return;
@@ -1661,6 +1917,7 @@ namespace
         app.loupeInteractive = interactive;
 
         LONG_PTR ex = WS_EX_TOPMOST | WS_EX_LAYERED | (interactive ? 0 : WS_EX_TRANSPARENT);
+        if (app.renderer.IsDComp()) ex |= WS_EX_NOREDIRECTIONBITMAP;
         SetWindowLongPtr(app.hwnd, GWL_EXSTYLE, ex);
         SetLayeredWindowAttributes(app.hwnd, 0, 255, LWA_ALPHA);
         SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -2022,21 +2279,196 @@ namespace
     // unless force (after ApplyMode cleared the region). Never touches
     // WindowOverlay's rounded region: taskbarCutActive is only ever set in
     // the topmost modes.
+    // Windows 11 rounds window corners (8 px at 100% scaling); maximised /
+    // fullscreen windows are square.
+    int WindowCornerRadius(HWND h)
+    {
+        if (IsZoomed(h) || IsWindowFullscreen(h)) return 0;
+        const UINT dpi = GetDpiForWindow(h);
+        return (int)(8 * (dpi ? dpi : 96) / 96);
+    }
+
+    // What a system pop-up actually shows: shell flyouts (e.g. the tray
+    // overflow) are big transparent windows around a smaller content child,
+    // so use the union of their visible children when that's smaller.
+    RECT PopupContentRect(HWND h, const RECT& frame)
+    {
+        struct Ctx { RECT u; bool any; } ctx{ {}, false };
+        EnumChildWindows(h, [](HWND c, LPARAM lp) -> BOOL {
+            auto* x = reinterpret_cast<Ctx*>(lp);
+            if (!IsWindowVisible(c) || GetParent(c) != GetAncestor(c, GA_PARENT)) return TRUE;
+            RECT r{};
+            if (!GetWindowRect(c, &r) || IsRectEmpty(&r)) return TRUE;
+            if (!x->any) { x->u = r; x->any = true; } else UnionRect(&x->u, &x->u, &r);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        RECT out = frame;
+        if (ctx.any && IntersectRect(&out, &ctx.u, &frame)) return out;
+        return frame;
+    }
+
+    // Window watcher: a background thread that keeps a fresh snapshot of every
+    // visible top-level window in z-order (top first), with what the cut-outs
+    // need worked out per window. The render loop only reads the latest
+    // snapshot: walking the window list itself (and asking which process each
+    // window belongs to) occasionally stalled it for tens of ms.
+    struct WinInfo
+    {
+        HWND     h = nullptr;
+        RECT     frame{};            // visible frame (no invisible resize border)
+        RECT     content{};          // what a pop-up actually shows (== frame for normal windows)
+        DWORD    band = 0;           // z-band (see WindowBand)
+        LONG_PTR ex = 0;             // extended style
+        int      radius = 0;         // rounded corners (see WindowCornerRadius)
+        bool     own = false;        // one of SR Loom's windows
+        bool     gui = false;        // SR Loom's panel
+        bool     shell = false;      // Windows shell UI
+        bool     trayWnd = false;    // a taskbar
+        bool     desktop = false;    // Progman / WorkerW (the list stops here)
+        bool     keep2D = false;     // always stays 2D (panel, terminals)
+        bool     fullscreenOnSr = false;
+    };
+    struct WinSnapshot
+    {
+        std::vector<WinInfo> z;
+        int64_t              t100 = 0;   // QPC time taken, 100 ns units
+    };
+
+    class WindowWatcher
+    {
+    public:
+        ~WindowWatcher() { Stop(); }
+        void Start()
+        {
+            if (m_thread.joinable()) return;
+            m_run = true;
+            m_thread = std::thread([this] { Loop(); });
+        }
+        void Stop()
+        {
+            m_run = false;
+            if (m_thread.joinable()) m_thread.join();
+        }
+        // Only works while something needs it (a topmost weave mode).
+        void SetActive(bool on) { m_active = on; }
+        void SetContext(HWND gui, HMONITOR srMon) { m_gui = gui; m_srMon = srMon; }
+        std::shared_ptr<const WinSnapshot> Latest()
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            return m_latest;
+        }
+
+    private:
+        void Loop()
+        {
+            while (m_run)
+            {
+                if (!m_active) { Sleep(20); continue; }
+                auto snap = std::make_shared<WinSnapshot>();
+                Build(*snap);
+                {
+                    std::lock_guard<std::mutex> lk(m_mutex);
+                    m_latest = std::move(snap);
+                }
+                Sleep(1);   // (1 ms timer resolution: ~1-2 ms between snapshots)
+            }
+        }
+
+        void Build(WinSnapshot& s)
+        {
+            LARGE_INTEGER qpc{}, qpf{};
+            QueryPerformanceCounter(&qpc);
+            QueryPerformanceFrequency(&qpf);
+            s.t100 = (int64_t)((double)qpc.QuadPart * 1.0e7 / (double)qpf.QuadPart);
+            const HWND gui = m_gui.load();
+            const HMONITOR srMon = m_srMon.load();
+            s.z.reserve(128);
+            for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+            {
+                if (!IsWindowVisible(h) || IsIconic(h) || IsCloaked(h)) continue;
+                WinInfo w;
+                w.h = h;
+                Cached& c = CacheFor(h);
+                w.desktop = c.desktop;
+                if (w.desktop) { s.z.push_back(w); break; }   // the desktop: nothing below matters
+                if (!VisibleFrameRect(h, w.frame)) continue;
+                w.ex      = GetWindowLongPtr(h, GWL_EXSTYLE);
+                w.band    = WindowBand(h);
+                w.own     = c.own;
+                w.gui     = (h == gui);
+                w.shell   = c.shell;
+                w.trayWnd = c.trayWnd;
+                w.keep2D  = w.gui || c.terminal;
+                w.radius  = WindowCornerRadius(h);
+                w.content = (w.band > 1) ? PopupContentRect(h, w.frame) : w.frame;
+                w.fullscreenOnSr = srMon && MonitorFromWindow(h, MONITOR_DEFAULTTONULL) == srMon &&
+                                   IsWindowFullscreen(h);
+                s.z.push_back(w);
+            }
+            // Forget windows that no longer exist (now and then).
+            if (++m_sweep % 500 == 0)
+                for (auto it = m_cache.begin(); it != m_cache.end();)
+                    it = IsWindow(it->first) ? std::next(it) : m_cache.erase(it);
+        }
+
+        // Per-window facts that never change: class and owning process.
+        struct Cached { bool desktop = false, trayWnd = false, terminal = false, own = false, shell = false; };
+        Cached& CacheFor(HWND h)
+        {
+            auto it = m_cache.find(h);
+            if (it != m_cache.end()) return it->second;
+            Cached c;
+            char cls[64] = {};
+            GetClassNameA(h, cls, (int)sizeof(cls));
+            c.desktop  = !strcmp(cls, "Progman") || !strcmp(cls, "WorkerW");
+            c.trayWnd  = !strcmp(cls, "Shell_TrayWnd") || !strcmp(cls, "Shell_SecondaryTrayWnd");
+            c.terminal = !strcmp(cls, "CASCADIA_HOSTING_WINDOW_CLASS") || !strcmp(cls, "ConsoleWindowClass") ||
+                         !strcmp(cls, "mintty");
+            c.own      = IsOwnProcessWindow(h);
+            c.shell    = IsShellWindowUncached(h);
+            return m_cache.emplace(h, c).first->second;
+        }
+
+        std::thread                        m_thread;
+        std::atomic<bool>                  m_run{ false }, m_active{ false };
+        std::atomic<HWND>                  m_gui{ nullptr };
+        std::atomic<HMONITOR>              m_srMon{ nullptr };
+        std::mutex                         m_mutex;
+        std::shared_ptr<const WinSnapshot> m_latest;
+        std::unordered_map<HWND, Cached>   m_cache;
+        unsigned                           m_sweep = 0;
+    };
+
+    WindowWatcher g_winWatch;   // (one per process; started in WinMain)
+
     void UpdateTaskbarCutout(AppState& app, bool force)
     {
         auto clearCut = [&]() {
             app.recentUiCuts.clear();
+            app.keepHistory.clear();
+            app.occHistory.clear();
             if (!app.taskbarCutActive) return;
-            SetWindowRgn(app.hwnd, nullptr, TRUE);
+            if (app.renderer.IsDComp()) app.renderer.SetVisibleAll();
+            else SetWindowRgn(app.hwnd, nullptr, TRUE);
             app.taskbarCutActive = false;
             app.weaveCuts.clear();
+            app.weaveCutRad.clear();
         };
-        if (!IsTopmostWeaveMode(app)) { clearCut(); return; }
+        if (!IsTopmostWeaveMode(app)) { clearCut(); g_winWatch.SetActive(false); return; }
+        // The window list comes from the background watcher (fresh within
+        // ~2 ms); nothing below walks the windows itself.
+        g_winWatch.SetContext(app.gui.Hwnd(), SrMonitor(app));
+        g_winWatch.SetActive(true);
+        const std::shared_ptr<const WinSnapshot> snap = g_winWatch.Latest();
+        if (!snap) return;   // (first moments: no snapshot yet)
 
         RECT wr{};
         if (!GetWindowRect(app.hwnd, &wr)) return;
         const HMONITOR mon = SrMonitor(app);
+        // Holes (screen coords) and their corner radii.
         std::vector<RECT> cuts;
+        std::vector<int>  cutRad;
+        auto addCut = [&](const RECT& r, int rad) { cuts.push_back(r); cutRad.push_back(rad); };
         RECT cut{};
 
         // Taskbar.
@@ -2044,61 +2476,261 @@ namespace
         RECT tr{};
         if (tb && GetWindowRect(tb, &tr))
         {
-            // A fullscreen app in front hides the taskbar -- weave all of it.
-            HWND fg = GetForegroundWindow();
-            const bool fsInFront = fg && !IsOwnProcessWindow(fg) && !IsShellWindow(fg) &&
-                MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) == mon && IsWindowFullscreen(fg);
+            // A fullscreen app above the taskbar hides it -- weave all of it.
+            // Judged by z-order, not focus: clicking into a window on another
+            // display leaves the fullscreen app still covering the taskbar.
+            bool fsInFront = false;
+            for (const WinInfo& w : snap->z)
+            {
+                if (w.h == tb || w.desktop) break;
+                if (w.own || w.shell) continue;
+                // (Click-through overlays and tool windows aren't apps covering it.)
+                if (w.ex & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)) continue;
+                if (w.fullscreenOnSr) { fsInFront = true; break; }
+            }
             // Auto-hide leaves only a sliver on-screen; the intersection with
             // our window handles that (and a Looking Glass not over it).
             if (!fsInFront && IntersectRect(&cut, &tr, &wr))
-                cuts.push_back(cut);
+                addCut(cut, 0);
         }
+
+        // Holes linger a little after their window moves on or goes away:
+        // the capture runs a frame or two behind, so closing a hole at once
+        // would weave a ghost of the window's last position (the "trail").
+        const DWORD now = GetTickCount();
+        auto linger = [&](std::vector<AppState::LingerCut>& list, const RECT& r, int rad) {
+            for (auto& c : list)
+                if (EqualRect(&c.r, &r)) { c.t = now; c.rad = rad; return; }
+            list.push_back({ r, now, rad });
+        };
+        auto expire = [&](std::vector<AppState::LingerCut>& list, DWORD ms) {
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [&](const AppState::LingerCut& c) { return now - c.t > ms; }),
+                       list.end());
+        };
+        // Where things were when the displayed capture was taken: a short
+        // history of hole sets with (QPC, 100 ns) timestamps, looked up at the
+        // capture frame's own timestamp.
+        using TimedCuts = AppState::TimedCuts;
+        LARGE_INTEGER qpc{}, qpf{};
+        QueryPerformanceCounter(&qpc);
+        QueryPerformanceFrequency(&qpf);
+        const int64_t now100 = (int64_t)((double)qpc.QuadPart * 1.0e7 / (double)qpf.QuadPart);
+        const int64_t capT   = app.capture.IsActive() ? app.capture.LastFrameTime100ns() : 0;
+        auto recordHist = [&](std::deque<TimedCuts>& h, TimedCuts cur) {
+            cur.t = snap->t100;   // (when the window list was taken)
+            h.push_back(std::move(cur));
+            while (h.size() > 2 && h[1].t < now100 - 5'000'000) h.pop_front();   // keep ~0.5 s
+        };
+        auto atCapture = [&](const std::deque<TimedCuts>& h) -> const TimedCuts* {
+            if (h.empty()) return nullptr;
+            if (capT <= 0) return h.size() >= 2 ? &h[h.size() - 2] : &h.back();   // unknown: one frame back
+            const TimedCuts* best = &h.front();
+            for (const TimedCuts& e : h) { if (e.t <= capT) best = &e; else break; }
+            return best;
+        };
 
         // System UI above us (higher z-band). Walk up the z-order from our
         // window; everything in a higher band is before us in the list.
-        const DWORD now = GetTickCount();
-        for (HWND h = GetWindow(app.hwnd, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV))
+        for (const WinInfo& w : snap->z)
         {
-            if (!IsWindowVisible(h) || IsCloaked(h) || IsOwnProcessWindow(h)) continue;
-            if (WindowBand(h) <= 1) continue;   // desktop band (or unknown): not system UI
-            RECT r{};
-            if (!GetWindowRect(h, &r) || !IntersectRect(&cut, &r, &wr)) continue;
-            bool known = false;
-            for (auto& rc : app.recentUiCuts)
-                if (EqualRect(&rc.first, &cut)) { rc.second = now; known = true; break; }
-            if (!known) app.recentUiCuts.push_back({ cut, now });
+            if (w.h == app.hwnd || w.desktop) break;   // (everything above our window in z-order)
+            if (w.own || w.band <= 1) continue;          // desktop band (or unknown): not system UI
+            // (w.content: what it shows -- pop-ups like the tray overflow have
+            // wide invisible shadow / resize margins that would show as a 2D ring.)
+            if (!IntersectRect(&cut, &w.content, &wr)) continue;
+            linger(app.recentUiCuts, cut, w.radius);
         }
-        // Keep holes for recently-closed UI a little longer (capture lag).
-        constexpr DWORD kLingerMs = 200;
-        app.recentUiCuts.erase(
-            std::remove_if(app.recentUiCuts.begin(), app.recentUiCuts.end(),
-                           [&](const auto& rc) { return now - rc.second > kLingerMs; }),
-            app.recentUiCuts.end());
-        for (const auto& rc : app.recentUiCuts) cuts.push_back(rc.first);
+        expire(app.recentUiCuts, 200);
+        for (const auto& c : app.recentUiCuts) addCut(c.r, c.rad);
 
-        if (cuts.empty()) { clearCut(); return; }
+        // Windows that always stay 2D (our panel, terminals): cut out the
+        // part of each that's actually visible (not under another window),
+        // with its rounded corners -- where it is NOW (the live window shows
+        // through) and where it was when the displayed capture was taken
+        // (the captured picture still shows it there; left woven, that's a
+        // ghost trailing a moving window). Nothing more: no extra trail.
+        {
+            std::map<HWND, TimedCuts> seen;
+            std::vector<RECT> above;
+            for (const WinInfo& w : snap->z)
+            {
+                if (w.desktop) break;   // the desktop
+                if (w.h == app.hwnd || (w.ex & WS_EX_TRANSPARENT)) continue;
+                const HWND h = w.h;
+                if (!IntersectRect(&cut, &w.frame, &wr)) continue;
+                if (w.keep2D)
+                {
+                    TimedCuts& tc = seen[h];
+                    bool covered = false;
+                    for (const RECT& a : above) { RECT i{}; if (IntersectRect(&i, &a, &cut)) { covered = true; break; } }
+                    if (!covered) { tc.r.push_back(cut); tc.rad.push_back(w.radius); }   // whole, rounded
+                    else
+                    {
+                        // Partly under other windows: just the visible pieces.
+                        HRGN vis = CreateRectRgnIndirect(&cut);
+                        for (const RECT& a : above)
+                        {
+                            HRGN ar = CreateRectRgnIndirect(&a);
+                            CombineRgn(vis, vis, ar, RGN_DIFF);
+                            DeleteObject(ar);
+                        }
+                        if (const DWORD bytes = GetRegionData(vis, 0, nullptr))
+                        {
+                            std::vector<char> buf(bytes);
+                            auto* rd = reinterpret_cast<RGNDATA*>(buf.data());
+                            if (GetRegionData(vis, bytes, rd))
+                            {
+                                const RECT* rs = reinterpret_cast<const RECT*>(rd->Buffer);
+                                for (DWORD i = 0; i < rd->rdh.nCount; ++i) { tc.r.push_back(rs[i]); tc.rad.push_back(0); }
+                            }
+                        }
+                        DeleteObject(vis);
+                    }
+                }
+                above.push_back(cut);
+            }
+            // Windows gone since last time get an empty entry (they may still
+            // be in the displayed capture for a moment).
+            for (auto& kv : app.keepHistory)
+                if (!seen.count(kv.first)) seen[kv.first];
+            for (auto& kv : seen) recordHist(app.keepHistory[kv.first], std::move(kv.second));
+            for (auto it = app.keepHistory.begin(); it != app.keepHistory.end();)
+            {
+                const TimedCuts* nowE = &it->second.back();
+                const TimedCuts* capE = atCapture(it->second);
+                for (const TimedCuts* e : { nowE, capE })
+                    if (e) for (size_t i = 0; i < e->r.size(); ++i) addCut(e->r[i], e->rad[i]);
+                // Gone, and no longer in the capture either: forget it.
+                if (nowE->r.empty() && (!capE || capE->r.empty())) it = app.keepHistory.erase(it);
+                else ++it;
+            }
+        }
+        // (Duplicates -- a window that hasn't moved -- are harmless but
+        // would defeat the "nothing changed" check: drop them.)
+        for (size_t i = 0; i < cuts.size(); ++i)
+            for (size_t j = cuts.size(); j-- > i + 1;)
+                if (EqualRect(&cuts[i], &cuts[j]) && cutRad[i] == cutRad[j])
+                {
+                    cuts.erase(cuts.begin() + j);
+                    cutRad.erase(cutRad.begin() + j);
+                }
+
+        // Auto Stereo always manages the region (its base is the region set,
+        // not the whole window), even with no system-UI holes to cut.
+        if (cuts.empty() && !app.autoStereo) { clearCut(); return; }
 
         auto sameCuts = [&]() {
             if (cuts.size() != app.weaveCuts.size()) return false;
             for (size_t i = 0; i < cuts.size(); ++i)
-                if (!EqualRect(&cuts[i], &app.weaveCuts[i])) return false;
+                if (!EqualRect(&cuts[i], &app.weaveCuts[i]) || cutRad[i] != app.weaveCutRad[i]) return false;
             return true;
         };
-        if (!force && app.taskbarCutActive && sameCuts() && EqualRect(&wr, &app.taskbarCutWindow))
+        if (!force && app.taskbarCutActive && sameCuts() && EqualRect(&wr, &app.taskbarCutWindow) &&
+            !(app.autoStereo && app.renderer.IsDComp()))   // (Auto Stereo mask: every frame, it's cheap)
             return;
 
-        HRGN rgn = CreateRectRgn(0, 0, wr.right - wr.left, wr.bottom - wr.top);
-        for (const RECT& c : cuts)
+        auto commit = [&]() {
+            app.taskbarCutActive = true;
+            app.weaveCuts        = std::move(cuts);
+            app.weaveCutRad      = std::move(cutRad);
+            app.taskbarCutWindow = wr;
+        };
+
+        // DirectComposition: the see-through mask, drawn into the next frame
+        // together with the picture (in sync; no window reshaping). Coords
+        // are the back buffer's (client area).
+        if (app.renderer.IsDComp())
         {
-            HRGN hole = CreateRectRgn(c.left - wr.left, c.top - wr.top,
-                                      c.right - wr.left, c.bottom - wr.top);
+            POINT co{ 0, 0 };
+            ClientToScreen(app.hwnd, &co);
+            auto toClient = [&](RECT s) { OffsetRect(&s, -co.x, -co.y); return s; };
+            std::vector<Renderer::MaskCut> excl;
+            for (size_t i = 0; i < cuts.size(); ++i) excl.push_back({ toClient(cuts[i]), cutRad[i] });
+            if (app.autoStereo)
+            {
+                // Per picture, moved on the GPU by its tracked offset in the
+                // same frame as the picture, minus windows in front of it.
+                std::vector<Renderer::MaskTracked> tracked;
+                TimedCuts occNow;
+                for (const WeaveRegion& r : app.regionWeaver.Regions())
+                {
+                    Renderer::MaskTracked mt;
+                    RECT fr = (r.gpuSlot < 0 && !IsRectEmpty(&r.vis)) ? r.vis : r.frame;
+                    OffsetRect(&fr, r.lead.x, r.lead.y);
+                    mt.rect  = toClient(FrameToScreen(app, fr));
+                    mt.clip  = IsRectEmpty(&r.clip) ? RECT{ -100000, -100000, 100000, 100000 }
+                                                    : toClient(FrameToScreen(app, r.clip));
+                    mt.slot  = r.gpuSlot;
+                    mt.scale = (float)ScreenAnalyzer::Scale();
+                    tracked.push_back(mt);
+                    auto oc = app.regionOcc.find(r.id);
+                    if (oc != app.regionOcc.end())
+                        for (const RECT& o : oc->second) { occNow.r.push_back(o); occNow.rad.push_back(0); }
+                }
+                // Windows in front of pictures: cut where they are now AND
+                // where they were when the displayed capture was taken (the
+                // captured picture still shows them there).
+                recordHist(app.occHistory, std::move(occNow));
+                const TimedCuts* occNowE = &app.occHistory.back();
+                for (const TimedCuts* e : { occNowE, atCapture(app.occHistory) })
+                    if (e) for (size_t i = 0; i < e->r.size(); ++i) excl.push_back({ toClient(e->r[i]), e->rad[i] });
+                app.renderer.SetVisibleTracked(tracked, excl, app.gpuTracking ? app.gpuTracker.ResultsSRV() : nullptr);
+            }
+            else
+                app.renderer.SetVisibleAllExcept(excl);
+            commit();
+            return;
+        }
+
+        // Classic presenter: reshape the window. Base shape: the whole weave
+        // window normally; in Auto Stereo, just the woven regions (empty =
+        // nothing shown). The holes are then subtracted from either.
+        HRGN rgn = nullptr;
+        if (app.autoStereo)
+        {
+            rgn = CreateRectRgn(0, 0, 0, 0);
+            for (const WeaveRegion& r : app.regionWeaver.Regions())
+            {
+                // Just the visible part of the image (not what's scrolled
+                // under a toolbar / out of its window), where it's drawn
+                // (shifted by its scroll lead, kept inside its viewport) ...
+                RECT fv = IsRectEmpty(&r.vis) ? r.frame : r.vis;
+                OffsetRect(&fv, r.lead.x, r.lead.y);
+                if (!IsRectEmpty(&r.clip) && !IntersectRect(&fv, &fv, &r.clip)) continue;
+                RECT s = FrameToScreen(app, fv);
+                if (IsRectEmpty(&s)) continue;
+                HRGN rr = CreateRectRgn(s.left - wr.left, s.top - wr.top,
+                                        s.right - wr.left, s.bottom - wr.top);
+                // ... minus windows in front of its window.
+                auto oc = app.regionOcc.find(r.id);
+                if (oc != app.regionOcc.end())
+                    for (const RECT& o : oc->second)
+                    {
+                        HRGN hole = CreateRectRgn(o.left - wr.left, o.top - wr.top,
+                                                  o.right - wr.left, o.bottom - wr.top);
+                        CombineRgn(rr, rr, hole, RGN_DIFF);
+                        DeleteObject(hole);
+                    }
+                CombineRgn(rgn, rgn, rr, RGN_OR);
+                DeleteObject(rr);
+            }
+        }
+        else
+            rgn = CreateRectRgn(0, 0, wr.right - wr.left, wr.bottom - wr.top);
+        for (size_t i = 0; i < cuts.size(); ++i)
+        {
+            const RECT& c = cuts[i];
+            const int d = 2 * cutRad[i];
+            HRGN hole = d > 0 ? CreateRoundRectRgn(c.left - wr.left, c.top - wr.top,
+                                                   c.right - wr.left + 1, c.bottom - wr.top + 1, d, d)
+                              : CreateRectRgn(c.left - wr.left, c.top - wr.top,
+                                              c.right - wr.left, c.bottom - wr.top);
             CombineRgn(rgn, rgn, hole, RGN_DIFF);
             DeleteObject(hole);
         }
         SetWindowRgn(app.hwnd, rgn, TRUE);   // the system owns rgn from here
-        app.taskbarCutActive = true;
-        app.weaveCuts        = std::move(cuts);
-        app.taskbarCutWindow = wr;
+        commit();
     }
 
     // Put the weave back on top if a fullscreen app/game on the SR display
@@ -2530,6 +3162,7 @@ namespace
             // always-on background service, the weave is the on-demand
             // foreground. The user's GUI toggle is the only thing that
             // turns the bridge off.
+            EndAutoStereo(app, "weaving turned off");
             // Hide and fully release SR so the lens and camera turn off.
             ShowWindow(app.hwnd, SW_HIDE);
             HideFsCtrlOverlay();
@@ -3398,6 +4031,7 @@ namespace
         app.katangaPrevWeaving = app.weavingEnabled;
         app.katangaAuto        = true;
         app.katangaAutoStartMs = GetTickCount();
+        EndAutoStereo(app, "Katanga sender took over");
         Log("Katanga auto-receive: sender detected -> switching to Katanga");
         app.mode = OutputMode::Fullscreen;
         ChangeFormat(app, StereoFormat::Katanga);    // arm: receiver on, lens off, window hidden
@@ -3462,6 +4096,1004 @@ namespace
                          SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
+    // --- Auto Stereo: region management --------------------------------
+    //
+    // Stage 1 (foundation): regions are added by hand -- Ctrl+Alt+A over a
+    // window weaves that window's client area in the current format; again
+    // over a woven region removes it. Several regions, each with its own
+    // format, can be active at once. Detection (image rectangles, format
+    // spotters) builds on this.
+
+    // Desktop rect -> capture-frame pixels (the capture covers the SR monitor).
+    RECT ScreenToFrame(const AppState& app, const RECT& s)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfo(SrMonitor(app), &mi)) return {};
+        const RECT& m = mi.rcMonitor;
+        const double fw = app.capture.FrameWidth(), fh = app.capture.FrameHeight();
+        if (fw <= 0 || fh <= 0 || m.right <= m.left || m.bottom <= m.top) return {};
+        const double sx = fw / (m.right - m.left), sy = fh / (m.bottom - m.top);
+        return { (LONG)((s.left - m.left) * sx + 0.5), (LONG)((s.top    - m.top) * sy + 0.5),
+                 (LONG)((s.right - m.left) * sx + 0.5), (LONG)((s.bottom - m.top) * sy + 0.5) };
+    }
+
+    bool ClientScreenRect(HWND h, RECT& out)
+    {
+        RECT c{};
+        if (!GetClientRect(h, &c)) return false;
+        POINT tl{ c.left, c.top }, br{ c.right, c.bottom };
+        if (!ClientToScreen(h, &tl) || !ClientToScreen(h, &br)) return false;
+        out = { tl.x, tl.y, br.x, br.y };
+        return out.right > out.left && out.bottom > out.top;
+    }
+
+    // Windows that must always show as plain 2D, never woven: SR Loom's own
+    // panel, and terminals (text windows -- weaving only garbles them).
+    bool IsKeep2DWindow(const AppState& app, HWND h)
+    {
+        if (!h) return false;
+        if (h == app.gui.Hwnd()) return true;
+        char cls[64] = {};
+        GetClassNameA(h, cls, (int)sizeof(cls));
+        return !strcmp(cls, "CASCADIA_HOSTING_WINDOW_CLASS") ||   // Windows Terminal
+               !strcmp(cls, "ConsoleWindowClass") ||              // classic console
+               !strcmp(cls, "mintty");                            // Git Bash / MSYS2
+    }
+
+    // Topmost visible, real (not ours / shell / click-through overlay)
+    // top-level window under a screen point.
+    HWND TopLevelWindowAt(POINT pt)
+    {
+        for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT))
+        {
+            if (!IsWindowVisible(h) || IsIconic(h) || IsCloaked(h) || IsOwnProcessWindow(h)) continue;
+            if (GetWindowLongPtr(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT) continue;
+            RECT r{};
+            if (!GetWindowRect(h, &r) || !PtInRect(&r, pt)) continue;
+            char cls[64] = {};
+            GetClassNameA(h, cls, (int)sizeof(cls));
+            if (!strcmp(cls, "Progman") || !strcmp(cls, "WorkerW") ||
+                !strcmp(cls, "Shell_TrayWnd") || !strcmp(cls, "Shell_SecondaryTrayWnd"))
+                return nullptr;   // the desktop / taskbar is under the cursor
+            return h;
+        }
+        return nullptr;
+    }
+
+    constexpr DWORD kScanIntervalMs = 100;   // auto-detect: time between scans (one takes ~10-30 ms) ...
+    constexpr DWORD kConfirmScanMs  = 0;     // ... straight away when a find awaits its confirming scan
+    // Scroll prediction: a scrolling picture is drawn this many frames of its
+    // recent speed ahead (capture -> screen is about a frame behind the live
+    // page), capped at kMaxLeadPx capture pixels.
+    constexpr float kScrollLeadFrames = 1.0f;
+    constexpr int   kMaxLeadPx        = 160;
+
+    void EndAutoStereo(AppState& app, const char* why)
+    {
+        if (!app.autoStereo) return;
+        app.autoStereo = false;
+        app.autoDetect = false;
+        app.regionWeaver.Clear();
+        app.regionTrackers.clear();
+        app.regionOcc.clear(); app.regionOccSig.clear(); app.regionOccArea.clear(); app.regrowAt.clear();
+        app.regionViewPos.clear();
+        app.regionAnchorHist.clear();
+        app.scanPending.clear(); app.autoMisses.clear();
+        app.suppressed.clear(); app.suppressedWindows.clear();
+        app.scanWantColour = false;
+        app.pickPending = false;
+        app.regionsDirty  = false;
+        app.captureRebind = true;       // normal pipeline re-binds the weaver input
+        app.weaver.LensEnable();
+        app.autoStereoLensOn = false;
+        Log("Auto Stereo: off (%s)", why);
+        UpdateTaskbarCutout(app, true); // back to the normal full-window clip
+    }
+
+    // Start Auto Stereo: passthrough capture of the SR display + the
+    // Fullscreen weave window (layered, click-through), clipped to the
+    // regions -- none yet, so nothing is woven until one is added.
+    void EnterAutoStereo(AppState& app)
+    {
+        if (app.autoStereo) return;
+        UsePassthrough(app);
+        app.mode = OutputMode::Fullscreen;
+        // The global format only matters for the weave window's own
+        // behaviour here (each region has its own). Katanga would put the
+        // window into its hidden "waiting for a sender" state, and the
+        // media-only formats don't apply to live capture.
+        if (app.format == StereoFormat::Katanga || app.format == StereoFormat::LightField ||
+            IsVRFormat(app.format))
+            ChangeFormat(app, StereoFormat::HalfSBS);
+        app.autoStereo = true;
+        EnsureWeaving(app);
+        Log("Auto Stereo: on");
+    }
+
+    void RemoveAutoRegion(AppState& app, int id, const char* why)
+    {
+        app.regionWeaver.Remove(id);
+        app.regionTrackers.erase(id);
+        app.regionOcc.erase(id); app.regionOccSig.erase(id); app.regionOccArea.erase(id);
+        app.regrowAt.erase(id); app.autoMisses.erase(id); app.regionViewPos.erase(id);
+        app.regionAnchorHist.erase(id);
+        app.regionsDirty = true;
+        Log("Auto Stereo: region %d removed (%s)", id, why);
+    }
+
+    RECT FrameToScreen(const AppState& app, const RECT& f)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfo(SrMonitor(app), &mi)) return {};
+        const RECT& m = mi.rcMonitor;
+        const double fw = app.capture.FrameWidth(), fh = app.capture.FrameHeight();
+        if (fw <= 0 || fh <= 0) return {};
+        const double sx = (m.right - m.left) / fw, sy = (m.bottom - m.top) / fh;
+        return { m.left + (LONG)(f.left * sx + 0.5), m.top + (LONG)(f.top * sy + 0.5),
+                 m.left + (LONG)(f.right * sx + 0.5), m.top + (LONG)(f.bottom * sy + 0.5) };
+    }
+
+    // Screen rect -> analysis pixels (the analyser's half-res image).
+    RECT ScreenToAnalysis(const AppState& app, const RECT& s)
+    {
+        const RECT f = ScreenToFrame(app, s);
+        const int k = ScreenAnalyzer::Scale();
+        return { f.left / k, f.top / k, f.right / k, f.bottom / k };
+    }
+
+    // A window's frame as drawn (without Windows 10/11's invisible resize border).
+    bool VisibleFrameRect(HWND h, RECT& r)
+    {
+        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r))))
+            return r.right > r.left && r.bottom > r.top;
+        return GetWindowRect(h, &r) && r.right > r.left && r.bottom > r.top;
+    }
+
+    // Real top-level windows in front of `host` (z-order), as screen rects:
+    // they cover part of it, so those parts must not be woven. Skips our own
+    // windows, click-through overlays and the taskbar (cut separately).
+    void WindowsInFront(const AppState& app, HWND host, std::vector<RECT>& out)
+    {
+        out.clear();
+        if (!host) return;
+        MONITORINFO mi{ sizeof(mi) };
+        GetMonitorInfo(SrMonitor(app), &mi);
+        const long long monArea = (long long)(mi.rcMonitor.right - mi.rcMonitor.left) *
+                                  (mi.rcMonitor.bottom - mi.rcMonitor.top);
+        const HWND fg = GetForegroundWindow();
+        // From the background window watcher's snapshot (see WindowWatcher).
+        const std::shared_ptr<const WinSnapshot> snap = g_winWatch.Latest();
+        if (!snap) return;
+        for (const WinInfo& w : snap->z)
+        {
+            const HWND h = w.h;
+            if (h == host || w.desktop) break;
+            if (w.own && !w.gui) continue;   // (our panel counts)
+            if (w.ex & WS_EX_TRANSPARENT) continue;
+            if (w.trayWnd) continue;
+            RECT onMon{};
+            if (!IntersectRect(&onMon, &w.frame, &mi.rcMonitor)) continue;
+            // A monitor-sized window that isn't the one in use is almost
+            // always an invisible helper / overlay, not something covering
+            // the screen for real (a real fullscreen app is the foreground).
+            const long long a = (long long)(onMon.right - onMon.left) * (onMon.bottom - onMon.top);
+            if (a * 100 >= monArea * 95 && h != fg) continue;
+            out.push_back(onMon);
+        }
+    }
+
+    // The scrolling viewport under a point: the deepest child window there
+    // that is still a big part of the window (a browser's page area, not a
+    // toolbar button). The host itself if there's none.
+    HWND ViewportWindowAt(HWND host, POINT pt)
+    {
+        RECT hc{};
+        if (!ClientScreenRect(host, hc)) return host;
+        const long long hostArea = (long long)(hc.right - hc.left) * (hc.bottom - hc.top);
+        HWND best = host;
+        for (HWND cur = host;;)
+        {
+            POINT cp = pt;
+            ScreenToClient(cur, &cp);
+            HWND c = ChildWindowFromPointEx(cur, cp, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+            if (!c || c == cur) break;
+            RECT cr{};
+            if (ClientScreenRect(c, cr) &&
+                (long long)(cr.right - cr.left) * (cr.bottom - cr.top) * 5 >= hostArea)
+                best = c;
+            cur = c;
+        }
+        return best;
+    }
+
+    // A viewport window's area on the SR display, in analysis pixels.
+    RECT ViewportAnalysisRect(const AppState& app, HWND view)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        RECT s{}, c{};
+        if (!view || !GetMonitorInfo(SrMonitor(app), &mi) || !ClientScreenRect(view, s) ||
+            !IntersectRect(&c, &s, &mi.rcMonitor))
+            return {};
+        return ScreenToAnalysis(app, c);
+    }
+
+    // Per frame: follow tracked windows, drop regions whose window is gone,
+    // and keep each region's "windows in front" cut-outs up to date.
+    void UpdateAutoStereoRegions(AppState& app)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfo(SrMonitor(app), &mi)) return;
+        std::vector<int> dead;
+        std::map<HWND, std::vector<RECT>> inFront;   // per host, this frame
+        const DWORD now = GetTickCount();
+        // Window-move compensation: each region's anchor (its window, or the
+        // viewport its picture is in) now vs when the displayed capture was
+        // taken. The captured picture is drawn shifted by the difference, so
+        // it sits where the live window is -- not a capture-delay behind it
+        // with the real window showing through ahead of it.
+        LARGE_INTEGER qpc{}, qpf{};
+        QueryPerformanceCounter(&qpc);
+        QueryPerformanceFrequency(&qpf);
+        const int64_t now100 = (int64_t)((double)qpc.QuadPart * 1.0e7 / (double)qpf.QuadPart);
+        const int64_t capT   = app.capture.IsActive() ? app.capture.LastFrameTime100ns() : 0;
+        auto anchorAtCapture = [&](int id, const RECT& nowRect) -> RECT {
+            auto& h = app.regionAnchorHist[id];
+            h.push_back({ now100, nowRect });
+            while (h.size() > 2 && h[1].first < now100 - 5'000'000) h.pop_front();   // ~0.5 s
+            if (capT <= 0) return h.size() >= 2 ? h[h.size() - 2].second : nowRect;
+            RECT best = h.front().second;
+            for (const auto& e : h) { if (e.first <= capT) best = e.second; else break; }
+            return best;
+        };
+        for (WeaveRegion& r : app.regionWeaver.Regions())
+        {
+            if (r.trackWindow)
+            {
+                RECT s{}, c{};
+                if (!IsWindow(r.trackWindow) || !IsWindowVisible(r.trackWindow) ||
+                    (r.host && IsIconic(r.host)) ||
+                    !ClientScreenRect(r.trackWindow, s) || !IntersectRect(&c, &s, &mi.rcMonitor))
+                {
+                    dead.push_back(r.id);
+                    continue;
+                }
+                // Crop where the window was in the displayed capture; draw
+                // (and show) it where the window is now.
+                RECT capC{};
+                const RECT capS = anchorAtCapture(r.id, s);
+                if (!IntersectRect(&capC, &capS, &mi.rcMonitor)) capC = c;
+                const RECT f = ScreenToFrame(app, capC);
+                const POINT wl{ c.left - capC.left, c.top - capC.top };
+                if (!EqualRect(&c, &r.screen) || !EqualRect(&f, &r.frame) ||
+                    wl.x != r.winLead.x || wl.y != r.winLead.y)
+                {
+                    r.screen  = c;
+                    r.frame   = f;
+                    r.winLead = wl;
+                    r.lead    = { r.scrollLead.x + wl.x, r.scrollLead.y + wl.y };
+                    app.regionsDirty = true;
+                }
+            }
+            else if (r.trackContent && r.host && IsWindow(r.host) && !IsIconic(r.host))
+            {
+                // A picture in a window: follows the window's moves the same way.
+                RECT vs{};
+                if (ClientScreenRect(r.viewWindow ? r.viewWindow : r.host, vs))
+                {
+                    const RECT cap = anchorAtCapture(r.id, vs);
+                    const POINT wl{ vs.left - cap.left, vs.top - cap.top };
+                    if (wl.x != r.winLead.x || wl.y != r.winLead.y)
+                    {
+                        r.winLead = wl;
+                        r.lead    = { r.scrollLead.x + wl.x, r.scrollLead.y + wl.y };
+                        app.regionsDirty = true;
+                    }
+                }
+            }
+            else if (r.host && (!IsWindow(r.host) || IsIconic(r.host)))
+            {
+                dead.push_back(r.id);
+                continue;
+            }
+            if (!r.host) continue;
+
+            // Windows in front of the host, clipped to what we show of this
+            // region (cut out of the weave).
+            auto it = inFront.find(r.host);
+            if (it == inFront.end())
+            {
+                std::vector<RECT> v;
+                WindowsInFront(app, r.host, v);
+                it = inFront.emplace(r.host, std::move(v)).first;
+            }
+            // (A scrolling picture can be anywhere in its viewport this frame
+            // -- the GPU moves it -- so its occluders cover the viewport.)
+            RECT occBound = r.screen;
+            if (r.trackContent) { RECT vs{}; if (ClientScreenRect(r.viewWindow ? r.viewWindow : r.host, vs)) UnionRect(&occBound, &occBound, &vs); }
+            std::vector<RECT> occ;
+            uint64_t sig = 1469598103934665603ull;
+            for (const RECT& w : it->second)
+            {
+                RECT i{};
+                if (!IntersectRect(&i, &w, &occBound)) continue;
+                occ.push_back(i);
+                sig = (sig ^ ((uint64_t)(uint32_t)i.left << 32 | (uint32_t)i.top)) * 1099511628211ull;
+                sig = (sig ^ ((uint64_t)(uint32_t)i.right << 32 | (uint32_t)i.bottom)) * 1099511628211ull;
+            }
+            if (sig != app.regionOccSig[r.id])
+            {
+                app.regionOccSig[r.id] = sig;
+                app.regionOcc[r.id]    = std::move(occ);
+                app.regionsDirty = true;
+            }
+            // How much of the image's viewport is covered. When that shrinks
+            // (a window moved away, or the image's window came to the
+            // front), the image may be bigger than the part we could see:
+            // try re-growing it (ProcessAutoStereoAnalysis).
+            if (r.trackContent)
+            {
+                RECT vs{};
+                long long area = 0;
+                if (ClientScreenRect(r.viewWindow ? r.viewWindow : r.host, vs))
+                    for (const RECT& w : it->second)
+                    {
+                        RECT i{};
+                        if (IntersectRect(&i, &w, &vs)) area += (long long)(i.right - i.left) * (i.bottom - i.top);
+                    }
+                auto prev = app.regionOccArea.find(r.id);
+                if (prev != app.regionOccArea.end() && area < prev->second)
+                    app.regrowAt[r.id] = now + 200;   // let the capture catch up first
+                app.regionOccArea[r.id] = area;
+            }
+        }
+        for (int id : dead)
+            RemoveAutoRegion(app, id, "window closed / minimised / off the SR display");
+    }
+
+    // Swap Eyes and the anaglyph settings are global: apply them to every
+    // region (a region's format is its own).
+    void SyncRegionEyes(AppState& app)
+    {
+        for (WeaveRegion& r : app.regionWeaver.Regions())
+            if (r.swapEyes != app.swapEyes || r.anaglyphCombo != app.anaglyphCombo ||
+                r.anaglyphMode != app.anaglyphMode)
+            {
+                r.swapEyes      = app.swapEyes;
+                r.anaglyphCombo = app.anaglyphCombo;
+                r.anaglyphMode  = app.anaglyphMode;
+                app.regionsDirty = true;
+            }
+    }
+
+    // Formats a live region can't meaningfully use fall back to Half SBS.
+    StereoFormat RegionFormatFor(StereoFormat fmt)
+    {
+        if (fmt == StereoFormat::Katanga || fmt == StereoFormat::LightField || IsVRFormat(fmt) ||
+            fmt == StereoFormat::FrameSequential || fmt == StereoFormat::Pulfrich)
+            return StereoFormat::HalfSBS;
+        return fmt;
+    }
+
+    WeaveRegion NewRegion(const AppState& app, StereoFormat fmt)
+    {
+        WeaveRegion r;
+        r.format        = fmt;
+        r.swapEyes      = app.swapEyes;
+        r.anaglyphCombo = app.anaglyphCombo;
+        r.anaglyphMode  = app.anaglyphMode;
+        return r;
+    }
+
+    // Whole-window region (the fallback when no image is found under the
+    // cursor, or a player / fullscreen video found by the scanner). Returns
+    // the region id, 0 if the window isn't on the SR display.
+    int AddWindowRegion(AppState& app, HWND h, StereoFormat fmt, bool autoDetected = false)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        RECT s{}, c{};
+        if (!IsWindow(h) || !GetMonitorInfo(SrMonitor(app), &mi) || !ClientScreenRect(h, s) ||
+            !IntersectRect(&c, &s, &mi.rcMonitor))
+            return 0;
+        WeaveRegion r = NewRegion(app, fmt);
+        r.trackWindow  = h;
+        r.host         = GetAncestor(h, GA_ROOT);
+        r.viewWindow   = h;
+        r.autoDetected = autoDetected;
+        r.screen       = c;
+        r.frame        = ScreenToFrame(app, c);
+        const int id = app.regionWeaver.Add(r);
+        app.regionsDirty = true;
+        Log("Auto Stereo: region %d = %swhole window %p '%s' (%ld,%ld %ldx%ld) as %s", id,
+            autoDetected ? "[auto] " : "", (void*)h, WindowTitle(r.host).c_str(),
+            c.left, c.top, c.right - c.left, c.bottom - c.top, Profiles::FormatToString(fmt));
+        return id;
+    }
+
+    // Image region that follows its content as the page scrolls. `t` is a
+    // tracker already Reset on the image (analysis px).
+    int AddContentRegion(AppState& app, const RegionTracker& t, StereoFormat fmt,
+                         HWND host, HWND view, bool autoDetected = false)
+    {
+        const int s = ScreenAnalyzer::Scale();
+        const RECT a = t.Rect(), v = t.Visible();
+        WeaveRegion r = NewRegion(app, fmt);
+        r.trackContent = true;
+        r.trueAspect   = true;     // a picture on a page: Full SBS keeps its real shape
+        r.host         = host;
+        r.viewWindow   = view ? view : host;
+        r.autoDetected = autoDetected;
+        r.frame        = { a.left * s, a.top * s, a.right * s, a.bottom * s };
+        r.vis          = { v.left * s, v.top * s, v.right * s, v.bottom * s };
+        r.screen       = FrameToScreen(app, r.frame);
+        const int id = app.regionWeaver.Add(r);
+        app.regionTrackers[id] = t;
+        app.regionsDirty = true;
+        Log("Auto Stereo: region %d = %simage (%ld,%ld %ldx%ld) in '%s' as %s", id,
+            autoDetected ? "[auto] " : "", r.screen.left, r.screen.top,
+            r.screen.right - r.screen.left, r.screen.bottom - r.screen.top,
+            WindowTitle(host).c_str(), Profiles::FormatToString(fmt));
+        return id;
+    }
+
+    // Auto-detect: hand the latest (colour) frame and the windows on the SR
+    // display to the background scanner.
+    void StartAutoScan(AppState& app)
+    {
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfo(SrMonitor(app), &mi)) return;
+        std::vector<ScanWindow> wins;
+        std::vector<RECT> above;   // screen rects of windows higher in the z-order
+        for (HWND h = GetTopWindow(nullptr); h && wins.size() < 8; h = GetWindow(h, GW_HWNDNEXT))
+        {
+            if (!IsWindowVisible(h) || IsIconic(h) || IsCloaked(h) || (IsOwnProcessWindow(h) && h != app.gui.Hwnd())) continue;
+            if (GetWindowLongPtr(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT) continue;
+            char cls[64] = {};
+            GetClassNameA(h, cls, (int)sizeof(cls));
+            if (!strcmp(cls, "Progman") || !strcmp(cls, "WorkerW")) break;   // the desktop: nothing below
+            RECT wr{}, onMon{};
+            if (!VisibleFrameRect(h, wr) || !IntersectRect(&onMon, &wr, &mi.rcMonitor)) continue;
+            // The taskbar, our panel and terminals are never scanned (but they
+            // do hide what's beneath them).
+            const bool shell = !strcmp(cls, "Shell_TrayWnd") || !strcmp(cls, "Shell_SecondaryTrayWnd") ||
+                               IsKeep2DWindow(app, h);
+            RECT c{}, cm{};
+            if (!shell && ClientScreenRect(h, c) && IntersectRect(&cm, &c, &mi.rcMonitor) &&
+                cm.right - cm.left >= 160 && cm.bottom - cm.top >= 120)
+            {
+                ScanWindow sw;
+                sw.host   = h;
+                sw.view   = ViewportWindowAt(h, { (cm.left + cm.right) / 2, (cm.top + cm.bottom) / 2 });
+                sw.bounds = ScreenToAnalysis(app, cm);
+                long long covered = 0;
+                for (const RECT& a : above)
+                {
+                    RECT i{};
+                    if (!IntersectRect(&i, &a, &cm)) continue;
+                    sw.covered.push_back(ScreenToAnalysis(app, i));
+                    covered += (long long)(i.right - i.left) * (i.bottom - i.top);
+                }
+                if (covered * 10 < (long long)(cm.right - cm.left) * (cm.bottom - cm.top) * 9)
+                    wins.push_back(std::move(sw));   // skip windows (almost) fully hidden
+            }
+            above.push_back(onMon);
+        }
+
+        const int k = ScreenAnalyzer::Scale();
+        std::vector<RECT> exclude;
+        std::vector<ScanVerify> verify;
+        for (const WeaveRegion& r : app.regionWeaver.Regions())
+        {
+            const RECT a{ r.frame.left / k, r.frame.top / k, r.frame.right / k, r.frame.bottom / k };
+            exclude.push_back(a);
+            if (!r.autoDetected) continue;
+            // Re-check only regions fully on show (a half-hidden SBS picture
+            // can't be judged).
+            if (r.trackContent)
+            {
+                auto t = app.regionTrackers.find(r.id);
+                if (t == app.regionTrackers.end()) continue;
+                const RECT v = t->second.Visible();
+                if (!EqualRect(&v, &t->second.Rect())) continue;
+            }
+            auto oc = app.regionOcc.find(r.id);
+            if (oc != app.regionOcc.end() && !oc->second.empty()) continue;
+            verify.push_back({ r.id, a, r.format });
+        }
+        for (const auto& kv : app.suppressed) exclude.push_back(kv.second.Rect());
+
+        app.scanner.Start(std::make_shared<LumaImage>(app.analysisImg), 0, std::move(wins),
+                          std::move(exclude), std::move(verify));
+        app.lastScanMs = GetTickCount();
+        app.scanWantColour = false;
+        app.screenChangedSinceScan = false;
+    }
+
+    // A confirmed scanner find -> a woven region.
+    void AddAutoRegion(AppState& app, const ScanHit& hit, const LumaImage& scanImg)
+    {
+        if (hit.whole)
+        {
+            const HWND w = hit.view ? hit.view : hit.host;
+            for (HWND s : app.suppressedWindows) if (s == w) return;
+            AddWindowRegion(app, w, hit.format, true);
+            return;
+        }
+        RegionTracker t;
+        t.SetViewport(ViewportAnalysisRect(app, hit.view));
+        t.Reset(scanImg, hit.rect);
+        if (!t.Valid()) return;
+        // The scan ran on an older frame: catch the tracker up (the page may
+        // have scrolled meanwhile).
+        if (app.analysisImg.width == scanImg.width && app.analysisImg.height == scanImg.height &&
+            !t.Track(app.analysisImg))
+            return;
+        AddContentRegion(app, t, hit.format, hit.host, hit.view, true);
+    }
+
+    float RectIoU(const RECT& a, const RECT& b)
+    {
+        RECT i{};
+        if (!IntersectRect(&i, &a, &b)) return 0.0f;
+        const double ia = (double)(i.right - i.left) * (i.bottom - i.top);
+        const double ua = (double)(a.right - a.left) * (a.bottom - a.top) +
+                          (double)(b.right - b.left) * (b.bottom - b.top) - ia;
+        return ua > 0 ? (float)(ia / ua) : 0.0f;
+    }
+
+    // Finished scan: re-check verdicts for woven auto regions, and weave
+    // finds that the previous scan also made (same window, place, format).
+    void HandleScanResult(AppState& app)
+    {
+        ScanResult res;
+        if (!app.scanner.Take(res)) return;
+        if (!app.autoDetect || !res.image) return;   // turned off while it ran
+
+        for (const auto& v : res.verified)
+        {
+            if (v.second) { app.autoMisses[v.first] = 0; continue; }
+            if (++app.autoMisses[v.first] >= 3)
+                RemoveAutoRegion(app, v.first, "no longer looks like a 3D image");
+        }
+
+        const int k = ScreenAnalyzer::Scale();
+        std::vector<ScanHit> next;
+        for (const ScanHit& h : res.hits)
+        {
+            // A clear-cut find is woven straight away; a marginal one waits for
+            // the next scan to agree (same window, place and format).
+            const bool strong = (h.format == StereoFormat::Anaglyph) ? h.score >= 0.35f : h.score >= 0.6f;
+            bool confirmed = strong;
+            for (const ScanHit& p : app.scanPending)
+                if (p.host == h.host && p.format == h.format && p.whole == h.whole &&
+                    RectIoU(p.rect, h.rect) >= 0.85f)
+                {
+                    confirmed = true;
+                    break;
+                }
+            if (!confirmed) { next.push_back(h); continue; }
+            // Still free? (a region may have been added since the scan started)
+            bool taken = false;
+            for (const WeaveRegion& r : app.regionWeaver.Regions())
+            {
+                const RECT a{ r.frame.left / k, r.frame.top / k, r.frame.right / k, r.frame.bottom / k };
+                if (RectIoU(a, h.rect) > 0.3f) { taken = true; break; }
+            }
+            for (const auto& kv : app.suppressed)
+                if (RectIoU(kv.second.Rect(), h.rect) > 0.3f) { taken = true; break; }
+            if (!taken) AddAutoRegion(app, h, *res.image);
+        }
+        app.scanPending = std::move(next);
+
+        // Log the scan's findings only when they change (the scanner runs
+        // continuously while the screen changes).
+        size_t key = res.hits.size() * 131 + res.log.size();
+        for (const ScanHit& h : res.hits) key = key * 31 + (size_t)h.rect.left * 7 + (size_t)h.rect.top + (size_t)h.format;
+        if (key != app.lastScanLogKey)
+        {
+            app.lastScanLogKey = key;
+            Log("Auto Stereo scan: %zu rects judged, %zu 3D (%.0f ms)", res.log.size(), res.hits.size(), res.ms);
+            int n = 0;
+            for (const std::string& l : res.log)
+                if (++n <= 12) Log("  %s", l.c_str());
+        }
+    }
+
+    // The panel's "Auto Stereo" button.
+    void SetAutoDetect(AppState& app, bool on)
+    {
+        if (on == app.autoDetect) return;
+        if (on)
+        {
+            EnterAutoStereo(app);
+            if (!app.autoStereo) return;
+            app.autoDetect = true;
+            app.scanPending.clear();
+            app.lastScanMs = 0;
+            app.screenChangedSinceScan = true;
+            app.regionsDirty = true;   // keeps the render loop's analysis path awake
+            Log("Auto Stereo: detection on (scanning the SR display for 3D images)");
+            return;
+        }
+        app.autoDetect = false;
+        app.scanPending.clear();
+        app.suppressed.clear();
+        app.suppressedWindows.clear();
+        app.scanWantColour = false;
+        std::vector<int> autoIds;
+        for (const WeaveRegion& r : app.regionWeaver.Regions()) if (r.autoDetected) autoIds.push_back(r.id);
+        for (int id : autoIds) RemoveAutoRegion(app, id, "detection turned off");
+        Log("Auto Stereo: detection off");
+        if (app.regionWeaver.Empty() && !app.pickPending)
+        {
+            EndAutoStereo(app, "detection turned off");
+            SetWeaving(app, false);
+        }
+    }
+
+    // Start a background image-rectangle search around `old` (analysis px)
+    // for region `id`: re-acquire (a lost picture) or re-grow (more of it came
+    // into view). Works on a copy of the current analysis image.
+    void LaunchAsyncFind(AppState& app, int id, bool regrow, const RECT& old, const RECT& bounds)
+    {
+        if (app.asyncFinds.count(id)) return;
+        auto img = std::make_shared<LumaImage>();
+        img->width  = app.analysisImg.width;
+        img->height = app.analysisImg.height;
+        img->pixels = app.analysisImg.pixels;   // luma only (the search needs no colour)
+        const int cx = (old.left + old.right) / 2, cy = (old.top + old.bottom) / 2;
+        AppState::AsyncFind j;
+        j.regrow = regrow;
+        j.old    = old;
+        j.img    = img;
+        j.fut    = std::async(std::launch::async, [img, cx, cy, bounds]() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            RECT r{};
+            const bool ok = FindImageRect(*img, cx, cy, bounds, r);
+            return std::make_pair(ok, r);
+        });
+        app.asyncFinds.emplace(id, std::move(j));
+    }
+
+    // Apply finished background searches. A re-acquired picture is re-learnt
+    // on the image it was found in, then caught up to the current frame; a
+    // re-grown one only if the new rectangle contains the old and is bigger.
+    void PollAsyncFinds(AppState& app)
+    {
+        std::vector<int> lost;
+        for (auto it = app.asyncFinds.begin(); it != app.asyncFinds.end();)
+        {
+            AppState::AsyncFind& j = it->second;
+            if (j.fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
+            const auto res = j.fut.get();
+            const int id = it->first;
+            auto tr = app.regionTrackers.find(id);
+            if (tr != app.regionTrackers.end())
+            {
+                RegionTracker& t = tr->second;
+                const RECT old = j.old, found = res.second;
+                const double oa = (double)(old.right - old.left) * (old.bottom - old.top);
+                const double na = res.first ? (double)(found.right - found.left) * (found.bottom - found.top) : 0.0;
+                const bool sameImage = app.analysisImg.width == j.img->width && app.analysisImg.height == j.img->height;
+                if (!j.regrow)
+                {
+                    if (oa > 0 && na > 0.75 * oa && na < 1.33 * oa)
+                    {
+                        t.Reset(*j.img, found);
+                        if (sameImage && !t.Track(app.analysisImg)) lost.push_back(id);
+                    }
+                    else
+                        lost.push_back(id);
+                }
+                else
+                {
+                    constexpr int tol = 3;
+                    const bool contains = res.first && found.left <= old.left + tol && found.top <= old.top + tol &&
+                                          found.right >= old.right - tol && found.bottom >= old.bottom - tol;
+                    if (contains && na >= 1.1 * oa)
+                    {
+                        t.Reset(*j.img, found);
+                        if (sameImage) t.Track(app.analysisImg);
+                        Log("Auto Stereo: region %d grew to the whole image (%ld,%ld)-(%ld,%ld) analysis px",
+                            id, found.left, found.top, found.right, found.bottom);
+                    }
+                }
+            }
+            it = app.asyncFinds.erase(it);   // (ready: destroying the future doesn't block)
+        }
+        for (int id : lost) RemoveAutoRegion(app, id, "image scrolled away / changed");
+    }
+
+    // New analysed frame: resolve a pending pick, move content regions,
+    // re-grow uncovered ones, and feed the auto-detect scanner.
+    void ProcessAutoStereoAnalysis(AppState& app)
+    {
+        const bool needAnalysis = app.pickPending || !app.regionTrackers.empty() ||
+                                  app.autoDetect || !app.suppressed.empty();
+        if (!needAnalysis) return;
+
+        uint64_t frameId = 0;
+        const bool fresh = app.analyzer.Latest(app.analysisImg, frameId, app.analysisWaitNewest);
+        const int s = ScreenAnalyzer::Scale();
+
+        if (app.pickPending)
+        {
+            // A pick waits (briefly) for a frame with colour, so the
+            // saved images and the classifier see the red/cyan channels too.
+            const bool waitColour = !app.analysisImg.hasColour() &&
+                                    GetTickCount() - app.pickStartMs < 400;
+            if (fresh && !waitColour)
+            {
+                // Point and viewport bounds in analysis pixels.
+                const RECT pf = ScreenToFrame(app, { app.pickPoint.x, app.pickPoint.y,
+                                                     app.pickPoint.x + 1, app.pickPoint.y + 1 });
+                const HWND view = ViewportWindowAt(app.pickWindow, app.pickPoint);
+                RECT bounds = ViewportAnalysisRect(app, view);
+                if (IsRectEmpty(&bounds)) bounds = { 0, 0, app.analysisImg.width, app.analysisImg.height };
+                RECT found{};
+                const bool gotRect = FindImageRect(app.analysisImg, pf.left / s, pf.top / s, bounds, found);
+                // Which format? Judge the picture (or, with none found, the
+                // whole viewport); the panel's format is the fallback.
+                const RECT judged = gotRect ? found : bounds;
+                char diag[512] = "";
+                StereoFormat guess{}; float score = 0;
+                StereoScores sc;
+                const bool looks3D = ClassifyStereo(app.analysisImg, judged, guess, score, diag, sizeof(diag), &sc);
+                StereoFormat fmt = app.pickFormat;
+                const char* why = "panel format";
+                if (looks3D) { fmt = guess; why = "detected"; }
+                else
+                {
+                    // You asked for 3D here, so take the clearer of the two
+                    // layouts even below the automatic threshold.
+                    const int jw = judged.right - judged.left, jh = judged.bottom - judged.top;
+                    if (sc.sbs >= 0.2f && sc.sbs >= 1.5f * sc.tab)
+                    {
+                        fmt = ((float)(jw / 2) / (float)(std::max)(jh, 1) >= 1.1f) ? StereoFormat::FullSBS : StereoFormat::HalfSBS;
+                        why = "best guess";
+                    }
+                    else if (sc.tab >= 0.2f && sc.tab >= 1.5f * sc.sbs)
+                    {
+                        fmt = ((float)jw / (float)(std::max)(jh / 2, 1) >= 2.6f) ? StereoFormat::HalfTAB : StereoFormat::FullTAB;
+                        why = "best guess";
+                    }
+                }
+                Log("Auto Stereo pick: %s (%s; sbs=%.2f tab=%.2f) -- %s", Profiles::FormatToString(fmt), why,
+                    sc.sbs, sc.tab, diag);
+                if (app.pickDebug)
+                {
+                    // Debug pick: save what the finder saw next to the exe.
+                    wchar_t exe[MAX_PATH] = {};
+                    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                    std::wstring dir(exe);
+                    dir = dir.substr(0, dir.find_last_of(L'\\')) + L"\\autostereo_debug";
+                    CreateDirectoryW(dir.c_str(), nullptr);
+                    wchar_t name[64];
+                    swprintf_s(name, L"\\pick_%lu.bmp", GetTickCount());
+                    const std::wstring path = dir + name;
+                    const POINT pa{ pf.left / s, pf.top / s };
+                    const bool saved = SaveLumaDebugBmp(app.analysisImg, bounds, gotRect ? &found : nullptr,
+                                                        pa, path.c_str());
+                    // Plus a clean copy (no markers) usable as an offline
+                    // test case, and the red/cyan channels.
+                    const std::wstring base = path.substr(0, path.size() - 4);
+                    SaveLumaDebugBmp(app.analysisImg, bounds, nullptr, pa, (base + L"_raw.bmp").c_str(), false);
+                    SaveColourDebugBmp(app.analysisImg, (base + L"_rc.bmp").c_str());
+                    Log("Auto Stereo DEBUG pick: point=(%ld,%ld) bounds=(%ld,%ld)-(%ld,%ld) found=%d rect=(%ld,%ld)-(%ld,%ld) colour=%d saved=%d '%ls'",
+                        pa.x, pa.y, bounds.left, bounds.top, bounds.right, bounds.bottom, (int)gotRect,
+                        found.left, found.top, found.right, found.bottom, (int)app.analysisImg.hasColour(),
+                        (int)saved, path.c_str());
+                }
+                if (gotRect)
+                {
+                    RegionTracker t;
+                    t.SetViewport(bounds);
+                    t.Reset(app.analysisImg, found);
+                    AddContentRegion(app, t, fmt, app.pickWindow, view);
+                }
+                else
+                {
+                    Log("Auto Stereo: no image rectangle under the cursor -- using the whole window");
+                    AddWindowRegion(app, view ? view : app.pickWindow, fmt);
+                }
+                app.pickPending = false;
+                if (!app.autoDetect) app.scanWantColour = false;   // the pick's colour request
+            }
+            else if (GetTickCount() - app.pickStartMs > 600)
+            {
+                Log("Auto Stereo: no analysed frame in time -- using the whole window");
+                AddWindowRegion(app, app.pickWindow, app.pickFormat);
+                app.pickPending = false;
+                if (!app.autoDetect) app.scanWantColour = false;
+            }
+        }
+
+        // Background image-rectangle searches (re-acquire a lost picture,
+        // re-grow an uncovered one) that have finished: apply them. They run
+        // off the render thread -- each is a full search over a window
+        // (tens of ms), which used to show as a hitch.
+        PollAsyncFinds(app);
+
+        if (!fresh) return;
+        const DWORD now = GetTickCount();
+        std::vector<int> lost;
+        for (auto& kv : app.regionTrackers)
+        {
+            RegionTracker& t = kv.second;
+            WeaveRegion* reg = nullptr;
+            for (WeaveRegion& r : app.regionWeaver.Regions()) if (r.id == kv.first) { reg = &r; break; }
+            if (!reg) { lost.push_back(kv.first); continue; }
+            const RECT view = ViewportAnalysisRect(app, reg->viewWindow);
+            // Window moved since the last track: carry the picture with it.
+            {
+                auto lp = app.regionViewPos.find(kv.first);
+                if (lp != app.regionViewPos.end() && !IsRectEmpty(&view))
+                {
+                    const int dx = view.left - lp->second.x, dy = view.top - lp->second.y;
+                    if (dx || dy) t.Shift(dx, dy);
+                }
+                if (!IsRectEmpty(&view)) app.regionViewPos[kv.first] = { view.left, view.top };
+            }
+            // A re-acquire search is out for this one: hold it where it was.
+            auto job = app.asyncFinds.find(kv.first);
+            if (job != app.asyncFinds.end() && !job->second.regrow) continue;
+            const RECT bounds = IsRectEmpty(&view) ? RECT{ 0, 0, app.analysisImg.width, app.analysisImg.height } : view;
+            t.SetViewport(view);
+            if (!t.Track(app.analysisImg))
+            {
+                // Content AND surroundings changed -- e.g. a playing video
+                // that's also being scrolled. Look (in the background) for an
+                // image rectangle of about the same size around where it was.
+                LaunchAsyncFind(app, kv.first, false, t.Rect(), bounds);
+                continue;
+            }
+            // More of the image may have come into view.
+            auto rg = app.regrowAt.find(kv.first);
+            if (rg != app.regrowAt.end() && (LONG)(now - rg->second) >= 0)
+            {
+                app.regrowAt.erase(rg);
+                if (job == app.asyncFinds.end()) LaunchAsyncFind(app, kv.first, true, t.Rect(), bounds);
+            }
+            const RECT a = t.Rect(), v = t.Visible(), vw = t.ViewRect();
+            const RECT f{ a.left * s, a.top * s, a.right * s, a.bottom * s };
+            const RECT vf{ v.left * s, v.top * s, v.right * s, v.bottom * s };
+            const RECT cf{ vw.left * s, vw.top * s, vw.right * s, vw.bottom * s };
+            // Scrolling: draw the picture where it will be once this frame is
+            // on screen (kScrollLeadFrames of its recent speed ahead), so it
+            // keeps up with the live page instead of trailing it.
+            auto leadOf = [&](float v) {
+                const int px = (int)std::lround(v * kScrollLeadFrames) * s;
+                return (std::max)(-kMaxLeadPx, (std::min)(kMaxLeadPx, px));
+            };
+            const POINT lead{ leadOf(t.VelocityX()), leadOf(t.VelocityY()) };
+            if (!EqualRect(&f, &reg->frame) || !EqualRect(&vf, &reg->vis) || !EqualRect(&cf, &reg->clip) ||
+                lead.x != reg->scrollLead.x || lead.y != reg->scrollLead.y)
+            {
+                reg->frame  = f;
+                reg->vis    = vf;
+                reg->clip   = cf;
+                reg->scrollLead = lead;
+                reg->lead   = { lead.x + reg->winLead.x, lead.y + reg->winLead.y };
+                reg->screen = FrameToScreen(app, f);
+                app.regionsDirty = true;
+            }
+        }
+        for (int id : lost) RemoveAutoRegion(app, id, "image scrolled away / changed");
+
+        // Auto finds the user removed stay suppressed while they're on screen.
+        for (auto it = app.suppressed.begin(); it != app.suppressed.end();)
+        {
+            it->second.SetViewport({});
+            if (it->second.Track(app.analysisImg)) ++it;
+            else it = app.suppressed.erase(it);
+        }
+
+        if (app.autoDetect && app.analysisImg.hasColour() && !app.scanner.Busy())
+            StartAutoScan(app);
+    }
+
+    // Ctrl+Alt+A. Over a woven region: remove it (an auto-detected one stays
+    // un-woven while it's on screen). Otherwise: weave the image under the
+    // cursor in the current format -- found on the next analysed frame,
+    // falling back to the whole window -- entering Auto Stereo if needed.
+    // Removing the last region leaves Auto Stereo (unless detection is on).
+    void ToggleAutoRegionUnderCursor(AppState& app)
+    {
+        POINT pt{};
+        GetCursorPos(&pt);
+        for (const WeaveRegion& r : app.regionWeaver.Regions())
+        {
+            if (!PtInRect(&r.screen, pt)) continue;
+            const int id = r.id;
+            if (r.autoDetected)
+            {
+                if (r.trackContent)
+                {
+                    auto t = app.regionTrackers.find(id);
+                    if (t != app.regionTrackers.end()) app.suppressed[app.nextSuppressId++] = t->second;
+                }
+                else if (r.trackWindow)
+                    app.suppressedWindows.push_back(r.trackWindow);
+            }
+            RemoveAutoRegion(app, id, "removed by user");
+            if (app.regionWeaver.Empty() && !app.autoDetect)
+            {
+                EndAutoStereo(app, "last region removed");
+                SetWeaving(app, false);
+            }
+            return;
+        }
+
+        HWND h = TopLevelWindowAt(pt);
+        if (!h) { Log("Auto Stereo: no window under the cursor"); return; }
+        MONITORINFO mi{ sizeof(mi) };
+        RECT s{}, c{};
+        if (!GetMonitorInfo(SrMonitor(app), &mi) || !ClientScreenRect(h, s) ||
+            !IntersectRect(&c, &s, &mi.rcMonitor))
+        {
+            Log("Auto Stereo: window %p is not on the SR display", (void*)h);
+            return;
+        }
+
+        EnterAutoStereo(app);
+
+        // Find the image under the cursor on the next analysed frame
+        // (ProcessAutoStereoAnalysis); the whole window is the fallback.
+        app.pickPending = true;
+        app.pickPoint   = pt;
+        app.pickWindow  = h;
+        app.pickStartMs = GetTickCount();
+        app.pickFormat  = RegionFormatFor(app.format);
+        app.scanWantColour = true;   // read back red/cyan too (anaglyph test)
+        app.regionsDirty = true;   // keeps the render loop's analysis path awake
+    }
+
+    // The SR display's CURRENT refresh rate (Hz), re-read every few seconds
+    // (the mode can change). Per monitor: DWM's global timing reports the
+    // Overlay / frame-limiter hooks other programs inject into every D3D app
+    // (SR Loom included). A global frame limit in one of them caps the weave.
+    std::string LoadedPresentHooks()
+    {
+        static const wchar_t* const kHooks[] = {
+            L"RTSSHooks64.dll", L"RTSSHooks.dll",                // RivaTuner Statistics Server
+            L"GameOverlayRenderer64.dll",                         // Steam overlay
+            L"DiscordHook64.dll", L"DiscordOverlay64.dll",        // Discord overlay
+            L"nvspcap64.dll",                                     // NVIDIA overlay / ShadowPlay
+            L"igo64.dll", L"overlay64.dll", L"uplay_overlay64.dll",
+            L"OWClient.dll", L"ow-graphics-hook64.dll",           // Overwolf
+            L"graphics-hook64.dll",                               // OBS game capture
+            L"ReShade64.dll", L"dxgi_hook.dll" };
+        std::string found;
+        for (const wchar_t* m : kHooks)
+            if (GetModuleHandleW(m))
+            {
+                char n[64]; WideCharToMultiByte(CP_UTF8, 0, m, -1, n, sizeof(n), nullptr, nullptr);
+                if (!found.empty()) found += ", ";
+                found += n;
+            }
+        return found;
+    }
+
+    // primary display, which may be a 60 Hz screen next to a 160 Hz SR one.
+    double SrRefreshHz(const AppState& app)
+    {
+        static double s_hz = 60.0;
+        static DWORD  s_checked = 0;
+        if (GetTickCount() - s_checked > 3000)
+        {
+            s_checked = GetTickCount();
+            MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+            DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+            if (GetMonitorInfoW(SrMonitor(app), &mi) &&
+                EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            {
+                if ((double)dm.dmDisplayFrequency != s_hz)
+                    Log("SR display refresh: %lu Hz (current mode)", dm.dmDisplayFrequency);
+                s_hz = (double)dm.dmDisplayFrequency;
+            }
+        }
+        return s_hz;
+    }
+
     void RenderFrame(AppState& app)
     {
         if (!app.weavingEnabled || !app.renderer.IsValid())
@@ -3522,7 +5154,27 @@ namespace
         }
 
         // Pace to the display before grabbing the newest frame (lowest latency).
+        app.prof.t0 = std::chrono::steady_clock::now();
+        if (app.prof.lastEnd.time_since_epoch().count() != 0)
+            app.prof.outside += std::chrono::duration<double, std::milli>(app.prof.t0 - app.prof.lastEnd).count();
         app.renderer.WaitForFrame();
+        // Weaving live capture into a bit-blt window: pace on the capture
+        // itself -- wake the moment a new frame lands (it's produced by the
+        // composition we'd otherwise be sleeping through in DwmFlush); if
+        // none lands within half a refresh (a still screen), sync to the
+        // compositor as before, so head tracking stays smooth. Other sources
+        // keep DwmFlush pacing (see Present below).
+        app.paceOnCapture = (!app.renderer.IsFlipModel() || app.renderer.IsDComp()) && app.capture.IsActive() &&
+                            app.source != SourceKind::TestImage && !app.video.IsOpen() &&
+                            !app.katanga.IsReceiving();
+        // (Waits at most ~40% of a refresh: the frame-latency wait above
+        // already paces to the display; this only lines the work up with
+        // the capture of what was just drawn.)
+        if (app.paceOnCapture &&
+            !app.capture.WaitForNewFrame((DWORD)(std::max)(1.0, 400.0 / SrRefreshHz(app))))
+            app.paceOnCapture = false;   // still screen: sync to the compositor as usual this loop
+        app.prof.tWait = std::chrono::steady_clock::now();
+        app.gpuTimer.Begin();
 
         // Anti-lag pattern (BlueSkyDefender's: max-frames-in-flight=1, sample input
         // AFTER the wait): tracking source-window position / cursor hover gets read
@@ -3534,6 +5186,7 @@ namespace
                                   GetTickCount() - app.captureWarmupStartMs > 400))
             EndCaptureWarmup(app);
         UpdateOverlayTracking(app);     // follow the source window in overlay mode
+        UpdateLoupeOwnDrag(app);        // our own move/resize of the looking glass (no modal loop)
         UpdateLoupeInteractivity(app);  // hover the chrome to grab/move the looking glass
 
         // Resolve the current source frame: the test image, or a capture frame.
@@ -3566,10 +5219,13 @@ namespace
             // foreign display (the picker) is woven whole — no crop.
             if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay && app.capture.FrameWidth() > 0)
             {
-                RECT r = PassthroughRegion(app, app.hwnd);
+                // Auto Stereo crops per region itself, so it needs the whole frame.
+                RECT r = app.autoStereo ? RECT{ 0, 0, 0, 0 } : PassthroughRegion(app, app.hwnd);
                 app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
             }
-            bool wgcGotFrame = app.capture.Update(capSizeChanged);
+            bool wgcGotFrame = false;
+            { HitchWatch hw("capture update"); wgcGotFrame = app.capture.Update(capSizeChanged); }
+            app.gpuTimer.Stamp(GpuFrameTimer::kCapture);
 
             // Source-switch hand-off: the new session's first frame is here
             // (or it's taking too long) -- switch the window to the new mode
@@ -3582,7 +5238,8 @@ namespace
                 if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay &&
                     app.capture.FrameWidth() > 0)
                 {
-                    RECT r = PassthroughRegion(app, app.hwnd);
+                    // Auto Stereo crops per region itself, so it needs the whole frame.
+                    RECT r = app.autoStereo ? RECT{ 0, 0, 0, 0 } : PassthroughRegion(app, app.hwnd);
                     app.capture.SetSourceRegion(r.left, r.top, r.right - r.left, r.bottom - r.top);
                     bool recropSizeChanged = false;
                     if (app.capture.Update(recropSizeChanged)) wgcGotFrame = true;
@@ -3761,6 +5418,124 @@ namespace
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
             if (nowReceiving) PlaceKatangaWeave(app);
+        }
+
+        // AUTO STEREO: weave each region with its own format through a
+        // composite. The weave window is clipped to the regions (see
+        // UpdateTaskbarCutout), so nothing outside them is shown woven.
+        if (app.autoStereo)
+        {
+            if (app.source != SourceKind::CaptureMonitor || app.foreignDisplay || !app.capture.IsActive())
+            {
+                EndAutoStereo(app, "source is no longer the SR display");
+            }
+            else
+            {
+                { HitchWatch hw("Auto Stereo region/window update"); UpdateAutoStereoRegions(app); }
+                SyncRegionEyes(app);
+                { HitchWatch hw("Auto Stereo scan results"); HandleScanResult(app); }
+                // Auto-detect: time for another scan? Only if the screen has
+                // changed since the last one, or a find awaits confirmation.
+                if (gotFrame) app.screenChangedSinceScan = true;
+                if (app.autoDetect && !app.scanWantColour && !app.scanner.Busy() &&
+                    GetTickCount() - app.lastScanMs >= (app.scanPending.empty() ? kScanIntervalMs : kConfirmScanMs) &&
+                    (app.screenChangedSinceScan || !app.scanPending.empty()))
+                    app.scanWantColour = true;
+                // Screen analysis: feed frames while tracking image regions;
+                // while a pick or a scan is pending, analyse the latest frame
+                // even if nothing changed (a static page delivers no new
+                // frames). A scan's frame also carries red/cyan.
+                const bool analyse = app.capture.Texture() &&
+                    ((gotFrame && (!app.regionTrackers.empty() || !app.suppressed.empty())) ||
+                     app.pickPending || app.scanWantColour);
+                if (analyse)
+                    app.analyzer.Submit(app.capture.SRV(), app.capture.Width(), app.capture.Height(),
+                                        app.scanWantColour);
+                // While images are being followed, read this very frame back
+                // (a short wait for the GPU) instead of one from 1-2 frames
+                // ago: otherwise the woven picture trails behind scrolling.
+                app.analysisWaitNewest = !app.gpuTracking && analyse && gotFrame && !app.regionTrackers.empty();
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    { HitchWatch hw("Auto Stereo analysis/tracking/picks"); ProcessAutoStereoAnalysis(app); }
+                    app.autoTimeAnalysisMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    app.gpuTimer.Stamp(GpuFrameTimer::kAnalysis);
+                }
+                // GPU scroll tracking: find each content picture in THIS
+                // frame's analysis image on the GPU (relative to where the
+                // CPU tracker last saw it); the crop, placement and cut-out
+                // read the result there, the same frame.
+                if (app.gpuTracking)
+                {
+                    std::vector<GpuTrackJob> jobs;
+                    int slot = 0;
+                    for (WeaveRegion& r : app.regionWeaver.Regions())
+                    {
+                        int want = -1;
+                        auto t = app.regionTrackers.find(r.id);
+                        if (t != app.regionTrackers.end() && t->second.Valid() &&
+                            slot < GpuTracker::kMaxSlots && !t->second.RowProfile().empty())
+                        {
+                            want = slot++;
+                            // The window may have moved since the CPU tracker's
+                            // frame: its position is known now, so start the
+                            // GPU search (and the crop, and the viewport clip)
+                            // from where the window is this frame.
+                            RECT base = t->second.Rect(), view = t->second.ViewRect();
+                            const RECT vnow = ViewportAnalysisRect(app, r.viewWindow);
+                            auto lp = app.regionViewPos.find(r.id);
+                            if (lp != app.regionViewPos.end() && !IsRectEmpty(&vnow))
+                            {
+                                const int dx = vnow.left - lp->second.x, dy = vnow.top - lp->second.y;
+                                OffsetRect(&base, dx, dy);
+                                OffsetRect(&view, dx, dy);
+                            }
+                            jobs.push_back({ want, base, view, &t->second.RowProfile(), &t->second.ColProfile() });
+                            const int k = ScreenAnalyzer::Scale();
+                            const RECT f{ base.left * k, base.top * k, base.right * k, base.bottom * k };
+                            const RECT c{ view.left * k, view.top * k, view.right * k, view.bottom * k };
+                            if (!EqualRect(&f, &r.frame) || !EqualRect(&c, &r.clip))
+                            {
+                                r.frame  = f;
+                                r.clip   = c;
+                                r.screen = FrameToScreen(app, f);
+                                app.regionsDirty = true;
+                            }
+                        }
+                        if (r.gpuSlot != want) { r.gpuSlot = want; app.regionsDirty = true; }
+                    }
+                    if (!jobs.empty()) { HitchWatch hw("GPU tracking dispatch"); app.gpuTracker.Run(app.analyzer.LumaSRV(), jobs); }
+                    app.gpuTimer.Stamp(GpuFrameTimer::kTracking);
+                    app.regionWeaver.SetGpuResults(jobs.empty() ? nullptr : app.gpuTracker.ResultsSRV(),
+                                                   ScreenAnalyzer::Scale());
+                }
+                const bool anyRegion = !app.regionWeaver.Empty();
+                // Lens only while there's something to weave.
+                if (anyRegion != app.autoStereoLensOn)
+                {
+                    if (anyRegion) app.weaver.LensEnable(); else app.weaver.LensDisable();
+                    app.autoStereoLensOn = anyRegion;
+                }
+                const bool rebuild = app.regionsDirty || app.captureRebind || gotFrame;
+                if (app.regionsDirty) UpdateTaskbarCutout(app, true);   // re-clip to the new regions
+                if (anyRegion && rebuild)
+                {
+                    bool resized = false;
+                    HitchWatch hwBuild("region crops/conversion");
+                    if (app.regionWeaver.Build(app.capture.Texture(), app.capture.SRV(), app.capture.SRVFormat(),
+                                               app.capture.Width(), app.capture.Height(), resized)
+                        && (resized || app.captureRebind))
+                    {
+                        app.weaver.SetInputView(app.regionWeaver.CompositeSRV(),
+                                                app.regionWeaver.PerEyeWidth(),
+                                                app.regionWeaver.Height(),
+                                                app.regionWeaver.CompositeFormat());
+                        app.captureRebind = false;
+                    }
+                }
+                app.regionsDirty = false;
+                goto skipSourcePipeline;
+            }
         }
 
         // FAST PATH: a live source already in side-by-side layout (full OR half SBS,
@@ -4124,12 +5899,113 @@ namespace
         }   // matches the "{" introduced before the liveSource block by the LFPRenderer branch
 
         skipSourcePipeline:
-        app.renderer.BindAndClearBackBuffer();
-        app.weaver.Weave();
-        app.renderer.Present(false);   // no-vsync: lowest latency (VRR absorbs tearing)
+        {
+            using clk = std::chrono::steady_clock;
+            auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            // DirectComposition: cut-outs are just mask data, so keep them
+            // current every frame (a moving panel / terminal / pop-up gets its
+            // hole in the same frame, not on the next 250 ms poll).
+            if (app.renderer.IsDComp() && IsTopmostWeaveMode(app))
+            { HitchWatch hw("cut-out update"); UpdateTaskbarCutout(app, false); }
+            const clk::time_point tWork = clk::now();
+            app.gpuTimer.Stamp(GpuFrameTimer::kOurs);
+            app.renderer.BindAndClearBackBuffer();
+            { HitchWatch hw("SR weave call"); if (!app.diagSkipWeave) app.weaver.Weave(); }   // (DiagSkipWeave: see Settings.h)
+            const clk::time_point tWeave = clk::now();
+            app.gpuTimer.Stamp(GpuFrameTimer::kWeave);
+            if (app.renderer.IsDComp()) app.renderer.ApplyMask();   // (timed apart from the present)
+            app.gpuTimer.Stamp(GpuFrameTimer::kMask);
+            { HitchWatch hw("present"); app.renderer.Present(false, !app.paceOnCapture); }   // no-vsync: lowest latency (VRR absorbs tearing)
+            const clk::time_point tEnd = clk::now();
+            app.prof.lastEnd = tEnd;
+            app.gpuTimer.End();
+
+            // Frame profile: every 5 s, where the loop's time went.
+            AppState::FrameProfile& p = app.prof;
+            if (p.t0.time_since_epoch().count() != 0)
+            {
+                const double total = ms(p.t0, tEnd);
+                p.wait += ms(p.t0, p.tWait); p.work += ms(p.tWait, tWork); p.weave += ms(tWork, tWeave);
+                p.present += ms(tWeave, tEnd); p.total += total; p.worst = (std::max)(p.worst, total);
+                p.analysis += app.autoStereo ? app.autoTimeAnalysisMs : 0.0;
+                ++p.loops;
+                p.frames += gotFrame ? 1 : 0;
+            }
+            if (GetTickCount() - p.last >= 5000)
+            {
+                if (p.loops > 0 && app.perfLog)
+                {
+                    const double secs = (GetTickCount() - p.last) / 1000.0;
+                    Log("Frame profile (%s%s, display %.0f Hz): %.1f loops/s, %.1f new frames/s | avg ms: pace-wait %.2f, "
+                        "our work %.2f (auto analysis %.2f), weave %.2f, present+compositor %.2f, whole loop %.2f (worst %.1f) | outside the weave %.2f (panel %.2f)",
+                        app.autoStereo ? "Auto Stereo" : (app.mode == OutputMode::LookingGlass ? "Looking Glass" :
+                                                          app.mode == OutputMode::Fullscreen ? "Fullscreen" : "other"),
+                        app.renderer.IsDComp() ? ", DirectComposition" : app.renderer.IsFlipModel() ? ", flip" : ", bit-blt",
+                        SrRefreshHz(app),
+                        p.loops / secs, p.frames / secs, p.wait / p.loops, p.work / p.loops, p.analysis / p.loops,
+                        p.weave / p.loops, p.present / p.loops, p.total / p.loops, p.worst,
+                        p.outside / p.loops, p.gui / p.loops);
+                    // GPU side, and the rate Windows actually composes at
+                    // (the loop can't outrun the compositor that shows it).
+                    DWM_TIMING_INFO ti{ sizeof(ti) };
+                    double dwmHz = 0.0;
+                    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateCompose.uiDenominator)
+                        dwmHz = (double)ti.rateCompose.uiNumerator / ti.rateCompose.uiDenominator;
+                    GpuFrameTimer& g = app.gpuTimer;
+                    uint64_t capFrames = 0;
+                    const double capFps = app.capture.TakeDeliveryRate(capFrames);
+                    // (Outside Auto Stereo the analysis/tracking marks are never
+                    // reached: everything after the capture copy is conversion.)
+                    if (g.n > 0 && !app.autoStereo)
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, conversion %.2f], SR weave %.2f, mask %.2f, present %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                            g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
+                            g.Avg(GpuFrameTimer::kCapture),
+                            g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
+                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            app.renderer.CompositionRateHz(), capFps);
+                    else if (g.n > 0)
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, analysis %.2f, tracking %.2f, crops+conversion %.2f], SR weave %.2f, mask %.2f, present %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                            g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
+                            g.Avg(GpuFrameTimer::kCapture),
+                            g.Avg(GpuFrameTimer::kAnalysis), g.Avg(GpuFrameTimer::kTracking), g.Avg(GpuFrameTimer::kOurs),
+                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            app.renderer.CompositionRateHz(), capFps);
+                    else
+                        Log("  GPU ms: n/a | DWM composing at %.1f Hz", dwmHz);
+                    g.Reset();
+                    // Injected present hooks (logged when the set changes).
+                    {
+                        static std::string s_hooks = "?";
+                        const std::string hooks = LoadedPresentHooks();
+                        if (hooks != s_hooks)
+                        {
+                            s_hooks = hooks;
+                            Log("  Present hooks loaded in SR Loom: %s", hooks.empty() ? "none" : hooks.c_str());
+                        }
+                    }
+                }
+                const DWORD last = GetTickCount();
+                p = AppState::FrameProfile{};
+                p.last = last;
+                p.lastEnd = tEnd;
+            }
+        }
     }
 
+    LRESULT WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+    // Every message to the weave window, timed: a slow one is logged with
+    // who sent it (see LogSlowMessage).
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        const DWORD sent = InSendMessageEx(nullptr);
+        const LRESULT r = WndProcImpl(hwnd, msg, wParam, lParam);
+        LogSlowMessage("weave", msg, wParam, sent, t0);
+        return r;
+    }
+
+    LRESULT WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         AppState* app = g_app;
 
@@ -4354,6 +6230,11 @@ namespace
             return 0;
 
         case WM_LBUTTONUP:
+            if (app && app->loupeDrag.active)
+            {
+                EndLoupeOwnDrag(*app);   // our own Looking Glass move/resize ends
+                return 0;
+            }
             if (app && app->vrMouseDown)
             {
                 const bool wasClick = !app->vrMoved;
@@ -4544,7 +6425,11 @@ namespace
             case ID_TRAY_SWAP_EYES: app->swapEyes = !app->swapEyes; app->captureRebind = true; return 0;
             case ID_TRAY_DETECT: DetectFormat(*app); return 0;
             case ID_TRAY_SRC_TESTIMAGE: OpenLoadTestImageDialog(*app); return 0;
+            case ID_TRAY_AUTO_STEREO:
+                SetAutoDetect(*app, !app->autoDetect);
+                return 0;
             case ID_TRAY_SRC_MONITOR:
+                EndAutoStereo(*app, "Fullscreen chosen");   // back to weaving the whole display
                 UsePassthrough(*app);
                 app->mode = OutputMode::Fullscreen;   // Monitor always means fullscreen
                 EnsureWeaving(*app);
@@ -4678,6 +6563,18 @@ namespace
                     CaptureForeground(*app);
             }
             // else if (wParam == kHotkeyDetect)  DetectFormat(*app); // auto-detect disabled
+            else if (wParam == kHotkeyAutoRegion || wParam == kHotkeyAutoRegionDbg)
+            {
+                // Auto Stereo: weave / un-weave the image under the cursor.
+                // Log which app was in front -- to diagnose apps that swallow
+                // Ctrl+Alt+A when they're focused.
+                HWND fg = GetForegroundWindow();
+                Log("Hotkey Ctrl+Alt+%sA received (foreground: '%s' / %s)",
+                    wParam == kHotkeyAutoRegionDbg ? "Shift+" : "",
+                    WindowTitle(fg).c_str(), ForegroundExeBaseName(fg).c_str());
+                app->pickDebug = (wParam == kHotkeyAutoRegionDbg);
+                ToggleAutoRegionUnderCursor(*app);
+            }
             else if (wParam == kHotkeyCalibrate)
             {
                 // Recenter head tracking: snap the current head pose to
@@ -4730,6 +6627,32 @@ namespace
         // While the user drags/resizes the window, the modal move loop blocks our
         // render loop — which stops weave() and freezes head-tracked weaving. Keep
         // rendering from a timer during the move.
+        // Looking Glass: move / resize it OURSELVES instead of letting Windows
+        // run its modal move loop (which stalls our render loop -- the glass
+        // dropped to timer-driven ~60 fps while being dragged). Pressing on
+        // the title bar or an edge starts it; the render loop then follows
+        // the mouse every frame (UpdateLoupeOwnDrag) until the button's up.
+        case WM_NCLBUTTONDOWN:
+            if (app && app->mode == OutputMode::LookingGlass &&
+                (wParam == HTCAPTION || (wParam >= HTLEFT && wParam <= HTBOTTOMRIGHT)))
+            {
+                app->loupeDrag.active = true;
+                app->loupeDrag.hit    = (int)wParam;
+                GetCursorPos(&app->loupeDrag.start);
+                GetWindowRect(hwnd, &app->loupeDrag.startRect);
+                app->loupeDragging = true;
+                SetCapture(hwnd);
+                return 0;
+            }
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+        case WM_CAPTURECHANGED:
+            if (app && app->loupeDrag.active && (HWND)lParam != hwnd)
+            {
+                app->loupeDrag.active = false;
+                app->loupeDragging = false;
+            }
+            return 0;
+
         case WM_ENTERSIZEMOVE:
             if (app) app->loupeDragging = true;
             SetTimer(hwnd, kRenderTimer, 8, nullptr);
@@ -4887,6 +6810,7 @@ namespace
             HideFsCtrlOverlay();
             HideFsSetOverlay();
             HideFsVidOverlay();
+            if (app && hwnd != app->hwnd) return 0;   // a replaced window (presenter fallback)
             PostQuitMessage(0);
             return 0;
 
@@ -4919,6 +6843,7 @@ static LONG WINAPI SrLoomCrashHandler(EXCEPTION_POINTERS* ep)
         ? (unsigned long long)((const char*)addr - (const char*)mod) : 0ull;
     Log("CRASH: code=0x%08X at addr=%p (module: %s +0x%llX)",
         (unsigned)code, addr, modName, rva);
+    LogFlush();   // (the writer thread may not get to it before the process dies)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -4927,6 +6852,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Install the crash handler first so any later init failure that
     // segfaults / access-violates leaves a useful trail in srweaver.log.
     SetUnhandledExceptionFilter(SrLoomCrashHandler);
+    TscPerMs();   // (starts the CPU-time calibration for the hitch log)
     Log("WinMain: SR Loom v%s starting (pid %lu)", kAppVersion, GetCurrentProcessId());
 
     // Single instance. Two SR Loom processes fight over the SR display /
@@ -5011,9 +6937,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     }
 
     // Create the output window on the SR display.
+    // DirectComposition presenter (Settings::ReadDirectComposition): the
+    // window must be created without a redirection bitmap for it.
     const RECT& d = app.srDisplayRect;
+    bool useDComp = Settings::ReadDirectComposition();
     app.hwnd = CreateWindowExA(
-        0, kWindowClass, kWindowTitle, WS_POPUP,
+        useDComp ? WS_EX_NOREDIRECTIONBITMAP : 0, kWindowClass, kWindowTitle, WS_POPUP,
         d.left, d.top, d.right - d.left, d.bottom - d.top,
         nullptr, nullptr, hInstance, nullptr);
     if (!app.hwnd)
@@ -5038,8 +6967,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     // Set up Direct3D. The weaver/SR session is started on demand when weaving is
     // enabled; the default source is the monitor (passthrough), so no initial image.
-    if (!app.renderer.Initialize(app.hwnd))
-        return 4;
+    if (!app.renderer.Initialize(app.hwnd, useDComp))
+    {
+        if (!useDComp) return 4;
+        // DirectComposition unavailable: a classic window + swap chains.
+        Log("WinMain: DirectComposition presenter failed -- using the classic presenter");
+        useDComp = false;
+        app.renderer.Shutdown();
+        HWND failed = app.hwnd;
+        app.hwnd = nullptr;          // (WM_DESTROY: not our window any more -- don't quit)
+        DestroyWindow(failed);
+        app.hwnd = CreateWindowExA(0, kWindowClass, kWindowTitle, WS_POPUP,
+                                   d.left, d.top, d.right - d.left, d.bottom - d.top,
+                                   nullptr, nullptr, hInstance, nullptr);
+        if (!app.hwnd) { ShowError("Failed to create output window."); return 3; }
+        if (excludeFromCapture) SetWindowDisplayAffinity(app.hwnd, WDA_EXCLUDEFROMCAPTURE);
+        const BOOL noTransitions = TRUE;
+        DwmSetWindowAttribute(app.hwnd, 3, &noTransitions, sizeof(noTransitions));
+        if (!app.renderer.Initialize(app.hwnd)) return 4;
+    }
+    Log("WinMain: presenter = %s", app.renderer.IsDComp() ? "DirectComposition" : "classic swap chains");
+    if (!app.gpuTimer.Init(app.renderer.Device(), app.renderer.Context()))
+        Log("WinMain: GPU frame timer unavailable");
 
     // Cap the render loop at the SR display's max supported refresh. Without this
     // we'd render past the panel's refresh on fast sources, wasting GPU / heat
@@ -5076,6 +7025,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 7;
     }
     Log("WinMain: converter.Initialize OK");
+    if (!app.regionWeaver.Initialize(app.renderer.Device(), app.renderer.Context()))
+        Log("WinMain: regionWeaver.Initialize FAILED (Auto Stereo unavailable)");
+    if (!app.analyzer.Initialize(app.renderer.Device(), app.renderer.Context()))
+        Log("WinMain: analyzer.Initialize FAILED (Auto Stereo image picking unavailable)");
+    // GPU scroll tracking needs the DirectComposition presenter (its see-through
+    // cut-out reads the GPU result in the same frame).
+    app.gpuTracking = app.renderer.IsDComp() &&
+                      app.gpuTracker.Initialize(app.renderer.Device(), app.renderer.Context());
+    Log("WinMain: GPU scroll tracking %s", app.gpuTracking ? "on" : "off");
     // LFPRenderer is optional -- only used when an LFP file is loaded.
     // If shader compile fails, log and continue without the feature.
     if (!app.lfpRenderer.Initialize(app.renderer.Device(), app.renderer.Context()))
@@ -5367,7 +7325,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     const int hk2 = RegisterHotKey(app.hwnd, kHotkeyMode,      MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F');
     const int hk3 = RegisterHotKey(app.hwnd, kHotkeyCapture,   MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'C');
     const int hk4 = RegisterHotKey(app.hwnd, kHotkeyCalibrate, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'R');
-    Log("WinMain: hotkeys W=%d F=%d C=%d R=%d", hk1, hk2, hk3, hk4);
+    const int hk5 = RegisterHotKey(app.hwnd, kHotkeyAutoRegion, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A');
+    const int hk6 = RegisterHotKey(app.hwnd, kHotkeyAutoRegionDbg, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'A');
+    Log("WinMain: hotkeys W=%d F=%d C=%d R=%d A=%d ShiftA=%d", hk1, hk2, hk3, hk4, hk5, hk6);
 
     // Profiles: load list + master enable. Install the foreground-watch
     // hook only if auto-apply is on -- global EVENT_SYSTEM_FOREGROUND
@@ -5399,16 +7359,69 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.weaver.StopSR();
     Log("WinMain: StopSR done");
     Log("WinMain: ready — idle in tray, entering main loop");
+    g_winWatch.Start();   // background window list for the cut-outs (idle until needed)
+    // The render loop runs on this thread: ahead of normal-priority work (and
+    // well ahead of the Auto Stereo scanner) so it isn't made to skip frames.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // 1 ms timer resolution for this process: waits with short timeouts
+    // (the capture wait, frame pacing) otherwise round up to Windows' 15.6 ms
+    // default tick -- which held the weave to ~64 frames/s on any display.
+    // (Windows 10 2004+ applies this to SR Loom only, not system-wide.)
+    timeBeginPeriod(1);
 
     bool running = true;
     while (running)
     {
         MSG msg{};
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
-            if (msg.message == WM_QUIT) { running = false; break; }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            // (Each message is timed on its own: a slow one is logged with
+            // its id and which window it was for -- see HitchWatch.)
+            const auto tPump0 = std::chrono::steady_clock::now();
+            double dispatched = 0.0, dispatchedCpu = 0.0;
+            const double cpuPump0 = ThreadCpuMs();
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                if (msg.message == WM_QUIT) { running = false; break; }
+                const auto tm0 = std::chrono::steady_clock::now();
+                const double cpuMsg0 = ThreadCpuMs();
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tm0).count();
+                dispatched += ms;
+                dispatchedCpu += ThreadCpuMs() - cpuMsg0;
+                if (ms > 20.0)
+                {
+                    char cls[64] = "?";
+                    if (msg.hwnd) GetClassNameA(msg.hwnd, cls, (int)sizeof(cls));
+                    Log("Hitch: window message 0x%04X (wParam 0x%llX) for %s window \"%s\" took %.1f ms",
+                        msg.message, (unsigned long long)msg.wParam,
+                        msg.hwnd == g_app->hwnd ? "the weave" : (msg.hwnd ? "another" : "no"), cls, ms);
+                }
+            }
+            // Time not in any dispatched message: messages SENT to our windows
+            // (by Windows or other programs), handled inside PeekMessage.
+            const double pump = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPump0).count();
+            if (pump - dispatched > 20.0)
+            {
+                Log("Hitch: messages sent to SR Loom's windows took %.1f ms (running %.1f ms of it)",
+                    pump - dispatched, ThreadCpuMs() - cpuPump0 - dispatchedCpu);
+                // First time: list every window on this thread, so the log shows
+                // whose they could be (ours, the tray's, or ones the SR runtime
+                // made on this thread).
+                static bool s_listed = false;
+                if (!s_listed)
+                {
+                    s_listed = true;
+                    EnumThreadWindows(GetCurrentThreadId(), [](HWND h, LPARAM) -> BOOL {
+                        char cls[96] = {}, title[96] = {};
+                        GetClassNameA(h, cls, (int)sizeof(cls));
+                        GetWindowTextA(h, title, (int)sizeof(title));
+                        Log("  render-thread window %p class \"%s\" title \"%s\"%s", (void*)h, cls, title,
+                            IsWindowVisible(h) ? " (visible)" : "");
+                        return TRUE;
+                    }, 0);
+                }
+            }
         }
         if (running)
         {
@@ -5443,6 +7456,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 gs.pulfrichNd    = app.pulfrichNd;
                 gs.framePackMode = app.framePackMode;
                 gs.srMonitor     = SrMonitor(app);        // "this display" (excluded from the picker)
+                gs.autoStereo    = app.autoDetect;
                 gs.captureMonitor = app.sourceMonitor;    // currently-captured display
                 gs.foreignDisplay = app.foreignDisplay;   // a picked display (vs this one) is active
                 gs.quiltCols     = app.quiltCols;
@@ -5456,7 +7470,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 // SR Platform runtime version (e.g. "1.34.10.17449") for
                 // the About popup. Static helper; pull it fresh each frame
                 // so a runtime hot-swap (rare) updates the GUI display.
-                const char* sr = SRWeaver::GetSRPlatformVersion();
+                static const std::string s_srVersion = [] { const char* v = SRWeaver::GetSRPlatformVersion(); return std::string(v ? v : ""); }();
+                const char* sr = s_srVersion.c_str();
                 strncpy_s(gs.srPlatformVersion, sr ? sr : "", _TRUNCATE);
                 // Light-field parallax-scale state for the GUI slider.
                 gs.lfpHeadLeanMm      = app.lfpHeadLeanMm;
@@ -5522,7 +7537,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                 }
                 else
                     strncpy_s(gs.sourceName, app.foreignDisplay ? "Display" : "Monitor", _TRUNCATE);
-                if (app.gui.Render(gs))
+                const auto tGui0 = std::chrono::steady_clock::now();
+                bool guiChanged = false;
+                { HitchWatch hw("panel"); guiChanged = app.gui.Render(gs); }
+                app.prof.gui += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tGui0).count();
+                if (guiChanged)
                 {
                     app.convergence   = gs.convergence;
                     app.captureRebind = true;   // re-run the conversion with the new convergence
@@ -5777,6 +7796,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             // that case.
             PollProfileFullscreenState(app);
             PollKatangaAutoReceive(app);   // throttled to 500ms internally
+            // Late Latching switch (panel): apply to the running weaver.
+            {
+                static DWORD s_last = 0;
+                if (GetTickCount() - s_last > 500)
+                {
+                    s_last = GetTickCount();
+                    const int want = Settings::ReadLateLatching() ? 1 : 0;
+                    if (app.weavingEnabled && want != app.lateLatchingApplied)
+                    {
+                        app.weaver.SetLateLatching(want != 0);
+                        app.lateLatchingApplied = want;   // (once, even if the runtime ignores it)
+                    }
+                    if (!app.weavingEnabled) app.lateLatchingApplied = -1;   // re-apply when it restarts
+                    app.perfLog = Settings::ReadPerfLog();
+                    const bool skip = Settings::ReadDiagSkipWeave();
+                    if (skip != app.diagSkipWeave)
+                    {
+                        app.diagSkipWeave = skip;
+                        Log("DIAG: SR weave call %s", skip ? "SKIPPED (diagnostic)" : "restored");
+                    }
+                }
+            }
             // Taskbar cut-out, every frame: when a window goes borderless-
             // fullscreen (F11) the taskbar vanishes behind it, and a stale
             // hole would show that window mid-resize (a white/grey box) for
@@ -5806,6 +7847,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
     UnregisterHotKey(app.hwnd, kHotkeyCalibrate);
+    UnregisterHotKey(app.hwnd, kHotkeyAutoRegion);
+    UnregisterHotKey(app.hwnd, kHotkeyAutoRegionDbg);
     if (app.fgHook) { UnhookWinEvent(app.fgHook); app.fgHook = nullptr; }
     // UnregisterHotKey(app.hwnd, kHotkeyDetect); // auto-detect disabled
     app.tray.Remove();
@@ -5822,6 +7865,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.weaver.Shutdown();
     app.renderer.Shutdown();
     VideoSource::Shutdown();
+    g_winWatch.Stop();
     g_app = nullptr;
     return 0;
 }

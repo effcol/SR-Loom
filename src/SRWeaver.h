@@ -43,6 +43,8 @@ namespace srw
         // failure -- the caller should treat false strictly (i.e. "definitely
         // occluded, safe to skip rendering").
         bool IsWindowPartVisible(HWND hwnd, int width, int height);
+        // Late latching on/off (runtime). Returns the resulting state.
+        bool SetLateLatching(bool on);
 
         // Cooperative lens-state hints. Asks the SR runtime to enable or
         // disable the SR display's lenticular lens. Cooperative across all

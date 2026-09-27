@@ -50,6 +50,10 @@ namespace
     }
 }
 
+// Frame-pool depth: 4 (as Magpie) so the compositor never waits for a buffer while we
+// hold one (Magpie uses 4; 2 can stall capture delivery).
+static constexpr int kPoolBuffers = 4;
+
 struct Capture::Impl
 {
     IDirect3DDevice              device{ nullptr };
@@ -57,6 +61,12 @@ struct Capture::Impl
     Direct3D11CaptureFramePool   framePool{ nullptr };
     GraphicsCaptureSession       session{ nullptr };
     winrt::Windows::Graphics::SizeInt32 lastSize{ 0, 0 };
+    winrt::event_token           frameArrivedToken{};
+    HANDLE                       frameEvent = nullptr;   // auto-reset, set on FrameArrived
+    // Looking Glass: the latest frame, held open as the source for re-crops
+    // until the next one arrives (see Update).
+    Direct3D11CaptureFrame       held{ nullptr };
+    com_ptr<ID3D11Texture2D>     heldTex;
 };
 
 Capture::Capture() = default;
@@ -159,8 +169,14 @@ bool Capture::StartCaptureInternalActive()
     auto size = m_impl->item.Size();
     m_impl->lastSize = size;
     m_impl->framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, size);
     m_impl->session = m_impl->framePool.CreateCaptureSession(m_impl->item);
+    // FrameArrived fires on a pool thread (free-threaded pool): just signal.
+    if (!m_impl->frameEvent) m_impl->frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    {
+        HANDLE ev = m_impl->frameEvent;
+        m_impl->frameArrivedToken = m_impl->framePool.FrameArrived([ev](auto&&, auto&&) { SetEvent(ev); });
+    }
     // Composite the OS cursor only when asked (the display picker wants it so you can
     // see your pointer on the captured display; passthrough/overlay leave it off to
     // avoid a second cursor on the screen the real one is already on). Property added
@@ -185,8 +201,15 @@ bool Capture::StartCaptureInternalActive()
 void Capture::Stop()
 {
     if (!m_impl) return;
+    if (m_impl->held) { try { m_impl->held.Close(); } catch (...) {} m_impl->held = nullptr; }
+    m_impl->heldTex = nullptr;
     if (m_impl->session)   { m_impl->session.Close();   m_impl->session = nullptr; }
-    if (m_impl->framePool) { m_impl->framePool.Close();  m_impl->framePool = nullptr; }
+    if (m_impl->framePool)
+    {
+        try { m_impl->framePool.FrameArrived(m_impl->frameArrivedToken); } catch (...) {}
+        m_impl->framePool.Close();
+        m_impl->framePool = nullptr;
+    }
     m_impl->item = nullptr;
     m_active = false;
     m_regX = m_regY = m_regW = m_regH = 0;   // reset crop to full frame
@@ -202,19 +225,38 @@ bool Capture::Update(bool& sizeChanged)
 
     try
     {
+        // Frames about to be taken no longer count as "new" for
+        // WaitForNewFrame (reset BEFORE draining: one landing after this
+        // re-signals).
+        if (m_impl->frameEvent) ResetEvent(m_impl->frameEvent);
         auto frame = m_impl->framePool.TryGetNextFrame();
         if (!frame)
             return RecropIfRegionChanged(sizeChanged);
 
+        // Delivery statistics: every frame Windows hands us (even ones skipped
+        // below), timed by its own capture stamp -- the SR display's real
+        // capture rate, independent of how fast our loop runs.
+        auto countFrame = [this](const auto& fr) {
+            int64_t t = 0;
+            try { t = fr.SystemRelativeTime().count(); } catch (...) {}
+            if (!t) return;
+            if (m_statFrames == 0) m_statFirstT = t;
+            m_statLastT = t;
+            ++m_statFrames;
+        };
+        countFrame(frame);
         // Drain any queued frames and weave only the newest — minimizes latency.
         for (;;)
         {
             auto next = m_impl->framePool.TryGetNextFrame();
             if (!next) break;
+            countFrame(next);
             frame.Close();
             frame = next;
         }
 
+        // When this frame was captured (QPC-based, 100 ns units).
+        try { m_lastFrameTime = frame.SystemRelativeTime().count(); } catch (...) {}
         auto contentSize = frame.ContentSize();
         auto frameTex = GetDXGIInterface<ID3D11Texture2D>(frame.Surface());
 
@@ -239,29 +281,36 @@ bool Capture::Update(bool& sizeChanged)
         }
         else
         {
-            // Sub-region: keep the whole frame too, so a later region change
-            // can be re-cropped without waiting for a new frame.
-            ID3D11Texture2D* src = frameTex.get();
-            if (EnsureFull(m_frameW, m_frameH))
-            {
-                m_context->CopyResource(m_full, frameTex.get());
-                src = m_full;
-            }
+            // Sub-region (Looking Glass): crop straight from the captured
+            // frame, and HOLD that frame (one of the pool's buffers) until the
+            // next one arrives -- if the glass moves meanwhile it re-crops
+            // from it. (This used to copy the whole 4K frame every frame just
+            // in case: a second full-screen copy per frame.)
+            SAFE_RELEASE(m_full);
             sizeChanged = EnsureTarget(rw, rh);
             if (m_tex)
-                m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, src, 0, &box);
+                m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, frameTex.get(), 0, &box);
         }
         m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
 
-        frame.Close();
+        if (m_impl->held) { m_impl->held.Close(); m_impl->held = nullptr; }
+        m_impl->heldTex = nullptr;
+        if (!fullFrame)
+        {
+            m_impl->held    = frame;
+            m_impl->heldTex = frameTex;
+        }
+        else
+            frame.Close();
 
         // Track window resizes by recreating the pool at the new content size.
         if (contentSize.Width != m_impl->lastSize.Width ||
             contentSize.Height != m_impl->lastSize.Height)
         {
+            if (m_impl->held) { m_impl->held.Close(); m_impl->held = nullptr; m_impl->heldTex = nullptr; }
             m_impl->lastSize = contentSize;
             m_impl->framePool.Recreate(
-                m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, contentSize);
+                m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, contentSize);
         }
         return true;
     }
@@ -291,6 +340,17 @@ bool Capture::RecropIfRegionChanged(bool& sizeChanged)
     int rx, ry, rw, rh;
     if (!ResolveRegion(rx, ry, rw, rh)) return false;
     if (rx == m_appX && ry == m_appY && rw == m_appW && rh == m_appH) return false;
+
+    // The held capture frame (Looking Glass) is the whole frame: crop from it.
+    if (m_impl && m_impl->heldTex)
+    {
+        sizeChanged = EnsureTarget(rw, rh);
+        if (!m_tex) return false;
+        D3D11_BOX hb{ (UINT)rx, (UINT)ry, 0, (UINT)(rx + rw), (UINT)(ry + rh), 1 };
+        m_context->CopySubresourceRegion(m_tex, 0, 0, 0, 0, m_impl->heldTex.get(), 0, &hb);
+        m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
+        return true;
+    }
 
     if (!m_full)
     {
@@ -396,5 +456,16 @@ void Capture::Shutdown()
 {
     Stop();
     ReleaseTarget();
-    if (m_impl) { m_impl->device = nullptr; m_impl.reset(); }
+    if (m_impl)
+    {
+        if (m_impl->frameEvent) { CloseHandle(m_impl->frameEvent); m_impl->frameEvent = nullptr; }
+        m_impl->device = nullptr;
+        m_impl.reset();
+    }
+}
+
+bool Capture::WaitForNewFrame(DWORD timeoutMs)
+{
+    if (!m_active || !m_impl || !m_impl->frameEvent) return false;
+    return WaitForSingleObject(m_impl->frameEvent, timeoutMs) == WAIT_OBJECT_0;
 }

@@ -1,4 +1,5 @@
 #include "SRWeaver.h"
+#include "Settings.h"
 
 // Allows SR::TryGetDisplayManagerInstance() (lazy-bound display manager).
 #define SRDISPLAY_LAZYBINDING
@@ -123,6 +124,16 @@ bool SRWeaver::IsLensEnabled() const
     catch (...) { return false; }
 }
 
+bool SRWeaver::SetLateLatching(bool on)
+{
+    if (!m_weaver) return false;
+    try { m_weaver->enableLateLatching(on); }
+    catch (...) { Log("enableLateLatching(%d) threw", (int)on); }
+    const bool now = m_weaver->isLateLatchingEnabled();
+    Log("LateLatching enabled=%d (requested %d)", (int)now, (int)on);
+    return now;
+}
+
 bool SRWeaver::IsWindowPartVisible(HWND hwnd, int width, int height)
 {
     if (!m_context || !hwnd || width <= 0 || height <= 0)
@@ -214,7 +225,7 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     // (A/B-tested off in an earlier build to rule out as the cause of
     // window-drag flicker -- flicker persists with it off, so it's not
     // the culprit; long-standing converter behaviour we'll chase later.)
-    try { m_weaver->enableLateLatching(true); }
+    try { m_weaver->enableLateLatching(Settings::ReadLateLatching()); }
     catch (...) { Log("enableLateLatching threw -- continuing without it"); }
     Log("LateLatching enabled=%d", m_weaver->isLateLatchingEnabled() ? 1 : 0);
 

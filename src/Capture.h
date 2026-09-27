@@ -40,6 +40,27 @@ namespace srw
         // capture dimensions changed (the caller must then re-register SRV()).
         bool Update(bool& sizeChanged);
 
+        // Block (up to timeoutMs) until the capture has a frame not yet taken
+        // by Update(). Lets the loop start work the moment a new frame lands
+        // instead of polling a moment too early and running a frame behind.
+        bool WaitForNewFrame(DWORD timeoutMs);
+
+        // When the newest frame taken by Update() was captured: QPC time in
+        // 100 ns units (0 = unknown). What the woven picture shows is the
+        // screen as it was at this moment.
+        int64_t LastFrameTime100ns() const { return m_lastFrameTime; }
+
+        // Frames Windows delivered since the last call and their rate (by
+        // capture timestamps; includes frames Update() skipped). Resets.
+        double TakeDeliveryRate(uint64_t& frames)
+        {
+            frames = m_statFrames;
+            const double span = (m_statLastT - m_statFirstT) / 1.0e7;
+            const double fps = (m_statFrames > 1 && span > 0) ? (m_statFrames - 1) / span : 0.0;
+            m_statFrames = 0;
+            return fps;
+        }
+
         // Restrict what gets fed to the weaver to a sub-rectangle of the captured
         // frame, in capture-frame (physical) pixels. Pass w<=0 or h<=0 for the
         // whole frame. Used by the looking-glass / passthrough to weave only the
@@ -47,6 +68,7 @@ namespace srw
         void SetSourceRegion(int x, int y, int w, int h);
 
         ID3D11ShaderResourceView* SRV() const { return m_srv; }
+        ID3D11Texture2D*          Texture() const { return m_tex; }   // the (cropped) copy target
         int         Width()      const { return m_width; }   // region (weave-input) width
         int         Height()     const { return m_height; }
         int         FrameWidth()  const { return m_frameW; } // full captured-frame size
@@ -88,6 +110,9 @@ namespace srw
         // it (no extra copy), and gets adopted as the source on a re-crop.
         ID3D11Texture2D*          m_full    = nullptr;
         bool                      m_active  = false;
+        int64_t                   m_lastFrameTime = 0;
+        uint64_t                  m_statFrames = 0;
+        int64_t                   m_statFirstT = 0, m_statLastT = 0;
         bool                      m_captureCursor = false;   // composite the OS cursor into the frame
         // TYPELESS buffer so we can copy the BGRA frame into it and still create
         // an sRGB shader view (sRGB casting isn't allowed on a fully-typed res).

@@ -68,6 +68,7 @@ namespace srw
         ID_TRAY_DETECT,
         ID_TRAY_EXIT,
         ID_TRAY_OPEN_UPDATE,            // "Update available" -- opens the GitHub release page
+        ID_TRAY_AUTO_STEREO,            // panel "Auto Stereo" button: detect + weave 3D images on screen
     };
 
     // Window-list items get ids in this range; index = id - base.

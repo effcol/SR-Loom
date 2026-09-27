@@ -36,6 +36,29 @@ namespace srw::Settings
     // extension) starts publishing frames over Katanga, SR Loom switches to
     // receiving them automatically, and restores the previous setup when it
     // stops. Default ON. HKCU\Software\SRLoom\KatangaAutoReceive.
+    // Present the weave through DirectComposition (default ON): no bit-blt
+    // copy or DwmFlush, and cut-outs (taskbar, Auto Stereo regions...) drawn
+    // as see-through pixels in the same frame as the picture. Off = the
+    // classic swap chains. Takes effect on restart (the weave window is
+    // created for one or the other). HKCU\Software\SRLoom\DirectComposition.
+    // SR weaver late latching (default ON): eye positions updated for frames
+    // already in flight. Suspected of pacing the weave to the 60 Hz tracking
+    // camera -- switchable to compare. HKCU\Software\SRLoom\LateLatching.
+    bool ReadLateLatching();
+    void WriteLateLatching(bool enable);
+
+    // Diagnostics only (no UI): skip the SR weaver's weave call, to see
+    // whether it paces the loop. HKCU\Software\SRLoom\DiagSkipWeave = 1.
+    bool ReadDiagSkipWeave();
+    void WriteDiagSkipWeave(bool enable);
+    // Frame / GPU timing lines in srweaver.log every 5 s (default ON while
+    // tuning). HKCU\Software\SRLoom\PerfLog.
+    bool ReadPerfLog();
+    void WritePerfLog(bool enable);
+
+    bool ReadDirectComposition();
+    void WriteDirectComposition(bool enable);
+
     bool ReadKatangaAutoReceive();
     void WriteKatangaAutoReceive(bool enable);
 

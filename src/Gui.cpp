@@ -412,6 +412,13 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     m_startInTray  = Settings::ReadStartInTray();
     m_headTrackingOnStartup = Settings::ReadHeadTrackingOnStartup();
     m_katangaAutoReceive    = Settings::ReadKatangaAutoReceive();
+    m_directComposition     = Settings::ReadDirectComposition();
+    m_lateLatching          = Settings::ReadLateLatching();
+    m_perfLog               = Settings::ReadPerfLog();
+    // The weave-skip test never survives a restart (a black 3D screen at
+    // launch would look broken).
+    Settings::WriteDiagSkipWeave(false);
+    m_skipWeave             = false;
     // Start in Windows' own light/dark app mode. The header's theme button
     // still flips it for the session; a Windows theme change re-syncs it
     // (WM_SETTINGCHANGE below).
@@ -754,6 +761,17 @@ bool Gui::EnsureSwapChain(UINT w, UINT h)
 bool Gui::Render(GuiState& state)
 {
     if (!m_visible || !m_imguiReady) return false;
+
+    // Up to ~60 frames/s, or straight away when the panel has had a message
+    // (mouse, keys, resize). It used to draw and present on every weave loop
+    // (140+/s), which only added GPU and DWM work to the weave's thread.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_refitDepth == 0)
+    {
+        if (!m_msgSinceFrame && now - m_lastFrame < std::chrono::milliseconds(16)) return false;
+        m_msgSinceFrame = false;
+        m_lastFrame = now;
+    }
 
     RECT rc{}; GetClientRect(m_hwnd, &rc);
     if (!EnsureSwapChain((UINT)(rc.right - rc.left), (UINT)(rc.bottom - rc.top)))
@@ -1163,7 +1181,7 @@ bool Gui::Render(GuiState& state)
 
             // This Display → fullscreen passthrough weave of the SR display itself.
             const bool monActive = (state.source == SourceKind::CaptureMonitor &&
-                                    !state.foreignDisplay &&
+                                    !state.foreignDisplay && !state.autoStereo &&
                                     state.mode == OutputMode::Fullscreen);
             if (monActive) {
                 ImGui::PushStyleColor(ImGuiCol_Button,        g_accent);
@@ -1192,9 +1210,19 @@ bool Gui::Render(GuiState& state)
             const bool dispActive = (state.source == SourceKind::CaptureMonitor && state.foreignDisplay);
             const bool winActive  = (state.source == SourceKind::CaptureWindow);
 
-            std::vector<MonEntry> mons;
-            EnumDisplayMonitors(nullptr, nullptr, MonEnumProc, reinterpret_cast<LPARAM>(&mons));
-            ResolveDisplayNames(mons);   // friendly EDID names where Windows knows them
+            // Monitor list + friendly names: cached for 2 s. QueryDisplayConfig
+            // (behind the friendly names) talks to the display driver and can
+            // take milliseconds -- far too slow to run every frame.
+            static std::vector<MonEntry> s_mons;
+            static DWORD s_monsAt = 0;
+            if (s_mons.empty() || GetTickCount() - s_monsAt > 2000)
+            {
+                s_mons.clear();
+                EnumDisplayMonitors(nullptr, nullptr, MonEnumProc, reinterpret_cast<LPARAM>(&s_mons));
+                ResolveDisplayNames(s_mons);   // friendly EDID names where Windows knows them
+                s_monsAt = GetTickCount();
+            }
+            const std::vector<MonEntry>& mons = s_mons;
             const char* dispLabel = "Other Displays";
             if (dispActive)
                 for (auto& m : mons) if (m.mon == state.captureMonitor) dispLabel = m.label;
@@ -1255,12 +1283,42 @@ bool Gui::Render(GuiState& state)
             }
             if (winActive) popAccent();
 
-            // Row 3: paired action buttons — "Load Image..." (left) and
-            // "Make Active Window 3D" (right). Image load opens the standard
-            // file dialog and routes through the existing tray command.
-            if (ImGui::Button("Load Media...",          ImVec2(half, 0))) post(ID_TRAY_SRC_TESTIMAGE);
+            // Row 3: "Auto Stereo" switch (left) -- find 3D pictures / videos
+            // on the SR display and weave just those, each in its own format
+            // -- and "Make Active Window 3D" (right).
+            {
+                ImGui::BeginGroup();
+                const float startX = ImGui::GetCursorPosX();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Auto Stereo");
+                ImGui::SameLine();
+                const float togW = ImGui::GetFrameHeight() * 1.8f;
+                ImGui::SetCursorPosX(startX + half - togW);
+                if (ToggleSwitch("##autostereo", state.autoStereo)) post(ID_TRAY_AUTO_STEREO);
+                ImGui::EndGroup();
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float maxW = 340.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(
+                    "Finds 3D pictures and videos on this display -- side-by-side, "
+                    "top-and-bottom and red/cyan anaglyph -- and shows just those in 3D, "
+                    "following them as you scroll. Everything else stays 2D.\n\n"
+                    "Ctrl+Alt+A over one removes it (or adds one it missed). The screen "
+                    "is looked at on this PC only, in memory; nothing is saved or sent "
+                    "anywhere.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
             ImGui::SameLine(0, gap);
             if (ImGui::Button("Make Active Window 3D", ImVec2(half, 0))) post(ID_TRAY_CAPTURE_FOREGROUND);
+
+            // Row 4: "Load Media..." opens the standard file dialog and routes
+            // through the existing tray command.
+            if (ImGui::Button("Load Media...", ImVec2(-FLT_MIN, 0))) post(ID_TRAY_SRC_TESTIMAGE);
         }
 
         if (CollapsibleHeader("STEREO 3D INPUT", m_stereoInputSectionOpen, m_dpiScale, "##stereohdr"))
@@ -2193,6 +2251,75 @@ bool Gui::Render(GuiState& state)
                 ImGui::PopTextWrapPos();
                 ImGui::EndTooltip();
             }
+            // Third row: the presenter. Restart needed (the weave window is
+            // created for one presenter or the other).
+            if (pairToggle2("Fast Presenter", m_directComposition, halfW))
+            {
+                m_directComposition = !m_directComposition;
+                Settings::WriteDirectComposition(m_directComposition);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(
+                    "When on (default), SR Loom shows the 3D through DirectComposition: "
+                    "lower latency, and the taskbar / 2D windows / Auto Stereo pictures "
+                    "are cut out in the same frame as the picture. Turn off if the SR "
+                    "display flickers or blanks. Restart SR Loom to apply.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Late Latching", m_lateLatching, halfW))
+            {
+                m_lateLatching = !m_lateLatching;
+                Settings::WriteLateLatching(m_lateLatching);
+            }
+            if (ImGui::IsItemHovered())
+            {
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(
+                    "When on (default), the SR weaver updates your eye position for frames "
+                    "already on their way to the screen. It may also hold each frame for the "
+                    "eye-tracking camera (60 Hz) -- turn off to compare smoothness on a fast "
+                    "display. Applies straight away.");
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            // Fourth row: diagnostics.
+            auto tip = [&](const char* text) {
+                if (!ImGui::IsItemHovered()) return;
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(text);
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            };
+            if (pairToggle2("Perf Log", m_perfLog, halfW))
+            {
+                m_perfLog = !m_perfLog;
+                Settings::WritePerfLog(m_perfLog);
+            }
+            tip("Writes frame-rate and timing lines to srweaver.log every 5 seconds "
+                "(\"Frame profile\" and \"GPU ms\"), for tracking down lag. Applies straight away.");
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Skip SR Weave (test)", m_skipWeave, halfW))
+            {
+                m_skipWeave = !m_skipWeave;
+                Settings::WriteDiagSkipWeave(m_skipWeave);
+            }
+            tip("Diagnostic: stops calling the SR weaver, so the 3D output goes BLACK, while "
+                "everything else keeps running. With Perf Log on, compare the frame rate with "
+                "this on and off to see whether the SR weaver is what holds it back. Turn off "
+                "to weave again. Not remembered across restarts.");
         }
     }
 
@@ -2290,7 +2417,18 @@ bool Gui::FitHeightToContent(int clientContentH)
     return false;
 }
 
+// Every message to the panel, timed (the render thread's hitch watchdog).
 LRESULT CALLBACK Gui::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const DWORD sent = InSendMessageEx(nullptr);
+    if (g_gui) g_gui->m_msgSinceFrame = true;
+    const LRESULT r = WndProcImpl(hwnd, msg, wParam, lParam);
+    LogSlowMessage("panel", msg, wParam, sent, t0);
+    return r;
+}
+
+LRESULT Gui::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
         return true;

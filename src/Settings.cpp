@@ -123,6 +123,46 @@ namespace srw::Settings
         WriteDword(kSettingsKey, kHeadTrackingOnStartupValue, enable ? 1u : 0u);
     }
 
+    bool ReadLateLatching()
+    {
+        return ReadDword(kSettingsKey, L"LateLatching", 1) != 0;   // default ON
+    }
+
+    void WriteLateLatching(bool enable)
+    {
+        WriteDword(kSettingsKey, L"LateLatching", enable ? 1u : 0u);
+    }
+
+    void WriteDiagSkipWeave(bool enable)
+    {
+        WriteDword(kSettingsKey, L"DiagSkipWeave", enable ? 1u : 0u);
+    }
+
+    bool ReadPerfLog()
+    {
+        return ReadDword(kSettingsKey, L"PerfLog", 1) != 0;
+    }
+
+    void WritePerfLog(bool enable)
+    {
+        WriteDword(kSettingsKey, L"PerfLog", enable ? 1u : 0u);
+    }
+
+    bool ReadDiagSkipWeave()
+    {
+        return ReadDword(kSettingsKey, L"DiagSkipWeave", 0) != 0;
+    }
+
+    bool ReadDirectComposition()
+    {
+        return ReadDword(kSettingsKey, L"DirectComposition", 1) != 0;   // default ON
+    }
+
+    void WriteDirectComposition(bool enable)
+    {
+        WriteDword(kSettingsKey, L"DirectComposition", enable ? 1u : 0u);
+    }
+
     bool ReadKatangaAutoReceive()
     {
         return ReadDword(kSettingsKey, L"KatangaAutoReceive", 1) != 0;   // default ON

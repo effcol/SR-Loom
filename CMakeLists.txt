@@ -129,6 +129,12 @@ add_executable(SRLoom WIN32
     src/Capture.cpp
     src/CaptureDXGI.cpp
     src/Converter.cpp
+    src/RegionWeave.cpp
+    src/RegionWeave.h
+    src/ScreenAnalysis.cpp
+    src/ScreenAnalysis.h
+    src/GpuTrack.cpp
+    src/GpuTrack.h
     src/Detector.cpp
     src/Gui.cpp
     src/AcerSpatialLabs.cpp

@@ -8,6 +8,14 @@
 #include <cstdio>
 #include <cstdarg>
 #include <string>
+#include <chrono>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <share.h>
+#include <intrin.h>
 
 // Release a COM pointer and null it.
 #ifndef SAFE_RELEASE
@@ -19,7 +27,7 @@ namespace srw
     // Current SR Loom version. Compared (after stripping any leading 'v') to
     // the GitHub Releases latest-tag by the update checker. Bump in lockstep
     // with the git tag for new releases.
-    constexpr const char* kAppVersion = "2.2";
+    constexpr const char* kAppVersion = "3.0";
 
     // GitHub repo path for the update checker + "About" links.
     constexpr const char* kRepoSlug = "effcol/SR-Loom";
@@ -143,6 +151,77 @@ namespace srw
         return path;
     }
 
+    // srweaver.log writer. Log() only queues the line; a background thread
+    // appends it to the file, which stays open. Opening, writing and closing
+    // the file on the caller's thread (as Log used to) took 10-30 ms now and
+    // then -- antivirus scanning each write -- and showed up as render-thread
+    // hitches in whatever section happened to log something.
+    class LogWriter
+    {
+    public:
+        // Never destroyed, so it still works while the process exits.
+        static LogWriter& Get() { static LogWriter* w = new LogWriter(); return *w; }
+
+        void Push(const char* line)
+        {
+            {
+                std::lock_guard<std::mutex> lk(m_queueMutex);
+                m_queue.emplace_back(line);
+                if (!m_started)
+                {
+                    m_started = true;
+                    std::thread([this] { Run(); }).detach();
+                    std::atexit([] { LogWriter::Get().Flush(); });
+                }
+            }
+            m_cv.notify_one();
+        }
+
+        // Write out whatever is queued, on the calling thread. (Gives up if the
+        // writer thread stays stuck mid-write -- e.g. it's the one crashing.)
+        void Flush()
+        {
+            std::unique_lock<std::mutex> fk(m_fileMutex, std::try_to_lock);
+            for (int i = 0; i < 20 && !fk.owns_lock(); ++i) { Sleep(5); (void)fk.try_lock(); }
+            if (fk.owns_lock()) WriteQueued();
+        }
+
+    private:
+        void Run()
+        {
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lk(m_queueMutex);
+                    m_cv.wait(lk, [this] { return !m_queue.empty(); });
+                }
+                std::lock_guard<std::mutex> fk(m_fileMutex);
+                WriteQueued();
+            }
+        }
+
+        // (Holding m_fileMutex, so lines go out in order.)
+        void WriteQueued()
+        {
+            std::deque<std::string> batch;
+            {
+                std::lock_guard<std::mutex> lk(m_queueMutex);
+                batch.swap(m_queue);
+            }
+            if (batch.empty()) return;
+            if (!m_file) m_file = _fsopen(ExePath("srweaver.log").c_str(), "a", _SH_DENYNO);   // (readable while open)
+            if (!m_file) return;
+            for (const std::string& s : batch) { fputs(s.c_str(), m_file); fputc('\n', m_file); }
+            fflush(m_file);
+        }
+
+        std::mutex              m_queueMutex, m_fileMutex;
+        std::condition_variable m_cv;
+        std::deque<std::string> m_queue;
+        bool                    m_started = false;
+        FILE*                   m_file = nullptr;
+    };
+
     // Append a line to srweaver.log (next to the exe) and the debugger output.
     inline void Log(const char* fmt, ...)
     {
@@ -153,13 +232,46 @@ namespace srw
         va_end(ap);
         ::OutputDebugStringA(buf);
         ::OutputDebugStringA("\n");
-        FILE* f = nullptr;
-        if (fopen_s(&f, ExePath("srweaver.log").c_str(), "a") == 0 && f)
-        {
-            fputs(buf, f);
-            fputc('\n', f);
-            fclose(f);
-        }
+        LogWriter::Get().Push(buf);
+    }
+
+    // Write out every queued log line now (crash handler).
+    inline void LogFlush() { LogWriter::Get().Flush(); }
+
+    // CPU time the calling thread has actually run, in ms. Next to wall time
+    // it tells a slow section that was WORKING from one that was WAITING (on
+    // the GPU queue, a lock, the scheduler). Thread cycle counts tick at the
+    // TSC rate, calibrated against QPC since the first call (made at startup).
+    inline double TscPerMs()
+    {
+        static const unsigned long long tsc0 = __rdtsc();
+        static const LARGE_INTEGER qpc0 = [] { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); return q; }();
+        LARGE_INTEGER qpc{}, qpf{};
+        QueryPerformanceCounter(&qpc);
+        QueryPerformanceFrequency(&qpf);
+        const double ms = (double)(qpc.QuadPart - qpc0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
+        return ms > 100.0 ? (double)(__rdtsc() - tsc0) / ms : 3.0e6;   // (a rough 3 GHz until calibrated)
+    }
+    inline double ThreadCpuMs()
+    {
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cycles);
+        return (double)cycles / TscPerMs();
+    }
+
+    // A window message that took a while to handle, logged with where it came
+    // from: part of the render thread's hitch watchdog. sendFlags is
+    // InSendMessageEx() taken as the message arrived.
+    inline void LogSlowMessage(const char* window, UINT msg, WPARAM wp, DWORD sendFlags,
+                               std::chrono::steady_clock::time_point t0)
+    {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms <= 15.0) return;
+        const char* from = (sendFlags & ISMEX_SEND)   ? "sent by another thread or program"
+                         : (sendFlags & ISMEX_NOTIFY) ? "notification from another thread"
+                         : "from SR Loom's own thread";
+        Log("Hitch: %s window message 0x%04X (wParam 0x%llX), %s, took %.1f ms",
+            window, msg, (unsigned long long)wp, from, ms);
     }
 
     // The selectable source stereo layouts, shared by the tray menu and command

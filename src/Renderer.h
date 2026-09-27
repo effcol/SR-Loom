@@ -6,17 +6,48 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>   // IDXGISwapChain1, IDXGIFactory2
 #include <chrono>
+#include <vector>
+
+struct IDCompositionDevice;
+struct IDCompositionTarget;
+struct IDCompositionVisual;
 
 namespace srw
 {
     class Renderer
     {
     public:
+        bool IsFlipModel() const { return m_flip; }
         Renderer() = default;
         ~Renderer();
 
         // Create the device + swap chain for the given window. Returns false on failure.
-        bool Initialize(HWND hwnd);
+        // useDComp: present through DirectComposition (the window must have been
+        // created with WS_EX_NOREDIRECTIONBITMAP); one composition swap chain
+        // serves every mode, and see-through areas are drawn as transparent
+        // pixels (SetVisibleRects) instead of reshaping the window.
+        bool Initialize(HWND hwnd, bool useDComp = false);
+        bool IsDComp() const { return m_dcomp != nullptr; }
+        // DirectComposition: the rate our window is being composed at (Hz, 0 = unknown).
+        double CompositionRateHz() const;
+
+        // DirectComposition only: which parts of the window show the weave
+        // (client pixels); everything else is see-through, in the same frame
+        // as the picture. All = the whole window.
+        void SetVisibleAll();
+        // DirectComposition: apply the see-through mask now (normally done
+        // inside Present; separate so it can be timed on its own).
+        void ApplyMask();
+        void SetVisibleRects(const std::vector<RECT>& rects);
+        // Auto Stereo: pictures that move with a GpuTracker offset (read on the
+        // GPU this frame, so the see-through cut-out moves with the picture),
+        // minus areas never shown (windows in front, taskbar, 2D windows).
+        struct MaskTracked { RECT rect{}; RECT clip{}; int slot = -1; float scale = 2.0f; };
+        struct MaskCut     { RECT rect{}; int radius = 0; };   // a hole (rounded corners)
+        // Whole window except these holes (Fullscreen / Looking Glass cut-outs).
+        void SetVisibleAllExcept(const std::vector<MaskCut>& holes);
+        void SetVisibleTracked(const std::vector<MaskTracked>& tracked, const std::vector<MaskCut>& excl,
+                               ID3D11ShaderResourceView* gpuResults);
         void Shutdown();
 
         // Resize the swap chain to the new client size (called on WM_SIZE).
@@ -29,7 +60,10 @@ namespace srw
         // Present the woven frame. vsync=true waits for one v-blank; vsync=false
         // presents immediately (with tearing allowed on a flip swapchain — ideal for
         // VRR displays and lowest latency).
-        void Present(bool vsync);
+        // flushDwm (bit-blt only): block until the next composition after
+        // presenting (paces the loop). Pass false when the caller paces
+        // itself -- e.g. on capture frame arrival.
+        void Present(bool vsync, bool flushDwm = true);
 
         // Block until the flip swap chain can accept a new frame (frame-latency
         // waitable object). Paces the render loop to the display's refresh with ~1
@@ -63,6 +97,22 @@ namespace srw
     private:
         bool CreateSwapChain(bool flip);   // (re)create the swap chain in the chosen model
         bool CreateBackBufferView();
+        bool CreateDCompSwapChain();
+        bool InitMask();
+        bool                    m_maskDone  = false;   // applied this frame already (ApplyMaskNow)
+
+        IDCompositionDevice*    m_dcomp     = nullptr;
+        IDCompositionTarget*    m_dcTarget  = nullptr;
+        IDCompositionVisual*    m_dcVisual  = nullptr;
+        ID3D11VertexShader*     m_maskVS    = nullptr;
+        ID3D11PixelShader*      m_maskPS    = nullptr;
+        ID3D11BlendState*       m_maskBlend = nullptr;
+        ID3D11Buffer*           m_maskCB    = nullptr;
+        bool                    m_maskAll   = true;
+        std::vector<RECT>       m_maskRects;
+        std::vector<MaskTracked> m_maskTracked;
+        std::vector<MaskCut>    m_maskExcl;
+        ID3D11ShaderResourceView* m_maskGpu = nullptr;   // not owned
 
         HWND                    m_hwnd      = nullptr;
         ID3D11Device*           m_device    = nullptr;
@@ -89,5 +139,6 @@ namespace srw
         // can compute the remaining wait time.
         int64_t                              m_targetIntervalNs = 0;
         std::chrono::steady_clock::time_point m_lastPresentEnd{};
+        std::chrono::steady_clock::time_point m_lastFrameStart{};   // render cap counts from here
     };
 }
