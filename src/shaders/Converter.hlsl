@@ -230,21 +230,26 @@ float4 PSAnaDisp(VSOut i) : SV_Target
 // every read: the 1/16 search alone took ~4 ms at 4K).
 float4 PSDown(VSOut i) : SV_Target
 {
-    // Exactly the 4x4 block of source pixels under this output pixel, found
-    // by pixel position (block centre = 4 x this pixel's centre), not by uv:
-    // the level is sized in whole blocks, a little past the picture's edge
-    // (clamped there), so its grid never drifts against the picture. (By uv,
-    // a picture whose size didn't divide by 16 got "16-px" blocks of 15.9 px,
-    // drifting across it differently for every size -- the disparities, and
-    // the blobs, changed whenever the area did.)
+    // The 4x4 block of source pixels under this output pixel, found by pixel
+    // position (block centre = 4 x this pixel's centre), not by uv: the level
+    // is sized in whole blocks, a little past the picture's edge (clamped
+    // there), so its grid never drifts against the picture.
+    // Anti-aliased: a tent over the 8x8 around the block (weights 1,3,3,1
+    // per axis, from 16 bilinear taps each averaging a pixel pair), not a
+    // plain box average. A box average jumps as the picture moves across the
+    // block grid by a pixel or two; everything downstream (descriptors,
+    // matches) jumped with it -- blobs came and went while scrolling.
     uint W, H;
     srcTex.GetDimensions(W, H);
     const float2 t = 1.0 / float2(W, H);
     const float2 c = i.pos.xy * 4.0 * t;
-    return 0.25 * (srcTex.SampleLevel(samp, c + t * float2(-1, -1), 0) +
-                   srcTex.SampleLevel(samp, c + t * float2( 1, -1), 0) +
-                   srcTex.SampleLevel(samp, c + t * float2(-1,  1), 0) +
-                   srcTex.SampleLevel(samp, c + t * float2( 1,  1), 0));
+    const float o[4] = { -3.0, -1.0, 1.0, 3.0 };
+    const float wt[4] = { 1.0, 3.0, 3.0, 1.0 };
+    float4 acc = 0;
+    [unroll] for (int y = 0; y < 4; ++y)
+    [unroll] for (int x = 0; x < 4; ++x)
+        acc += srcTex.SampleLevel(samp, c + t * float2(o[x], o[y]), 0) * (wt[x] * wt[y]);
+    return acc / 64.0;
 }
 
 // Descriptor pass: each refine-level pixel's 4-angle gradient descriptor
@@ -296,31 +301,50 @@ float4 PSAnaRefine(VSOut i) : SV_Target
     int2   p  = int2(i.pos.xy);
     int    W  = (int)g_coarseW;
     float4 priorAll = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .ba uniqueness
-    const int kL0 = (int)round(priorAll.r * g_coarseW);
-    const int kR0 = (int)round(priorAll.g * g_coarseW);
-    const int M = 6;
+    const float lim = W / g_lvlToSrcX;                       // (the picture's right edge, in this level's px)
 
     float refL[16], refR[16]; loadDescL(p, refL); loadDescR(p, refR);
 
+    // Hypotheses: the coarse answer here (interpolated), searched +-6, and
+    // the actual answers of the 2x2 coarse blocks around, each +-2. At an
+    // object's edge the interpolated answer is a blend belonging to neither
+    // side, and a thin object (a leg, a pole) narrower than a coarse block
+    // often has the background's -- reachable, or not, depending on where
+    // the block grid falls: blobs that came and went as the picture moved.
+    uint cw, ch; dispTex.GetDimensions(cw, ch);
+    const int2 b0 = int2(floor(uv * float2(cw, ch) - 0.5));
     float bestL = 1e9, dL = priorAll.r, bestR = 1e9, dR = priorAll.g;
-    [loop] for (int k = -M; k <= M; ++k)
+    [loop] for (int h = 0; h < 5; ++h)
     {
-        const int xL = clamp(p.x + kL0 + k, 0, W - 1);   // candidate for dLR (match the right view)
-        const int xR = clamp(p.x + kR0 + k, 0, W - 1);   // candidate for dRL (match the left view)
-        float candR[16], candL[16];
-        loadDescR(int2(xL, p.y), candR);
-        loadDescL(int2(xR, p.y), candL);
-        // (Ties -- a flat area, where every candidate costs the same -- go
-        // to the coarse level's answer, k = 0: the loop used to keep the
-        // first, far-left candidate, so flat areas got a disparity of -6
-        // texels for no reason, and smoothing mixed those into the picture's
-        // own next door -- borrows landing in the wrong place: blobs.)
-        const float tie = abs((float)k) * 0.002;
-        float sadL = descCost(refL, candR) + tie;   // ref left view vs candidate right view
-        float sadR = descCost(refR, candL) + tie;   // ref right view vs candidate left view
-        const int rawL = p.x + kL0 + k, rawR = p.x + kR0 + k;   // (off the picture: never, see PSAnaDisp)
-        if (sadL < bestL && rawL >= 0 && rawL < W / g_lvlToSrcX) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
-        if (sadR < bestR && rawR >= 0 && rawR < W / g_lvlToSrcX) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
+        float2 pr = priorAll.rg;
+        if (h > 0)
+        {
+            const int2 q = clamp(b0 + int2((h - 1) & 1, (h - 1) >> 1), int2(0, 0), int2(cw - 1, ch - 1));
+            pr = dispTex.Load(int3(q, 0)).rg;
+        }
+        const int kL0 = (int)round(pr.r * g_coarseW);
+        const int kR0 = (int)round(pr.g * g_coarseW);
+        const int M = (h == 0) ? 6 : 2;
+        [loop] for (int k = -M; k <= M; ++k)
+        {
+            const int rawL = p.x + kL0 + k, rawR = p.x + kR0 + k;
+            const int xL = clamp(rawL, 0, W - 1);   // candidate for dLR (match the right view)
+            const int xR = clamp(rawR, 0, W - 1);   // candidate for dRL (match the left view)
+            float candR[16], candL[16];
+            loadDescR(int2(xL, p.y), candR);
+            loadDescL(int2(xR, p.y), candL);
+            // (Ties -- a flat area, where every candidate costs the same -- go
+            // to the interpolated coarse answer, k = 0: the loop used to keep
+            // the first, far-left candidate, so flat areas got a disparity of
+            // -6 texels for no reason, and smoothing mixed those into the
+            // picture's own next door -- borrows landing in the wrong place.)
+            const float tie = (abs((float)k) + (h > 0 ? 1.0 : 0.0)) * 0.002;
+            float sadL = descCost(refL, candR) + tie;   // ref left view vs candidate right view
+            float sadR = descCost(refR, candL) + tie;   // ref right view vs candidate left view
+            // (Off the picture: never, see PSAnaDisp.)
+            if (sadL < bestL && rawL >= 0 && rawL < lim) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
+            if (sadR < bestR && rawR >= 0 && rawR < lim) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
+        }
     }
     return float4(dL, dR, priorAll.b, priorAll.a);   // carry uniqueness through
 }

@@ -508,6 +508,35 @@ int wmain(int argc, wchar_t** argv)
         scoreEye(truthL, 0, L"L");
         scoreEye(truthR, eyeW, L"R");
     }
+    // ANATEST_STREAKS: in the outer 64 px of the picture, each eye, count
+    // pixels in horizontal streaks -- the BORROWED channel(s) flat over 8+ px
+    // while the eye's own channel there has texture (a single column copied
+    // across). Red/cyan only.
+    if (getenv("ANATEST_STREAKS"))
+    {
+        const UINT B = (std::min)(64u, picW / 4);
+        const char* side[4] = { "L-left", "L-right", "R-left", "R-right" };
+        for (int s = 0; s < 4; ++s)
+        {
+            const int eye = s / 2; const bool rightSide = s % 2;
+            size_t streak = 0, n = 0;
+            for (UINT y = 0; y < picH; ++y)
+                for (UINT x0 = 0; x0 + 8 <= B; ++x0)
+                {
+                    const UINT x = rightSide ? picX + picW - B + x0 : picX + x0;
+                    int bMin = 255, bMax = 0, oMin = 255, oMax = 0;
+                    for (UINT k = 0; k < 8; ++k)
+                    {
+                        const uint8_t* o = base + (size_t)(picY + y) * m.RowPitch + (size_t)(eye * eyeW + x + k) * 4;
+                        const int bor = eye == 0 ? o[1] : o[0], own = eye == 0 ? o[0] : o[1];
+                        bMin = (std::min)(bMin, bor); bMax = (std::max)(bMax, bor); oMin = (std::min)(oMin, own); oMax = (std::max)(oMax, own);
+                    }
+                    ++n; if (bMax - bMin <= 2 && oMax - oMin > 24) ++streak;
+                }
+            wprintf(L"%S %.2f%%  ", side[s], 100.0 * streak / n);
+        }
+        wprintf(L"(streaky windows at the edges)\n");
+    }
     // ANATEST_OUTSIDE (with a canvas): coloured pixels (chroma > 40) in the
     // left eye OUTSIDE the picture -- where any colour is an error -- and a
     // few of them to probe.
