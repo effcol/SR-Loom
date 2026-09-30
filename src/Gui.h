@@ -188,8 +188,7 @@ namespace srw
         bool                     m_draggingBg = false;      // dragging the window by empty space
         POINT                    m_dragCur0{}, m_dragWin0{}; // cursor + window origin at drag start
         bool                     m_acerNeedsAdmin = false;  // last Acer SpatialLabs write was ACCESS_DENIED
-        bool                     m_acerSectionOpen = false; // ACER SPATIALLABS section expanded?
-        bool                     m_startupSectionOpen = false; // STARTUP section expanded?
+        bool                     m_settingsOpen = false;   // SETTINGS section expanded? (SpatialLabs, Startup, Advanced)
         bool                     m_profilesSectionOpen = false; // PROFILES section expanded?
         // HEADTRACKING starts EXPANDED by default -- it's a primary feature
         // (most users care about the on/off toggle + mode) and shouldn't
@@ -210,9 +209,9 @@ namespace srw
         bool                     m_katangaAutoReceive    = true;   // Katanga senders auto-shown in 3D
         bool                     m_directComposition     = true;   // presenter (restart to apply)
         bool                     m_lateLatching          = true;   // SR weaver late latching
-        bool                     m_perfLog               = true;   // frame / GPU timing in the log
+        bool                     m_perfLog               = false;  // frame / GPU timing in the log
         bool                     m_eyeOrder              = true;   // Automatic works out the eye order
-        bool                     m_skipWeave             = false;  // diagnostic: no SR weave call
+        int                      m_weaverChoice          = 0;      // Settings WeaverChoice (0 modern, 1-3 legacy ACT off/static/dynamic)
         // Inline state for the About popup's "Check for updates" link.
         // Idle by default; switches to Checking on click, then settles to
         // UpToDate / Available / Failed when WM_APP_UPDATE_RESULT lands.

@@ -52,18 +52,24 @@ namespace srw::Settings
     // frame itself instead of a copy of it (no UI; for comparing).
     // HKCU\Software\SRLoom\ZeroCopyCapture.
     bool ReadZeroCopyCapture();
+    // Which SR weaver (default 0): 0 the modern one; 1-3 the legacy one with
+    // anti-crosstalk Off / Static / Dynamic (only it has those). Applies when
+    // the SR session is next made. HKCUSoftwareSRLoomWeaverChoice.
+    int  ReadWeaverChoice();
+    void WriteWeaverChoice(int choice);
 
     // Diagnostics only (no UI): skip the SR weaver's weave call, to see
     // whether it paces the loop. HKCU\Software\SRLoom\DiagSkipWeave = 1.
     bool ReadDiagSkipWeave();
     void WriteDiagSkipWeave(bool enable);
-    // Frame / GPU timing lines in srweaver.log every 5 s (default ON while
-    // tuning). HKCU\Software\SRLoom\PerfLog.
+    // Frame / GPU timing lines in srweaver.log every 5 s (default off: turned
+    // on in Settings for a stutter report). HKCU\Software\SRLoom\PerfLog.
     bool ReadPerfLog();
     void WritePerfLog(bool enable);
 
     // Automatic Detection works out which half of an SBS / TAB picture is the
-    // left eye (and swaps it when it's the other way round). Default on.
+    // left eye (and swaps it when it's the other way round). Default on. (The
+    // US patents Leia US9325964 / US9729852 claim this, to 2032 / 2031.)
     bool ReadEyeOrderDetect();
     void WriteEyeOrderDetect(bool enable);
 

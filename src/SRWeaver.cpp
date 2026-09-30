@@ -130,6 +130,13 @@ bool SRWeaver::IsLensEnabled() const
 
 bool SRWeaver::SetLateLatching(bool on)
 {
+    if (m_legacy)
+    {
+        try { m_legacy->enableLateLatching(on); } catch (...) {}
+        const bool now = m_legacy->isLateLatchingEnabled();
+        Log("LateLatching enabled=%d (requested %d, legacy weaver)", (int)now, (int)on);
+        return now;
+    }
     if (!m_weaver) return false;
     try { m_weaver->enableLateLatching(on); }
     catch (...) { Log("enableLateLatching(%d) threw", (int)on); }
@@ -234,6 +241,12 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     if (!m_context)
         return false;
 
+    m_immediate = immediateContext;
+    m_choice = Settings::ReadWeaverChoice();
+    if (m_choice > 0 && CreateLegacyWeaver(immediateContext, window))
+        return FinishWeaver();
+    m_choice = 0;   // (modern, chosen or as the fallback)
+
     WeaverErrorCode result = SR::CreateDX11Weaver(m_context, immediateContext, window, &m_weaver);
     if (result != WeaverErrorCode::WeaverSuccess || m_weaver == nullptr)
     {
@@ -263,37 +276,48 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     // hardware conversion, set read to false."
     try { m_weaver->setShaderSRGBConversion(false, false); }
     catch (...) { Log("setShaderSRGBConversion threw -- using defaults"); }
+    Log("Weaver: IDX11Weaver1");
+    return FinishWeaver();
+}
 
-    // ACT (Anti-Crosstalk): mode setter only lives on the deprecated
-    // PredictingDX11Weaver class; not yet ported to IDX11Weaver1. ACT is a
-    // LENS-HARDWARE property (one-mode-per-panel), not per-weaver state, so
-    // we briefly spin up a deprecated weaver instance JUST to set the mode
-    // to Dynamic (best optical quality per Leia user guidance), then
-    // destroy it. Our modern IDX11Weaver1 keeps doing the real weaving;
-    // the lens hardware retains the ACT setting.
+// The legacy weaver (PredictingDX11Weaver): deprecated in the SDK, but the only
+// one with the anti-crosstalk modes. (It used to be spun up for a moment just
+// to set ACT Dynamic for the modern weaver -- that is per-weaver software
+// filtering, not a lens setting, so it did nothing.)
+bool SRWeaver::CreateLegacyWeaver(ID3D11DeviceContext* immediateContext, HWND window)
+{
+    ID3D11Device* device = nullptr;
+    immediateContext->GetDevice(&device);
+    if (!device) return false;
+    // (The side-by-side size it's made for; the input set later replaces its
+    // own buffer.)
+    int vw = 0, vh = 0;
+    if (!GetRecommendedViewsSize(vw, vh)) { vw = 1920; vh = 1080; }
+    const ::WeaverACTMode modes[4] = { ::WeaverACTMode::Off, ::WeaverACTMode::Off,
+                                       ::WeaverACTMode::Static, ::WeaverACTMode::Dynamic };
     try
     {
-        ID3D11Device* device = nullptr;
-        immediateContext->GetDevice(&device);
-        if (device)
-        {
-            #pragma warning(push)
-            #pragma warning(disable: 4996)   // [[deprecated]] on PredictingDX11Weaver
-            SR::PredictingDX11Weaver actHelper(
-                *m_context, device, immediateContext, 1, 1, window);
-            actHelper.setACTMode(::WeaverACTMode::Dynamic);
-            const ::WeaverACTMode got = actHelper.getACTMode();
-            Log("ACT: requested Dynamic, runtime now reports mode=%d",
-                (int)got);
-            #pragma warning(pop)
-            device->Release();
-        }
-        else
-            Log("ACT: couldn't fetch device from immediate context -- skipped");
+        #pragma warning(push)
+        #pragma warning(disable: 4996)   // [[deprecated]] on PredictingDX11Weaver
+        m_legacy = new SR::PredictingDX11Weaver(*m_context, device, immediateContext,
+                                                (unsigned)(vw * 2), (unsigned)vh, window);
+        m_legacy->setACTMode(modes[m_choice]);
+        try { m_legacy->enableLateLatching(Settings::ReadLateLatching()); } catch (...) {}
+        m_legacy->setShaderSRGBConversion(false, false);   // (as the modern one: _SRGB views both ends)
+        Log("Weaver: PredictingDX11Weaver, ACT %s (runtime reports mode %d, static %.2f, dynamic %.2f), late latching %d",
+            m_choice == 1 ? "Off" : m_choice == 2 ? "Static" : "Dynamic", (int)m_legacy->getACTMode(),
+            m_legacy->getCrosstalkStaticFactor(), m_legacy->getCrosstalkDynamicFactor(),
+            m_legacy->isLateLatchingEnabled() ? 1 : 0);
+        #pragma warning(pop)
     }
-    catch (std::exception& e) { Log("ACT: setACTMode threw: %s", e.what()); }
-    catch (...)               { Log("ACT: setACTMode threw (unknown)"); }
+    catch (std::exception& e) { Log("Weaver: legacy failed (%s) -- using the modern one", e.what()); delete m_legacy; m_legacy = nullptr; }
+    catch (...)               { Log("Weaver: legacy failed -- using the modern one"); delete m_legacy; m_legacy = nullptr; }
+    device->Release();
+    return m_legacy != nullptr;
+}
 
+bool SRWeaver::FinishWeaver()
+{
     // Subscribe to head-pose updates BEFORE initialize() -- the LeiaSR docs +
     // example apps create their trackers between context creation and
     // initialize(). Failure to start the tracker is non-fatal (the weaver still
@@ -310,7 +334,7 @@ bool SRWeaver::CreateWeaver(ID3D11DeviceContext* immediateContext, HWND window)
     try { m_lensHint = SR::SwitchableLensHint::create(*m_context); }
     catch (...) { m_lensHint = nullptr; }
     Log("CreateWeaver OK (weaver=%p, lensHint=%p); SR context initialized",
-        (void*)m_weaver, (void*)m_lensHint);
+        m_legacy ? (void*)m_legacy : (void*)m_weaver, (void*)m_lensHint);
     return true;
 }
 
@@ -404,7 +428,10 @@ bool SRWeaver::SetStereoImageFromFile(ID3D11Device* device,
 void SRWeaver::SetInputView(ID3D11ShaderResourceView* srv, int perEyeWidth,
                             int height, DXGI_FORMAT format)
 {
-    if (m_weaver && srv)
+    if (!srv) return;
+    if (m_legacy)
+        m_legacy->setInputFrameBuffer(srv);   // (it samples the side-by-side view as it is)
+    else if (m_weaver)
         m_weaver->setInputViewTexture(srv, perEyeWidth, height, format);
 }
 
@@ -430,6 +457,12 @@ void SRWeaver::StopSR()
     // SwitchableLensHint is owned by the SRContext; just drop our pointer.
     m_lensHint = nullptr;
     m_lensReq = -1;
+    if (m_legacy)
+    {
+        #pragma warning(suppress: 4996)
+        delete m_legacy;
+        m_legacy = nullptr;
+    }
     if (m_weaver)
     {
         m_weaver->destroy();
@@ -444,7 +477,7 @@ void SRWeaver::StopSR()
 
 void SRWeaver::Weave()
 {
-    if (!m_weaver)
+    if (!m_weaver && !m_legacy)
         return;
     // The SR weaver can throw (e.g. lost SR service / tracking). Log every
     // distinct exception (one per frame max -- we re-log after 1s of silence
@@ -452,7 +485,16 @@ void SRWeaver::Weave()
     // persistently-broken state).
     try
     {
-        m_weaver->weave();
+        if (m_legacy)
+        {
+            // (Into the bound back buffer, over the viewport the renderer set.)
+            D3D11_VIEWPORT vp{}; UINT n = 1;
+            m_immediate->RSGetViewports(&n, &vp);
+            if (n && vp.Width > 0 && vp.Height > 0)
+                m_legacy->weave((unsigned)vp.Width, (unsigned)vp.Height);
+        }
+        else
+            m_weaver->weave();
     }
     catch (std::exception& e)
     {
@@ -478,6 +520,12 @@ void SRWeaver::Shutdown()
 {
     ReleaseViewTexture();
     StopHeadTracker();
+    if (m_legacy)
+    {
+        #pragma warning(suppress: 4996)
+        delete m_legacy;
+        m_legacy = nullptr;
+    }
     if (m_weaver)
     {
         m_weaver->destroy();

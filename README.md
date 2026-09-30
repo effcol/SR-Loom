@@ -163,7 +163,7 @@ has installed to use the display.
 Requires Visual Studio 2022/2026 (Desktop C++) and CMake ≥ 3.21. The build is
 **x64 only** (the SR Platform runtime only installs on 64-bit Windows).
 
-> The `lib/` folder (the proprietary SR SDK) is **not** tracked in git. Place the
+> The `lib/` folder (the Leia SR SDK) is **not** tracked in git. Place the
 > LeiaSR SDK locally at `lib/Simulated Reality/LeiaSR-SDK-1.36.2-win64`.
 
 ```powershell
@@ -182,6 +182,7 @@ cmake --build build/x64 --config Release
 
 ## License
 
-MIT (see `LICENSE`). Bundles the **Inter** font (SIL Open Font License). Links
-against the proprietary **SR SDK**, which keeps its own license and must be
-installed separately.
+MIT (see `LICENSE`). Third-party parts (Dear ImGui, NPClient, the 1 Euro
+Filter, the **Inter** font, stb_image) are listed with their licences in
+`THIRD_PARTY_NOTICES.txt`. Links against Leia's **SR SDK** (MIT); the SR
+Platform runtime must be installed separately.

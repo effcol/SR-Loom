@@ -88,6 +88,9 @@ namespace srw
         // no-vsync flip swap chain. Hybrid sleep+yield+spin pacing for sub-ms
         // precision without burning a full CPU core.
         void SetTargetRefreshHz(double hz);
+        // The SR display moved or changed (Windows display settings): wait for
+        // its refreshes from now on. Keeps the output when it's still the one.
+        void SetVBlankMonitor(HMONITOR target);
 
         // Choose the swap-chain model for the window's current state: a low-latency
         // FLIP swap chain when the window is NOT layered (fullscreen/windowed — e.g.
@@ -145,6 +148,8 @@ namespace srw
         DXGI_FORMAT             m_rtvFormat  = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         UINT                    m_swapFlags  = 0;       // flags the swap chain was created with
         HANDLE                  m_waitable   = nullptr; // frame-latency waitable (flip only)
+        bool                    m_compositorOtherClock = false;   // (WaitForFrame: Windows composes at another rate than the SR display)
+        ULONGLONG               m_clockCheckMs = 0;
         bool                    m_allowTearing = false; // GPU/OS supports tearing (VRR)
         bool                    m_flip       = true;    // current model: true=flip, false=bit-blt
         bool                    m_layered    = false;   // current window layered state

@@ -138,6 +138,17 @@ namespace srw::Settings
         return ReadDword(kSettingsKey, L"ZeroCopyCapture", 1) != 0;   // default ON
     }
 
+    int ReadWeaverChoice()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"WeaverChoice", 0);
+        return v <= 3 ? (int)v : 0;
+    }
+
+    void WriteWeaverChoice(int choice)
+    {
+        WriteDword(kSettingsKey, L"WeaverChoice", (DWORD)(choice >= 0 && choice <= 3 ? choice : 0));
+    }
+
     void WriteDiagSkipWeave(bool enable)
     {
         WriteDword(kSettingsKey, L"DiagSkipWeave", enable ? 1u : 0u);
@@ -145,7 +156,7 @@ namespace srw::Settings
 
     bool ReadPerfLog()
     {
-        return ReadDword(kSettingsKey, L"PerfLog", 1) != 0;
+        return ReadDword(kSettingsKey, L"PerfLog", 0) != 0;   // default off (turn on in Advanced when reporting stutter)
     }
 
     void WritePerfLog(bool enable)
@@ -160,7 +171,7 @@ namespace srw::Settings
 
     bool ReadEyeOrderDetect()
     {
-        return ReadDword(kSettingsKey, L"EyeOrderDetect", 1) != 0;
+        return ReadDword(kSettingsKey, L"EyeOrderDetect", 1) != 0;   // default on (user's decision; see the note in Settings.h)
     }
 
     void WriteEyeOrderDetect(bool enable)

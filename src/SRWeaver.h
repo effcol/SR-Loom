@@ -12,6 +12,7 @@ namespace SR
 {
     class SRContext;
     class IDX11Weaver1;
+    class PredictingDX11Weaver;
     class HeadPoseTracker;
     class Window2;
     class SwitchableLensHint;
@@ -120,7 +121,10 @@ namespace srw
         // tied to this SRWeaver -- callers must Disable any borrowed
         // subscriptions before Shutdown.
         SR::SRContext* Context() const { return m_context; }
-        bool HasWeaver()  const { return m_weaver != nullptr; }
+        bool HasWeaver()  const { return m_weaver != nullptr || m_legacy != nullptr; }
+        // Which weaver is running (Settings::ReadWeaverChoice when it was made):
+        // 0 modern, 1-3 legacy with anti-crosstalk Off / Static / Dynamic.
+        int  WeaverChoice() const { return m_choice; }
 
         // Latest tracked head pose (position in mm relative to display centre,
         // orientation in radians as (pitch, yaw, roll)). Returns false if the
@@ -131,10 +135,17 @@ namespace srw
         class HeadListenerImpl;          // opaque to keep SDK headers out of this file
         void ReleaseViewTexture();
         void StartHeadTracker();
+        bool CreateLegacyWeaver(ID3D11DeviceContext* immediateContext, HWND window);
+        bool FinishWeaver();   // (head tracker, context initialise, lens hint: either weaver)
         void StopHeadTracker();
 
         SR::SRContext*            m_context = nullptr;
         SR::IDX11Weaver1*         m_weaver  = nullptr;
+        // The legacy (deprecated) weaver, instead of m_weaver when chosen: it
+        // has the anti-crosstalk modes the modern one lacks.
+        SR::PredictingDX11Weaver* m_legacy  = nullptr;
+        ID3D11DeviceContext*      m_immediate = nullptr;   // (the legacy weave needs the output size: its viewport)
+        int                       m_choice  = 0;
         SR::HeadPoseTracker*      m_headTracker  = nullptr;
         HeadListenerImpl*         m_headListener = nullptr;
         // Window2 instance for occlusion-check (isWindowPartVisible). Owned

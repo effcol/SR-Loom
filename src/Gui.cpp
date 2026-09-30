@@ -132,6 +132,15 @@ namespace
         c[ImGuiCol_ScrollbarGrabActive]  = accent;
     }
 
+
+    // The gap above every section header (DISPLAY, STEREO 3D INPUT,
+    // HEADTRACKING, PROFILES, SETTINGS), in px at 100% scale, on top of the
+    // normal item spacing. One value so they all match.
+    constexpr float kSectionGap = 0.0f;
+    void SectionGap(float dpiScale)
+    {
+        if (kSectionGap > 0.0f) ImGui::Dummy(ImVec2(0, kSectionGap * dpiScale));
+    }
     // A dim, small-caps section label with breathing room (no heavy separator line).
     void Section(const char* label)
     {
@@ -150,7 +159,7 @@ namespace
     bool CollapsibleHeader(const char* hdr, bool& open, float dpiScale,
                            const char* uniqueId)
     {
-        ImGui::Dummy(ImVec2(0, 5));
+        SectionGap(dpiScale);
         const ImVec2 ts   = ImGui::CalcTextSize(hdr);
         const float  h    = ImGui::GetFrameHeight();
         const float  s    = 4.0f * dpiScale;
@@ -433,7 +442,7 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // The weave-skip test never survives a restart (a black 3D screen at
     // launch would look broken).
     Settings::WriteDiagSkipWeave(false);
-    m_skipWeave             = false;
+    m_weaverChoice          = Settings::ReadWeaverChoice();
     // Start in Windows' own light/dark app mode. The header's theme button
     // still flips it for the session; a Windows theme change re-syncs it
     // (WM_SETTINGCHANGE below).
@@ -1728,7 +1737,7 @@ bool Gui::Render(GuiState& state)
         // PROFILES. OpenTrack UDP toggle + mode buttons + Calibrate +
         // Launch OpenTrack. Defaults ON whenever an SR session is active;
         // user toggle overrides for the rest of that session.
-        ImGui::Dummy(ImVec2(0, 5));
+        SectionGap(m_dpiScale);
         {
             const char* hdr   = "HEADTRACKING";
             const ImVec2 ts   = ImGui::CalcTextSize(hdr);
@@ -1953,7 +1962,7 @@ bool Gui::Render(GuiState& state)
         // delete-X per row, "Open profiles.ini" link. List is populated by
         // main from app.profiles each frame; click handlers set request
         // flags that main consumes after Render returns.
-        ImGui::Dummy(ImVec2(0, 5));
+        SectionGap(m_dpiScale);
         {
             const char* hdr   = "PROFILES";
             const ImVec2 ts   = ImGui::CalcTextSize(hdr);
@@ -2155,6 +2164,52 @@ bool Gui::Render(GuiState& state)
             }
         }
 
+        // SETTINGS: one collapsible section (same chevron header as PROFILES),
+        // holding SpatialLabs, Startup and Advanced under small fixed sub-headings.
+        SectionGap(m_dpiScale);
+        {
+            const char* hdr  = "SETTINGS";
+            const ImVec2 ts  = ImGui::CalcTextSize(hdr);
+            const float  h   = ImGui::GetFrameHeight();
+            const float  s   = 4.0f * m_dpiScale;     // chevron half-size
+            const float  gap = 7.0f * m_dpiScale;     // text→chevron gap
+            const float  bw  = ts.x + gap + s * 2;    // hit rect width: text + arrow
+            const ImVec2 p   = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##settingshdr", ImVec2(bw, h));
+            if (ImGui::IsItemClicked()) m_settingsOpen = !m_settingsOpen;
+            const bool hov = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
+            dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
+            const float cx = p.x + ts.x + gap + s;
+            const float cy = p.y + h * 0.5f;
+            if (m_settingsOpen)   // up = collapse
+                dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
+                                      ImVec2(cx + s, cy + s * 0.55f),
+                                      ImVec2(cx,     cy - s * 0.55f), col);
+            else                  // down = expand
+                dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
+                                      ImVec2(cx + s, cy - s * 0.55f),
+                                      ImVec2(cx,     cy + s * 0.55f), col);
+        }
+        // A group's sub-heading: smaller dim text and a faint rule to the edge.
+        auto subHeader = [&](const char* label, bool first) {
+            ImGui::Dummy(ImVec2(0, (first ? 1.0f : 6.0f) * m_dpiScale));
+            ImGui::SetWindowFontScale(0.85f);
+            ImGui::PushStyleColor(ImGuiCol_Text, g_dim);
+            ImGui::TextUnformatted(label);
+            ImGui::PopStyleColor();
+            ImGui::SetWindowFontScale(1.0f);
+            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            const float y  = (mn.y + mx.y) * 0.5f;
+            const float x0 = mx.x + 6.0f * m_dpiScale;
+            const float x1 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+            ImVec4 rule = g_dim; rule.w *= 0.35f;
+            if (x1 > x0) ImGui::GetWindowDrawList()->AddLine(ImVec2(x0, y), ImVec2(x1, y), ImGui::GetColorU32(rule), 1.0f);
+        };
+
+        if (m_settingsOpen)
+        {
         // Acer SpatialLabs: surface Acer's auto-detect registry toggles when an
         // Acer display is present. Those auto-detects tend to fight SR Loom (auto-
         // switching 2D/3D by focus, or auto-engaging on fullscreen apps), so giving
@@ -2162,34 +2217,7 @@ bool Gui::Render(GuiState& state)
         // Writes go to HKLM and need admin; if denied, offer a Restart-as-admin link.
         if (AcerSpatialLabs::Available())
         {
-            // Subtle header: dim "ACER SPATIALLABS" label + a small chevron right
-            // after the text (no boxed background, no full-width hit-rect).
-            ImGui::Dummy(ImVec2(0, 5));
-            {
-                const char* hdr   = "ACER SPATIALLABS";
-                const ImVec2 ts   = ImGui::CalcTextSize(hdr);
-                const float  h    = ImGui::GetFrameHeight();
-                const float  s    = 4.0f * m_dpiScale;     // chevron half-size
-                const float  gap  = 7.0f * m_dpiScale;     // text→chevron gap
-                const float  bw   = ts.x + gap + s * 2;    // hit rect width: text + arrow
-                const ImVec2 p    = ImGui::GetCursorScreenPos();
-                ImGui::InvisibleButton("##acerhdr", ImVec2(bw, h));
-                if (ImGui::IsItemClicked()) m_acerSectionOpen = !m_acerSectionOpen;
-                const bool hov = ImGui::IsItemHovered();
-                ImDrawList* dl = ImGui::GetWindowDrawList();
-                const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
-                dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
-                const float cx = p.x + ts.x + gap + s;
-                const float cy = p.y + h * 0.5f;
-                if (m_acerSectionOpen)   // up = collapse
-                    dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
-                                          ImVec2(cx + s, cy + s * 0.55f),
-                                          ImVec2(cx,     cy - s * 0.55f), col);
-                else                     // down = expand
-                    dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
-                                          ImVec2(cx + s, cy - s * 0.55f),
-                                          ImVec2(cx,     cy + s * 0.55f), col);
-            }
+            subHeader("SpatialLabs", true);
 
             // Label + right-aligned toggle inside a given column width. Used for
             // the side-by-side two-toggles-per-row layout in both Acer and Startup.
@@ -2214,7 +2242,6 @@ bool Gui::Render(GuiState& state)
                 return ToggleSwitch(label, on);
             };
 
-            if (m_acerSectionOpen)
             {
                 const auto sls = AcerSpatialLabs::Read();
                 auto slWrite = [&](AcerSpatialLabs::Setting s, bool v) {
@@ -2259,39 +2286,7 @@ bool Gui::Render(GuiState& state)
             }
         }
 
-        // STARTUP section -- collapsible chevron header (same pattern as Acer),
-        // with the two preferences in a single two-column row. Skip the top
-        // breathing-room dummy when the previous section is just a collapsed
-        // header above us, otherwise the two header rows feel too far apart.
-        const bool acerCollapsedJustAbove = AcerSpatialLabs::Available() && !m_acerSectionOpen;
-        ImGui::Dummy(ImVec2(0, acerCollapsedJustAbove ? 0.0f : 5.0f));
-        {
-            const char* hdr  = "STARTUP";
-            const ImVec2 ts  = ImGui::CalcTextSize(hdr);
-            const float  h   = ImGui::GetFrameHeight();
-            const float  s   = 4.0f * m_dpiScale;
-            const float  gap = 7.0f * m_dpiScale;
-            const float  bw  = ts.x + gap + s * 2;
-            const ImVec2 p   = ImGui::GetCursorScreenPos();
-            ImGui::InvisibleButton("##startuphdr", ImVec2(bw, h));
-            if (ImGui::IsItemClicked()) m_startupSectionOpen = !m_startupSectionOpen;
-            const bool hov = ImGui::IsItemHovered();
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const ImU32 col = ImGui::GetColorU32(hov ? g_text : g_dim);
-            dl->AddText(ImVec2(p.x, p.y + (h - ts.y) * 0.5f), col, hdr);
-            const float cx = p.x + ts.x + gap + s;
-            const float cy = p.y + h * 0.5f;
-            if (m_startupSectionOpen)
-                dl->AddTriangleFilled(ImVec2(cx - s, cy + s * 0.55f),
-                                      ImVec2(cx + s, cy + s * 0.55f),
-                                      ImVec2(cx,     cy - s * 0.55f), col);
-            else
-                dl->AddTriangleFilled(ImVec2(cx - s, cy - s * 0.55f),
-                                      ImVec2(cx + s, cy - s * 0.55f),
-                                      ImVec2(cx,     cy + s * 0.55f), col);
-        }
-
-        if (m_startupSectionOpen)
+        subHeader("Startup", !AcerSpatialLabs::Available());
         {
             // Both are tiny HKCU registry settings; run-at-startup just adds/removes
             // our exe from the Run key (no elevation needed), and start-in-tray
@@ -2365,7 +2360,58 @@ bool Gui::Render(GuiState& state)
                 ImGui::PopTextWrapPos();
                 ImGui::EndTooltip();
             }
-            // Third row: the presenter. Restart needed (the weave window is
+        }
+
+        // Advanced: the weaver and presenter choices, eye order and the log.
+        subHeader("Advanced", false);
+        {
+            auto pairToggle2 = [&](const char* label, bool on, float colW) -> bool {
+                const float startX = ImGui::GetCursorPosX();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(label);
+                ImGui::SameLine();
+                const float togW = ImGui::GetFrameHeight() * 1.8f;
+                ImGui::SetCursorPosX(startX + colW - togW);
+                return ToggleSwitch(label, on);
+            };
+            const float halfW = (ImGui::GetContentRegionAvail().x
+                                 - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+            auto tip = [&](const char* text) {
+                if (!ImGui::IsItemHovered()) return;
+                const float maxW = 320.0f * m_dpiScale;
+                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                ImGui::TextUnformatted(text);
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            };
+            // First row: which SR weaver. The legacy one is the only one with
+            // anti-crosstalk; changing it restarts the SR session (a moment).
+            {
+                static const char* kWeavers[4] = { "Standard (default)", "Legacy, no anti-crosstalk",
+                                                   "Legacy, static anti-crosstalk", "Legacy, dynamic anti-crosstalk" };
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Weaver");
+                tip("Which Leia SR weaver draws the 3D. Standard is the SDK's current weaver (IDX11Weaver1). Legacy is "
+                    "its older one (PredictingDX11Weaver), the only one with anti-crosstalk: it pre-filters the "
+                    "picture to reduce ghosting between the eyes. Try static or dynamic if you see double edges. "
+                    "Changing it restarts the 3D for a moment.");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                const int cur = (m_weaverChoice >= 0 && m_weaverChoice < 4) ? m_weaverChoice : 0;
+                if (ImGui::BeginCombo("##weaver", kWeavers[cur]))
+                {
+                    for (int k = 0; k < 4; ++k)
+                        if (ImGui::Selectable(kWeavers[k], k == cur))
+                        {
+                            m_weaverChoice = k;
+                            Settings::WriteWeaverChoice(k);
+                        }
+                    ImGui::EndCombo();
+                }
+            }
+            // Second row: the presenter. Restart needed (the weave window is
             // created for one presenter or the other).
             if (pairToggle2("Fast Presenter", m_directComposition, halfW))
             {
@@ -2406,34 +2452,8 @@ bool Gui::Render(GuiState& state)
                 ImGui::PopTextWrapPos();
                 ImGui::EndTooltip();
             }
-            // Fourth row: diagnostics.
-            auto tip = [&](const char* text) {
-                if (!ImGui::IsItemHovered()) return;
-                const float maxW = 320.0f * m_dpiScale;
-                ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
-                ImGui::BeginTooltip();
-                ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
-                ImGui::TextUnformatted(text);
-                ImGui::PopTextWrapPos();
-                ImGui::EndTooltip();
-            };
-            if (pairToggle2("Perf Log", m_perfLog, halfW))
-            {
-                m_perfLog = !m_perfLog;
-                Settings::WritePerfLog(m_perfLog);
-            }
-            tip("Writes frame-rate and timing lines to srweaver.log every 5 seconds "
-                "(\"Frame profile\" and \"GPU ms\"), for tracking down lag. Applies straight away.");
-            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
-            if (pairToggle2("Skip SR Weave (test)", m_skipWeave, halfW))
-            {
-                m_skipWeave = !m_skipWeave;
-                Settings::WriteDiagSkipWeave(m_skipWeave);
-            }
-            tip("Diagnostic: stops calling the SR weaver, so the 3D output goes BLACK, while "
-                "everything else keeps running. With Perf Log on, compare the frame rate with "
-                "this on and off to see whether the SR weaver is what holds it back. Turn off "
-                "to weave again. Not remembered across restarts.");
+            // Third row: eye order and the timing log. (The "Skip SR Weave"
+            // test switch is gone from the panel: registry DiagSkipWeave.)
             if (pairToggle2("Detect Eye Order", m_eyeOrder, halfW))
             {
                 m_eyeOrder = !m_eyeOrder;
@@ -2443,10 +2463,21 @@ bool Gui::Render(GuiState& state)
                 "(and which colour of an anaglyph), in Automatic Detection and in layouts you pick, "
                 "and swaps the ones that are the other way round (e.g. cross-view pictures). "
                 "Swap Eyes still flips everything.");
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Perf Log", m_perfLog, halfW))
+            {
+                m_perfLog = !m_perfLog;
+                Settings::WritePerfLog(m_perfLog);
+            }
+            tip("Writes frame-rate and timing lines to srweaver.log every 5 seconds "
+                "(\"Frame profile\" and \"GPU ms\"), for tracking down lag. Applies straight away.");
         }
+        }   // (SETTINGS)
     }
 
-    m_sectionsH = ImGui::GetCursorPosY() + 4.0f;   // measured content height (snug sizing)
+    // Measured content height (snug sizing): up to the last row, less the
+    // spacing ImGui leaves after it, plus a small margin.
+    m_sectionsH = ImGui::GetCursorPosY() - ImGui::GetStyle().ItemSpacing.y + 2.0f * m_dpiScale;
     ImGui::EndChild();
     }   // end if (m_expanded)
 

@@ -546,7 +546,7 @@ namespace
         GpuFrameTimer                gpuTimer;   // GPU side of the frame profile
         int                          lateLatchingApplied = -1;   // SR weaver late latching as set (-1 unknown)
         bool                         diagSkipWeave = false;      // diagnostics: no SR weave call
-        bool                         perfLog = true;             // frame / GPU timing lines (Settings::ReadPerfLog)
+        bool                         perfLog = false;            // frame / GPU timing lines (Settings::ReadPerfLog)
         Detector     detector;
         Gui          gui;
         VideoSource  video;          // active video file source (mp4/mov/etc), if any
@@ -781,6 +781,12 @@ namespace
         RECT       loupeSavedRect{};
         bool       loupeHasSaved  = false;
         bool       captureRebind  = false;   // re-register SRV on next frame
+        // Weaving off: when to let the SR session go (0 = nothing pending). It is
+        // kept that long so switching weaving straight back on is instant.
+        ULONGLONG  srStopAtMs     = 0;
+        int        weaverChoiceSeen = -1;   // (Settings WeaverChoice last acted on; -1 not read yet)
+        ULONGLONG  displayChangedAtMs = 0;  // (WM_DISPLAYCHANGE: when; HandleDisplayChange once it settles)
+        double     paceHz = 0.0;            // (the refresh rate the renderer paces for: the SR display's current one)
         RECT       srDisplayRect  = { 0, 0, 1920, 1080 };  // filled from SR SDK
         HMONITOR   sourceMonitor  = nullptr; // monitor being captured (passthrough / display picker)
         bool       foreignDisplay = false;   // capturing a NON-SR display: weave the whole frame (no crop)
@@ -2176,6 +2182,8 @@ namespace
                      SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
     }
 
+    constexpr ULONGLONG kSrKeepAliveMs = 5000;   // (SetWeaving: the SR session outlives weaving by this)
+    void PaceForSrRefresh(AppState& app, bool now = false);   // fwd decl (defined below)
     void SetWeaving(AppState& app, bool enable);   // fwd decl (defined below)
     void ChangeFormat(AppState& app, StereoFormat newFmt);  // fwd decl
     void EnsureWeavingFormatOnly(AppState& app);   // fwd decl
@@ -2799,6 +2807,7 @@ namespace
             // Judged by z-order, not focus: clicking into a window on another
             // display leaves the fullscreen app still covering the taskbar.
             bool fsInFront = false;
+            std::vector<RECT> overTaskbar;   // (windows in front of it: they're woven, not cut)
             for (const WinInfo& w : snap->z)
             {
                 if (w.h == tb || w.desktop) break;
@@ -2806,11 +2815,39 @@ namespace
                 // (Click-through overlays and tool windows aren't apps covering it.)
                 if (w.ex & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)) continue;
                 if (w.fullscreenOnSr) { fsInFront = true; break; }
+                RECT o{};
+                if (IntersectRect(&o, &w.frame, &tr)) overTaskbar.push_back(o);
             }
             // Auto-hide leaves only a sliver on-screen; the intersection with
             // our window handles that (and a Looking Glass not over it).
             if (!fsInFront && IntersectRect(&cut, &tr, &wr))
-                addCut(cut, 0);
+            {
+                if (overTaskbar.empty()) addCut(cut, 0);
+                else
+                {
+                    // A window in front of the taskbar (dragged over it, or
+                    // always-on-top) is 3D there: cut only the taskbar's
+                    // visible pieces.
+                    HRGN vis = CreateRectRgnIndirect(&cut);
+                    for (const RECT& a : overTaskbar)
+                    {
+                        HRGN ar = CreateRectRgnIndirect(&a);
+                        CombineRgn(vis, vis, ar, RGN_DIFF);
+                        DeleteObject(ar);
+                    }
+                    if (const DWORD bytes = GetRegionData(vis, 0, nullptr))
+                    {
+                        std::vector<char> buf(bytes);
+                        auto* rd = reinterpret_cast<RGNDATA*>(buf.data());
+                        if (GetRegionData(vis, bytes, rd))
+                        {
+                            const RECT* rs = reinterpret_cast<const RECT*>(rd->Buffer);
+                            for (DWORD i = 0; i < rd->rdh.nCount; ++i) addCut(rs[i], 0);
+                        }
+                    }
+                    DeleteObject(vis);
+                }
+            }
         }
 
         // Holes linger a little after their window moves on or goes away:
@@ -3467,6 +3504,7 @@ namespace
                          enable ? HIGH_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
         if (enable)
         {
+            app.srStopAtMs = 0;   // (a session kept alive after weaving stopped is used as it is)
             // Katanga arm (format = Katanga, no game publishing yet): leave the
             // SR session alive but ask SwitchableLensHint to disable the lens.
             // No StartSR/StopSR churn, no swap-chain recreation risk (that was
@@ -3484,6 +3522,8 @@ namespace
                 {
                     Log("SR display moved: (%ld,%ld)-(%ld,%ld)", rc.left, rc.top, rc.right, rc.bottom);
                     app.srDisplayRect = rc;
+                    app.renderer.SetVBlankMonitor(SrMonitor(app));
+                    PaceForSrRefresh(app, true);
                 }
                 // (For the log only. Weaving below the source's own resolution
                 // looked blurry -- every eye is kept at full resolution.)
@@ -3523,11 +3563,14 @@ namespace
             // foreground. The user's GUI toggle is the only thing that
             // turns the bridge off.
             EndAutoStereo(app, "weaving turned off");
-            // Hide and fully release SR so the lens and camera turn off.
+            // Hide, and lens off now. The SR session (camera, weaver) is let go
+            // a few seconds later (see kSrKeepAliveMs): tearing it down and
+            // making it again blocked for 60-240 ms each way, so switching
+            // weaving off and straight back on is instant this way.
             ShowWindow(app.hwnd, SW_HIDE);
             HideFsCtrlOverlay();
             app.weaver.LensDisable();
-            app.weaver.StopSR();
+            app.srStopAtMs = GetTickCount64() + kSrKeepAliveMs;
         }
         app.tray.SetTooltip(enable
             ? "SR Loom — weaving\nLeft-click for panel"
@@ -6252,11 +6295,11 @@ namespace
     }
 
     // primary display, which may be a 60 Hz screen next to a 160 Hz SR one.
-    double SrRefreshHz(const AppState& app)
+    double SrRefreshHz(const AppState& app, bool now = false)
     {
         static double s_hz = 60.0;
         static DWORD  s_checked = 0;
-        if (GetTickCount() - s_checked > 3000)
+        if (now || GetTickCount() - s_checked > 3000)
         {
             s_checked = GetTickCount();
             MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
@@ -6270,6 +6313,45 @@ namespace
             }
         }
         return s_hz;
+    }
+
+    // Pace for the SR display's CURRENT refresh rate, not its maximum: it can be
+    // set lower (e.g. 120 Hz), or changed while SR Loom runs.
+    void PaceForSrRefresh(AppState& app, bool now)
+    {
+        const double hz = SrRefreshHz(app, now);
+        if (hz > 1.0 && std::abs(hz - app.paceHz) > 0.5)
+        {
+            app.renderer.SetTargetRefreshHz(hz);
+            Log("Pacing for the SR display's %.0f Hz", hz);
+            app.paceHz = hz;
+        }
+    }
+
+    // Windows' display settings changed (WM_DISPLAYCHANGE, settled): a monitor
+    // added / removed / rearranged, or a new resolution or refresh rate. Follow
+    // the SR display: where it is now, which output to pace on, its refresh.
+    void HandleDisplayChange(AppState& app)
+    {
+        RECT rc{};
+        // (Asks the SR session. Without one -- weaving off for a while -- the
+        // next weave start reads it, as it always has.)
+        const bool known = app.weaver.GetSRDisplayRect(rc);
+        Log("Display settings changed%s", known ? "" : " (SR display position re-read when weaving starts)");
+        if (known && !EqualRect(&rc, &app.srDisplayRect))
+        {
+            Log("SR display is now at (%ld,%ld)-(%ld,%ld)", rc.left, rc.top, rc.right, rc.bottom);
+            app.srDisplayRect = rc;
+            app.srMmPerPx = MonitorMmPerPx(SrMonitor(app));
+            if (app.weavingEnabled)
+            {
+                // (Capturing the SR display: capture it where it is now.)
+                if (app.source == SourceKind::CaptureMonitor && !app.foreignDisplay) UsePassthrough(app);
+                ApplyMode(app);
+            }
+        }
+        app.renderer.SetVBlankMonitor(SrMonitor(app));
+        PaceForSrRefresh(app, true);
     }
 
     void RenderFrame(AppState& app)
@@ -8195,6 +8277,12 @@ namespace
             }
             break;   // let DefWindowProc handle every other system command
 
+        case WM_DISPLAYCHANGE:
+            // A display was added, removed, moved or changed resolution / refresh.
+            // Handled in the main loop once Windows has settled (HandleDisplayChange).
+            if (app) app->displayChangedAtMs = GetTickCount64();
+            break;
+
         case WM_SETTINGCHANGE:
             // Windows light/dark app mode may have changed: re-theme the
             // native title bar (Looking Glass / Windowed). Cheap, idempotent.
@@ -9277,6 +9365,44 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
                         app.lateLatchingApplied = want;   // (once, even if the runtime ignores it)
                     }
                     if (!app.weavingEnabled) app.lateLatchingApplied = -1;   // re-apply when it restarts
+                    // The SR display's refresh (current mode), and display
+                    // settings changes once they've settled (Windows sends a few).
+                    PaceForSrRefresh(app);
+                    if (app.displayChangedAtMs && GetTickCount64() - app.displayChangedAtMs > 1000)
+                    {
+                        app.displayChangedAtMs = 0;
+                        HandleDisplayChange(app);
+                    }
+                    // Weaving has been off for a while: let the SR session go
+                    // (camera off). Kept until now so switching back is instant.
+                    if (app.weavingEnabled) app.srStopAtMs = 0;
+                    else if (app.srStopAtMs && GetTickCount64() >= app.srStopAtMs)
+                    {
+                        app.srStopAtMs = 0;
+                        app.weaver.StopSR();
+                        Log("SR session released (weaving off for %llu s)", kSrKeepAliveMs / 1000);
+                    }
+                    // Weaver choice (panel): a different weaver needs a new SR session.
+                    const int wantWeaver = Settings::ReadWeaverChoice();
+                    if (app.weaverChoiceSeen < 0) app.weaverChoiceSeen = wantWeaver;
+                    else if (wantWeaver != app.weaverChoiceSeen)
+                    {
+                        app.weaverChoiceSeen = wantWeaver;
+                        if (app.weaver.HasWeaver())
+                        {
+                            Log("Weaver choice changed to %d: restarting the SR session", wantWeaver);
+                            app.weaver.StopSR();
+                            app.srStopAtMs = 0;
+                            if (app.weavingEnabled)
+                            {
+                                app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                                const bool katangaArmed = (app.format == StereoFormat::Katanga && !app.katanga.IsReceiving());
+                                if (katangaArmed) app.weaver.LensDisable(); else app.weaver.LensEnable();
+                                app.lateLatchingApplied = -1;
+                                app.captureRebind = true;   // (the new weaver needs its input)
+                            }
+                        }
+                    }
                     app.perfLog = Settings::ReadPerfLog();
                     app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
                     const bool skip = Settings::ReadDiagSkipWeave();

@@ -688,7 +688,29 @@ void Renderer::WaitForFrame()
 {
     using wclk = std::chrono::steady_clock;
     const auto w0 = wclk::now();
-    if (m_waitable)
+    // The compositor's frame signal ticks on Windows' composition clock. When
+    // that runs at another display's rate (e.g. 240 Hz for a second monitor,
+    // with the SR display at 160 Hz), its ticks slide against the SR display's
+    // refreshes as the two clocks drift, and for minutes at a time frames
+    // were late (9-15 a second). With the SR display's own vertical blank to
+    // pace on (below), that signal is then skipped. (Checked every second.)
+    if (m_vblankOutput && m_targetIntervalNs > 0 && GetTickCount64() - m_clockCheckMs > 1000)
+    {
+        m_clockCheckMs = GetTickCount64();
+        DWM_TIMING_INFO ti{}; ti.cbSize = sizeof(ti);
+        bool other = false;
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateCompose.uiDenominator)
+        {
+            const double dwmHz = (double)ti.rateCompose.uiNumerator / ti.rateCompose.uiDenominator;
+            const double srHz  = 1e9 / (m_targetIntervalNs / 0.98);
+            other = std::abs(dwmHz - srHz) > srHz * 0.03;
+            if (other != m_compositorOtherClock)
+                Log("Renderer: Windows composes at %.1f Hz, the SR display refreshes at %.1f Hz -- %s", dwmHz, srHz,
+                    other ? "pacing on the SR display alone" : "pacing on the compositor and the SR display");
+        }
+        m_compositorOtherClock = other;
+    }
+    if (m_waitable && !m_compositorOtherClock)
         WaitForSingleObjectEx(m_waitable, 1000, TRUE);
     m_lastCompositorWaitMs = std::chrono::duration<double, std::milli>(wclk::now() - w0).count();
     m_lastVBlankWaitMs = 0.0;
@@ -832,4 +854,35 @@ double Renderer::MsToNextVBlank() const
     const int64_t period = (int64_t)(m_targetIntervalNs / 0.98);
     const int64_t phase = duration_cast<nanoseconds>(steady_clock::now() - m_lastVBlank).count() % period;
     return (period - phase) / 1.0e6;
+}
+
+void Renderer::SetVBlankMonitor(HMONITOR target)
+{
+    if (!target || !m_device) return;
+    if (m_vblankOutput)
+    {
+        DXGI_OUTPUT_DESC od{};
+        if (SUCCEEDED(m_vblankOutput->GetDesc(&od)) && od.Monitor == target) return;
+    }
+    // (On the device's adapter: the SR display's, from Initialize.)
+    IDXGIDevice* dd = nullptr;
+    IDXGIAdapter* a = nullptr;
+    IDXGIOutput* found = nullptr;
+    if (SUCCEEDED(m_device->QueryInterface(&dd)) && SUCCEEDED(dd->GetAdapter(&a)))
+    {
+        IDXGIOutput* o = nullptr;
+        for (UINT j = 0; !found && a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; ++j)
+        {
+            DXGI_OUTPUT_DESC od{};
+            if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == target) found = o;
+            else o->Release();
+        }
+    }
+    SAFE_RELEASE(a);
+    SAFE_RELEASE(dd);
+    SAFE_RELEASE(m_vblankOutput);
+    m_vblankOutput = found;   // (none: another adapter -- paced by the cap and the compositor)
+    m_lastVBlank = {};        // (the old display's phase means nothing now)
+    m_clockCheckMs = 0;       // (compare the clocks again straight away)
+    Log("Renderer: waiting for refreshes on %s", found ? "the SR display's new output" : "nothing (the SR display isn't on this adapter)");
 }
