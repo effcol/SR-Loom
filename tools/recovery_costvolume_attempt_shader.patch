@@ -1,4 +1,4 @@
---- /c/Users/effie/AppData/Local/Temp/claude/D--Coding-SR-Weaver/060892a4-7a49-4f09-8781-08f83110e7d5/scratchpad/baseline.hlsl	2026-09-27 18:22:43.009902900 +0100
+--- a/src/shaders/Converter.hlsl	2026-09-27 18:22:43.009902900 +0100
 +++ src/shaders/Converter.hlsl	2026-09-27 20:39:36.951750200 +0100
 @@ -11,6 +11,9 @@
  Texture2D<uint4> descTexD : register(t6);
