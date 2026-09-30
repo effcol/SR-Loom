@@ -53,7 +53,8 @@ namespace
 
 // Frame-pool depth: 4 (as Magpie) so the compositor never waits for a buffer while we
 // hold one (Magpie uses 4; 2 can stall capture delivery).
-static constexpr int kPoolBuffers = 4;
+// +1 for zero-copy, which holds the newest frame until the next one lands.
+static constexpr int kPoolBuffers = 5;
 
 struct Capture::Impl
 {
@@ -202,7 +203,12 @@ bool Capture::StartCaptureInternalActive()
     m_contentValid = false;   // (a new session: the first frame is copied whole)
     try
     {
-        m_impl->session.DirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportAndRender);
+        // Zero-copy reads each frame's buffer whole, so every frame must be
+        // drawn whole (ReportOnly); ReportAndRender draws only what changed
+        // into the buffer, which is fine while each frame is copied over the
+        // last one. (Partial copies work with either.)
+        m_impl->session.DirtyRegionMode(m_zeroCopy ? GraphicsCaptureDirtyRegionMode::ReportOnly
+                                                   : GraphicsCaptureDirtyRegionMode::ReportAndRender);
         m_impl->dirtyOk = true;
     }
     catch (...) {}
@@ -216,8 +222,11 @@ bool Capture::StartCaptureInternalActive()
 void Capture::Stop()
 {
     if (!m_impl) return;
+    EnsureCopy();   // (the last picture stays shown until the next source's first frame)
     if (m_impl->held) { try { m_impl->held.Close(); } catch (...) {} m_impl->held = nullptr; }
     m_impl->heldTex = nullptr;
+    m_direct = m_copyStale = false;
+    ReleaseDirectViews();
     if (m_impl->session)   { m_impl->session.Close();   m_impl->session = nullptr; }
     if (m_impl->framePool)
     {
@@ -235,6 +244,7 @@ void Capture::Stop()
 bool Capture::Update(bool& sizeChanged)
 {
     sizeChanged = false;
+    DropRetiredViews(false);
     if (!m_active || !m_impl || !m_impl->framePool)
         return false;
 
@@ -302,8 +312,51 @@ bool Capture::Update(bool& sizeChanged)
         // frame -- one of the pool's buffers -- until the next one arrives, to
         // re-crop from if the glass moves meanwhile; see below.)
         const bool fullFrame = (rx == 0 && ry == 0 && rw == m_frameW && rh == m_frameH);
+        // (The window was resized: the pool is remade below, and its buffers go.)
+        const bool poolResize = contentSize.Width != m_impl->lastSize.Width ||
+                                contentSize.Height != m_impl->lastSize.Height;
+        // Zero-copy: the whole frame is the picture -- hold it, copy nothing.
+        const bool direct = m_zeroCopy && fullFrame && !poolResize;
         SAFE_RELEASE(m_full);
         sizeChanged = EnsureTarget(rw, rh);
+        if (direct)
+        {
+            // Whether anything changed (dirty regions) still decides if it's
+            // a new picture; m_tex just isn't kept up to date (EnsureCopy).
+            // What changed is remembered, so the copy -- if it's wanted --
+            // takes only that (as the copying path does).
+            const bool dirtyUsable = m_impl->dirtyOk && dirtyKnown && !sizeChanged &&
+                                     rx == m_appX && ry == m_appY && rw == m_appW && rh == m_appH;
+            bool touched = !dirtyUsable;
+            if (dirtyUsable)
+                for (const RECT& d : dirty)
+                    if (d.right > d.left && d.bottom > d.top)
+                    {
+                        touched = true;
+                        if (!m_pendingAll) m_pendingDirty.push_back(d);
+                    }
+            if (touched)
+            {
+                m_copyStale = true;
+                // (Nothing may ask for the copy for a long time -- Half SBS
+                // never does: past 16 parts it'll just be all of it.)
+                if (!dirtyUsable || m_pendingDirty.size() > 16) { m_pendingAll = true; m_pendingDirty.clear(); }
+            }
+            m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
+            if (m_impl->held) { m_impl->held.Close(); m_impl->held = nullptr; }
+            m_impl->held    = frame;
+            m_impl->heldTex = frameTex;
+            m_direct = true;
+            if (!touched) return false;
+            ++m_version;
+            return true;
+        }
+        if (m_direct)   // (back to copying: whole, unless the copy is up to date)
+        {
+            if (m_copyStale) m_contentValid = false;
+            m_direct = m_copyStale = m_pendingAll = false;
+            m_pendingDirty.clear();
+        }
         // With the dirty regions: only what changed inside the crop is copied,
         // and a frame that changed nothing inside it isn't new content at all
         // (a clock ticking elsewhere on screen no longer re-converts the weave).
@@ -355,6 +408,7 @@ bool Capture::Update(bool& sizeChanged)
         {
             if (m_impl->held) { m_impl->held.Close(); m_impl->held = nullptr; m_impl->heldTex = nullptr; }
             m_impl->lastSize = contentSize;
+            ReleaseDirectViews();   // (the old buffers go)
             m_impl->framePool.Recreate(
                 m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, contentSize);
         }
@@ -366,6 +420,75 @@ bool Capture::Update(bool& sizeChanged)
     {
         return false;
     }
+}
+
+void Capture::EnsureCopy()
+{
+    if (!m_copyStale) return;
+    m_copyStale = false;
+    const bool all = m_pendingAll || !m_contentValid;
+    std::vector<RECT> parts;
+    parts.swap(m_pendingDirty);
+    m_pendingAll = false;
+    if (!m_impl || !m_impl->heldTex || !m_tex) { m_contentValid = false; return; }
+    if (all)
+        m_context->CopyResource(m_tex, m_impl->heldTex.get());   // (direct = the whole frame, same size)
+    else
+        for (const RECT& d : parts)
+        {
+            const RECT f{ 0, 0, m_frameW, m_frameH };
+            RECT p{};
+            if (!IntersectRect(&p, &d, &f)) continue;
+            D3D11_BOX b{ (UINT)p.left, (UINT)p.top, 0, (UINT)p.right, (UINT)p.bottom, 1 };
+            m_context->CopySubresourceRegion(m_tex, 0, (UINT)p.left, (UINT)p.top, 0, m_impl->heldTex.get(), 0, &b);
+        }
+    m_contentValid = true;
+}
+
+ID3D11ShaderResourceView* Capture::DirectSRV(bool& encoded)
+{
+    encoded = false;
+    if (!m_direct || !m_impl || !m_impl->heldTex) return SRV();
+    ID3D11Texture2D* tex = m_impl->heldTex.get();
+    for (const DirectView& v : m_views)
+        if (v.tex == tex) { encoded = true; return v.srv; }
+    // A buffer not seen yet: a plain UNORM view of it (all it allows).
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format              = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (FAILED(m_device->CreateShaderResourceView(tex, &sd, &srv)))
+    {
+        m_direct = false;   // (can't view it: copy instead from now on for this frame)
+        return SRV();
+    }
+    DirectView& slot = m_views[m_viewNext];
+    m_viewNext = (m_viewNext + 1) % kDirectViews;
+    SAFE_RELEASE(slot.srv);
+    SAFE_RELEASE(slot.tex);
+    slot.tex = tex; tex->AddRef();
+    slot.srv = srv;
+    encoded = true;
+    return srv;
+}
+
+// The pool's buffers are going (a new session or size). Their views may still
+// be what the weaver was last given, so they're let go a few updates later,
+// once everything has been given the new picture.
+void Capture::ReleaseDirectViews()
+{
+    for (DirectView& o : m_retired) { SAFE_RELEASE(o.srv); SAFE_RELEASE(o.tex); }
+    for (int i = 0; i < kDirectViews; ++i) { m_retired[i] = m_views[i]; m_views[i] = {}; }
+    m_retireIn = 3;
+    m_viewNext = 0;
+}
+
+void Capture::DropRetiredViews(bool now)
+{
+    if (!now && (m_retireIn == 0 || --m_retireIn > 0)) return;
+    for (DirectView& o : m_retired) { SAFE_RELEASE(o.srv); SAFE_RELEASE(o.tex); }
+    m_retireIn = 0;
 }
 
 bool Capture::ResolveRegion(int& rx, int& ry, int& rw, int& rh) const
@@ -399,6 +522,8 @@ bool Capture::RecropIfRegionChanged(bool& sizeChanged)
         m_appX = rx; m_appY = ry; m_appW = rw; m_appH = rh;
         ++m_version;
         m_contentValid = true;
+        m_direct = m_copyStale = m_pendingAll = false;   // (a crop now: the copy is the picture)
+        m_pendingDirty.clear();
         return true;
     }
 
@@ -507,6 +632,8 @@ void Capture::ReleaseTarget()
 void Capture::Shutdown()
 {
     Stop();
+    ReleaseDirectViews();
+    DropRetiredViews(true);
     ReleaseTarget();
     if (m_impl)
     {

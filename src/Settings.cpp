@@ -133,6 +133,11 @@ namespace srw::Settings
         WriteDword(kSettingsKey, L"LateLatching", enable ? 1u : 0u);
     }
 
+    bool ReadZeroCopyCapture()
+    {
+        return ReadDword(kSettingsKey, L"ZeroCopyCapture", 1) != 0;   // default ON
+    }
+
     void WriteDiagSkipWeave(bool enable)
     {
         WriteDword(kSettingsKey, L"DiagSkipWeave", enable ? 1u : 0u);
@@ -163,14 +168,22 @@ namespace srw::Settings
         WriteDword(kSettingsKey, L"EyeOrderDetect", enable ? 1u : 0u);
     }
 
+    // The pinned Stereo 3D Input: 1..n a layout (StereoFormatList index + 1),
+    // 0 Automatic Detection. Nothing pinned: Side-by-Side (half) -- Automatic
+    // is experimental. (Stored: Automatic as kPinnedAuto; a stored 0 is from
+    // before, when Automatic was the default, and reads as nothing pinned.)
+    constexpr DWORD kPinnedAuto = 1000;
+    constexpr int   kDefaultHalfSbs = 2;
     int ReadDefaultInput()
     {
-        return (int)ReadDword(kSettingsKey, L"DefaultInput", 0);   // default: Automatic Detection
+        const DWORD v = ReadDword(kSettingsKey, L"DefaultInput", 0);
+        if (v == kPinnedAuto) return 0;
+        return v == 0 ? kDefaultHalfSbs : (int)v;
     }
 
     void WriteDefaultInput(int input)
     {
-        WriteDword(kSettingsKey, L"DefaultInput", (DWORD)(input < 0 ? 0 : input));
+        WriteDword(kSettingsKey, L"DefaultInput", input <= 0 ? kPinnedAuto : (DWORD)input);
     }
 
     bool ReadDirectComposition()

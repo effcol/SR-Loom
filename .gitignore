@@ -61,3 +61,15 @@ tools/sweep_*/
 
 # Auto Stereo "debug pick" screenshots, written next to the exe.
 autostereo_debug/
+
+# Test harness (tools/anatest) and research outputs: comparison images,
+# screenshots and captured frames -- anywhere under tools/, never committed.
+tools/**/*.png
+tools/**/*.jpg
+tools/**/*.jpeg
+tools/**/*.bmp
+tools/**/*.pfm
+# Diagnostic captures of the screen (debug hotkey / older builds) and crash
+# dumps, wherever they land.
+anadebug/
+*.dmp

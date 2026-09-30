@@ -14,6 +14,216 @@ using namespace srw;
 
 namespace
 {
+    // Quantile matching: value in `from` -> the value at the same quantile of
+    // `to` (reversed: at 1 - quantile).
+    void MatchHist(const std::vector<long>& from, const std::vector<long>& to, bool reverse, uint8_t out[256])
+    {
+        double nf = 0, nt = 0;
+        for (int i = 0; i < 256; ++i) { nf += from[i]; nt += to[i]; }
+        double cf[256], ct[256], a = 0, b = 0;
+        for (int i = 0; i < 256; ++i)
+        {
+            a += from[i]; b += to[i];
+            cf[i] = (a - from[i] * 0.5) / (std::max)(nf, 1.0);
+            ct[i] = (b - to[i] * 0.5) / (std::max)(nt, 1.0);
+        }
+        for (int v = 0; v < 256; ++v)
+        {
+            const double q = reverse ? 1.0 - cf[v] : cf[v];
+            int j = 0;
+            while (j < 255 && ct[j] < q) ++j;
+            double val = j;
+            if (j > 0 && ct[j] > ct[j - 1]) val = j - 1 + (q - ct[j - 1]) / (ct[j] - ct[j - 1]);
+            out[v] = (uint8_t)std::clamp((int)std::lround(val), 0, 255);
+        }
+    }
+    // Share of (a, b) points off the best curve a = f(b) (median of a per b
+    // bin), more than `tol` away.
+    float CurveOff(const std::vector<std::pair<int, int>>& ab, int tol)
+    {
+        std::vector<std::vector<int>> bins(64);
+        for (const auto& p : ab) bins[p.second / 4].push_back(p.first);
+        size_t off = 0;
+        for (auto& v : bins)
+        {
+            if (v.empty()) continue;
+            std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+            const int m = v[v.size() / 2];
+            for (int x : v) off += std::abs(x - m) > tol;
+        }
+        return (float)off / (std::max)(ab.size(), (size_t)1);
+    }
+}
+
+int srw::AnalyseAnaPicture(const LumaImage& img, const RECT& rIn, int combo, std::shared_ptr<const AnaTint>* tint,
+                            float* apartShare)
+{
+    if (tint) tint->reset();
+    if (!img.hasColour() || img.green.size() != img.pixels.size() || img.blue.size() != img.pixels.size()) return -1;
+    // The one-channel eye's channel, and the two-channel eye's pair.
+    const std::vector<uint8_t>* ch[3] = { &img.red, &img.green, &img.blue };
+    int s, p1, p2;
+    if (combo == 0)      { s = 0; p1 = 1; p2 = 2; }   // red | cyan
+    else if (combo == 3) { s = 1; p1 = 0; p2 = 2; }   // green | magenta
+    else if (combo == 4) { s = 2; p1 = 0; p2 = 1; }   // amber | blue
+    else return -1;
+    const uint8_t* S = ch[s]->data(); const uint8_t* A = ch[p1]->data(); const uint8_t* B = ch[p2]->data();
+    const uint8_t* Rc = img.red.data(); const uint8_t* Gc = img.green.data(); const uint8_t* Bc = img.blue.data();
+    const RECT r{ (std::max)(rIn.left, 0L), (std::max)(rIn.top, 0L),
+                  (std::min)(rIn.right, (LONG)img.width), (std::min)(rIn.bottom, (LONG)img.height) };
+    const size_t W = (size_t)img.width;
+    auto neutral = [&](size_t i) {
+        return (std::max)((std::max)(Rc[i], Gc[i]), Bc[i]) - (std::min)((std::min)(Rc[i], Gc[i]), Bc[i]) <= 8;
+    };
+
+    // Black-and-white: the pair's 8x8 block averages are the same. (Blocks
+    // mostly plain grey -- a page, grey sky -- say nothing and are skipped.)
+    constexpr int kTol = 6;
+    int blocks = 0, apart = 0;
+    for (int by = r.top; by + 8 <= r.bottom; by += 8)
+        for (int bx = r.left; bx + 8 <= r.right; bx += 8)
+        {
+            int sa = 0, sb = 0, busy = 0;
+            for (int y = by; y < by + 8; ++y)
+                for (int x = bx; x < bx + 8; ++x)
+                {
+                    const size_t i = (size_t)y * W + x;
+                    sa += A[i]; sb += B[i]; busy += !neutral(i);
+                }
+            if (busy < 16) continue;
+            ++blocks;
+            apart += std::abs(sa - sb) > kTol * 64;
+        }
+    if (blocks < 20) return -1;
+    if (apartShare) *apartShare = (float)apart / blocks;
+    bool castTint = false;   // (a toned black-and-white, or a half-colour anaglyph: below)
+    if (apart < 0.02 * blocks)   // (offline: black-and-white 0.000, colour 0.33 and up)
+    {
+        // The pair is one grey picture. But the one-channel eye can still carry
+        // an overall cast: a toned print (moon pictures gone pink or cyan), or a
+        // "half-colour" anaglyph -- a colour photo whose cyan eye was made grey,
+        // while the red eye kept its real red (Julia, on Commons: pink all
+        // over). Then it's shown in that one colour (the tint decode, along
+        // red-cyan) rather than grey. Offline: black-and-white within +-6
+        // levels (mean) / +-5 (median); half-colour +8 to +37 / +13 to +50.
+        long n = 0; double d = 0; std::vector<long> hs(256), hk(256);
+        for (int y = r.top; y < r.bottom; ++y)
+            for (int x = r.left; x < r.right; ++x)
+            {
+                const size_t i = (size_t)y * W + x;
+                const int k = (A[i] + B[i] + 1) / 2;
+                d += (int)S[i] - k; hs[S[i]]++; hk[k]++; ++n;
+            }
+        int ms = 0, mk = 0;
+        for (long c = 0; ms < 255 && (c += hs[ms]) < n / 2; ) ++ms;
+        for (long c = 0; mk < 255 && (c += hk[mk]) < n / 2; ) ++mk;
+        const double mean = n ? d / n : 0.0, med = ms - mk;
+        if (std::abs(mean) < 10.0 && std::abs(med) < 12.0) return 1;
+        castTint = true;
+    }
+    if (!castTint)
+    {
+        // One colour: on smooth 4x4 blocks (each of the pair varying <= 16 inside)
+        // one of the pair follows the other along a single curve.
+        std::vector<std::pair<int, int>> ab, ba;
+        for (int by = r.top; by + 4 <= r.bottom; by += 4)
+            for (int bx = r.left; bx + 4 <= r.right; bx += 4)
+            {
+                int sa = 0, sb = 0, busy = 0, a0 = 255, a1 = 0, b0 = 255, b1 = 0;
+                for (int y = by; y < by + 4; ++y)
+                    for (int x = bx; x < bx + 4; ++x)
+                    {
+                        const size_t i = (size_t)y * W + x;
+                        sa += A[i]; sb += B[i]; busy += !neutral(i);
+                        a0 = (std::min)(a0, (int)A[i]); a1 = (std::max)(a1, (int)A[i]);
+                        b0 = (std::min)(b0, (int)B[i]); b1 = (std::max)(b1, (int)B[i]);
+                    }
+                if (busy < 4 || a1 - a0 > 16 || b1 - b0 > 16) continue;
+                ab.push_back({ sa / 16, sb / 16 }); ba.push_back({ sb / 16, sa / 16 });
+            }
+        // Enough smooth blocks to be sure (about a picture shown 700 px across):
+        // on a smaller one a colour picture's few smooth parts can happen to lie on
+        // one curve too (offline, at 300-450 px) -- and taking colour for one tint
+        // would flatten it. Smaller ones stay with Recovered Colour.
+        if (ab.size() < 3500) return 0;
+        // (offline: one-colour pictures <= 0.012, colour 0.02 and up -- bar a
+        // Mars landscape of nearly one hue at 0.005)
+        if ((std::min)(CurveOff(ab, kTol), CurveOff(ba, kTol)) >= 0.015f) return 0;
+    }
+    if (!tint) return 2;
+
+    // The curve. Both eyes see the same scene, so the one-channel eye's values
+    // and the pair's average (the key) have the same distribution: matching
+    // their quantiles gives one from the other. (Whether the two rise
+    // together: from 32x32 block averages, which depth barely shifts.)
+    std::vector<long> hS(256), hK(256);
+    for (int y = r.top; y < r.bottom; ++y)
+        for (int x = r.left; x < r.right; ++x)
+        {
+            const size_t i = (size_t)y * W + x;
+            hS[S[i]]++; hK[(A[i] + B[i] + 1) / 2]++;
+        }
+    double ss = 0, sk = 0, ssk = 0; int n = 0;
+    const int bs = (r.right - r.left >= 128 && r.bottom - r.top >= 128) ? 32 : 16;
+    for (int by = r.top; by + bs <= r.bottom; by += bs)
+        for (int bx = r.left; bx + bs <= r.right; bx += bs)
+        {
+            double vs = 0, vk = 0;
+            for (int y = by; y < by + bs; ++y)
+                for (int x = bx; x < bx + bs; ++x)
+                {
+                    const size_t i = (size_t)y * W + x;
+                    vs += S[i]; vk += (A[i] + B[i]) * 0.5;
+                }
+            vs /= bs * bs; vk /= bs * bs;
+            ss += vs; sk += vk; ssk += vs * vk; ++n;
+        }
+    const bool reverse = n > 1 && (ssk / n - ss / n * sk / n) < 0.0;
+    uint8_t kToS[256], sToK[256];
+    MatchHist(hK, hS, reverse, kToS);
+    MatchHist(hS, hK, reverse, sToK);
+    // Each of the pair from the key: its median per key value.
+    std::vector<std::vector<uint8_t>> va(256), vb(256);
+    for (int y = r.top; y < r.bottom; ++y)
+        for (int x = r.left; x < r.right; ++x)
+        {
+            const size_t i = (size_t)y * W + x;
+            const int k = (A[i] + B[i] + 1) / 2;
+            if (va[k].size() < 2000) { va[k].push_back(A[i]); vb[k].push_back(B[i]); }
+        }
+    auto medians = [](std::vector<std::vector<uint8_t>>& v, int out[256])
+    {
+        int last = -1;
+        for (int k = 0; k < 256; ++k)
+        {
+            if (!v[k].empty())
+            {
+                std::nth_element(v[k].begin(), v[k].begin() + v[k].size() / 2, v[k].end());
+                last = v[k][v[k].size() / 2];
+            }
+            out[k] = last;
+        }
+        int next = -1;
+        for (int k = 255; k >= 0; --k) { if (out[k] >= 0) next = out[k]; else out[k] = next < 0 ? k : next; }
+    };
+    int kToA[256], kToB[256];
+    medians(va, kToA); medians(vb, kToB);
+    auto t = std::make_shared<AnaTint>();
+    for (int v = 0; v < 256; ++v)
+    {
+        const int k = sToK[v];
+        t->single[v][s] = (uint8_t)v; t->single[v][p1] = (uint8_t)kToA[k]; t->single[v][p2] = (uint8_t)kToB[k];
+        t->single[v][3] = 255;
+        t->missing[v] = kToS[v];
+        t->pairA[v] = (uint8_t)kToA[v]; t->pairB[v] = (uint8_t)kToB[v];
+    }
+    *tint = t;
+    return 2;
+}
+
+
+namespace
+{
     // Run fn(i) for i in [0,n) on up to all CPU cores (the scan runs on its
     // own background thread; this fans it out further).
     template <class F> void ParallelFor(int n, F fn)
@@ -1679,8 +1889,8 @@ namespace
         const uint8_t* R = img.red.data();
         const uint8_t* G = img.green.data();
         const uint8_t* B = img.blue.data();
-        // Detail (mean |horizontal step|) per channel, and the mean channel differences.
-        double eR = 0, eG = 0, eB = 0, dGB = 0, dRB = 0, dRG = 0; long n = 0;
+        // Detail (mean |horizontal step|) per channel.
+        double eR = 0, eG = 0, eB = 0; long n = 0;
         for (int y = r.top; y < r.bottom; y += 2)
             for (int x = r.left; x + 1 < r.right; x += 2)
             {
@@ -1688,27 +1898,35 @@ namespace
                 eR += std::abs((int)R[i + 1] - (int)R[i]);
                 eG += std::abs((int)G[i + 1] - (int)G[i]);
                 eB += std::abs((int)B[i + 1] - (int)B[i]);
-                dGB += std::abs((int)G[i] - (int)B[i]);
-                dRB += std::abs((int)R[i] - (int)B[i]);
-                dRG += std::abs((int)R[i] - (int)G[i]);
                 ++n;
             }
         if (n == 0) return k;
-        eR /= n; eG /= n; eB /= n; dGB /= n; dRB /= n; dRG /= n;
+        eR /= n; eG /= n; eB /= n;
         const double eMax = (std::max)(eR, (std::max)(eG, eB));
         const bool emptyG = eG < 0.15 * eMax, emptyB = eB < 0.15 * eMax;
-        constexpr double kGreySame = 6.0;   // mean |difference| below this: the same (grey) picture
+        // What the picture under it was (AnalyseAnaPicture): black-and-white ->
+        // Mono, one colour -> its tint (mode 5), colour -> Recovered Colour.
+        auto bw = [&](int combo) { const int p = AnalyseAnaPicture(img, r, combo, &k.tint); return p == 1 ? 3 : p == 2 ? 5 : 4; };
         if (emptyG) { k.combo = 2; k.mode = 3; k.known = true; return k; }   // red/blue: one channel per eye
         if (emptyB) { k.combo = 1; k.mode = 3; k.known = true; return k; }   // red/green
         const bool sRG = AnaSplit(AnaSignature(R, G, W, r, w, h));
         const bool sRB = AnaSplit(AnaSignature(R, B, W, r, w, h));
         const bool sGB = AnaSplit(AnaSignature(G, B, W, r, w, h));
         k.known = true;
-        if (sRG && sRB && !sGB)      { k.combo = 0; k.mode = dGB < kGreySame ? 3 : 4; }   // red | green+blue
-        else if (sRG && sGB && !sRB) { k.combo = 3; k.mode = dRB < kGreySame ? 3 : 4; }   // green | red+blue
-        else if (sRB && sGB && !sRG) { k.combo = 4; k.mode = dRG < kGreySame ? 3 : 4; }   // red+green | blue
-        else if (sRG && !sRB && !sGB) { k.combo = 5; k.mode = 4; }                        // cyan | magenta (blue shared)
-        else                         { k.combo = 0; k.mode = dGB < kGreySame ? 3 : 4; k.known = false; }
+        if (sRG && sRB && !sGB)      { k.combo = 0; k.mode = bw(0); }   // red | green+blue
+        else if (sRG && sGB && !sRB) { k.combo = 3; k.mode = bw(3); }   // green | red+blue
+        else if (sRB && sGB && !sRG) { k.combo = 4; k.mode = bw(4); }   // red+green | blue
+        else if (sRG && !sRB && !sGB)                                                  // cyan | magenta (blue shared)
+        {
+            // ... unless green and blue are the same picture (AnalyseAnaPicture):
+            // then it is a black-and-white red/cyan one whose red-vs-blue split
+            // was missed (blue is the noisiest channel of a JPEG). A real
+            // cyan/magenta one has green (left eye) and blue (both) apart
+            // wherever there is depth.
+            if (AnalyseAnaPicture(img, r, 0, nullptr) == 1) { k.combo = 0; k.mode = 3; }
+            else { k.combo = 5; k.mode = 4; }
+        }
+        else                         { k.combo = 0; k.mode = bw(0); k.known = false; }
         return k;
     }
 }
@@ -2210,6 +2428,7 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
             continue;
         }
         out.log.push_back(std::string(j.whole ? (j.st ? "whole HIT " : "whole no  ") : (j.st ? "image HIT " : "image no  ")) + j.diag);
+        if (!j.whole) out.pictures.push_back(j.rect);
         if (j.st)
         {
             const ScanWindow& sw = windows[j.win];
@@ -2217,4 +2436,30 @@ void StereoScanner::Scan(const LumaImage& img, const std::vector<ScanWindow>& wi
         }
     }
     if (cache) *cache = std::move(used);   // keep only what's still on screen
+}
+
+// Some sign that this picture is an anaglyph at all -- a lighter version of
+// ClassifyStereo's test, for pictures it didn't call 3D (small thumbnails often
+// miss its bar). Red and cyan differ, and their edges line up clearly better
+// shifted sideways than not (or than shifted up or down). Page parts -- red
+// text, an icon, a panel -- have their edges in one channel only, or in both
+// at the same place: no shift helps them.
+bool srw::AnaglyphEvidence(const LumaImage& img, const RECT& rIn)
+{
+    if (!img.hasColour() || img.cyan.size() != img.pixels.size()) return false;
+    const RECT r{ (std::max)(rIn.left, 0L), (std::max)(rIn.top, 0L),
+                  (std::min)(rIn.right, (LONG)img.width), (std::min)(rIn.bottom, (LONG)img.height) };
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (w < 48 || h < 48) return false;
+    const size_t W = (size_t)img.width;
+    double along = 0; long n = 0;
+    for (int y = r.top; y < r.bottom; y += 2)
+        for (int x = r.left; x < r.right; x += 2)
+        {
+            const size_t i = (size_t)y * W + x;
+            along += std::abs((int)img.red[i] - (int)img.cyan[i]); ++n;
+        }
+    if (n == 0 || along / n < 2.0) return false;
+    const AnaSig s = AnaSignature(img.red.data(), img.cyan.data(), W, r, w, h);
+    return s.blocks >= 4 && s.aH - s.a0 >= 0.10f && s.aH - s.aV >= 0.05f;
 }

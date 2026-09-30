@@ -1428,12 +1428,31 @@ bool Gui::Render(GuiState& state)
             const float pinW = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
 
             ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::BeginCombo("##format", state.autoInput ? "Automatic Detection" : kCat[curCat],
-                                  ImGuiComboFlags_HeightLargest))
+            const bool fmtOpen = ImGui::BeginCombo("##format", state.autoInput ? "Automatic Detection" : kCat[curCat],
+                                                   ImGuiComboFlags_HeightLargest);
+            if (state.autoInput)
+            {
+                // (Experimental, in red, on the closed box too -- left of its arrow.)
+                const char* tag = "Experimental";
+                const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+                const ImVec2 ts = ImGui::CalcTextSize(tag);
+                const float arrow = ImGui::GetFrameHeight();
+                ImGui::GetWindowDrawList()->AddText(ImVec2(mx.x - arrow - ts.x - ImGui::GetStyle().FramePadding.x, mn.y + (mx.y - mn.y - ts.y) * 0.5f),
+                                                    IM_COL32(235, 80, 70, 255), tag);
+            }
+            if (fmtOpen)
             {
                 const float itemW = ImGui::GetContentRegionAvail().x - pinW;
                 if (ImGui::Selectable("Automatic Detection", state.autoInput, 0, ImVec2(itemW, 0)))
                     post(ID_TRAY_AUTO_STEREO);
+                {
+                    // (Experimental, in red, at the item's right-hand end.)
+                    const char* tag = "Experimental";
+                    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+                    const ImVec2 ts = ImGui::CalcTextSize(tag);
+                    ImGui::GetWindowDrawList()->AddText(ImVec2(mx.x - ts.x - ImGui::GetStyle().FramePadding.x, mn.y + (mx.y - mn.y - ts.y) * 0.5f),
+                                                        IM_COL32(235, 80, 70, 255), tag);
+                }
                 if (ImGui::IsItemHovered())
                 {
                     const float maxW = 340.0f * m_dpiScale;

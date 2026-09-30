@@ -134,7 +134,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
 set(CONVERTER_ENTRIES
     VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSPicCols:ps_5_0 PSPicRows:ps_5_0 PSPicRect:ps_5_0)
+    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSAnaBoxCheck:ps_5_0 PSAnaBoxRows:ps_5_0 PSAnaBoxMap:ps_5_0 PSChange:ps_5_0 PSChangeGrow:ps_5_0 PSAnaBoxShiftCost:ps_5_0 PSAnaBoxShift:ps_5_0)
 set(CONVERTER_SHADER_HEADERS)
 foreach(E ${CONVERTER_ENTRIES})
     string(REPLACE ":" ";" P "${E}")
@@ -255,13 +255,23 @@ add_dependencies(SRLoom NPClient64)
 # built only on request: cmake --build ... --target anatest). anatest runs the
 # current converter; anatest_head the one in build/anatest/head (e.g. a
 # previous commit's Converter.cpp/.h) to compare against.
-add_executable(anatest EXCLUDE_FROM_ALL tools/anatest/anatest.cpp src/Converter.cpp ${CONVERTER_SHADER_HEADERS})
+add_executable(anatest EXCLUDE_FROM_ALL tools/anatest/anatest.cpp src/Converter.cpp src/ScreenAnalysis.cpp ${CONVERTER_SHADER_HEADERS})
 target_include_directories(anatest PRIVATE ${CMAKE_SOURCE_DIR}/src ${SHADER_OUT_DIR})
 target_compile_definitions(anatest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(anatest PRIVATE d3d11 dxgi windowscodecs ole32)
+target_link_libraries(anatest PRIVATE d3d11 dxgi d3dcompiler user32 windowscodecs ole32)
 if(EXISTS "${CMAKE_SOURCE_DIR}/build/anatest/head/Converter.cpp")
     add_executable(anatest_head EXCLUDE_FROM_ALL tools/anatest/anatest.cpp "${CMAKE_SOURCE_DIR}/build/anatest/head/Converter.cpp")
     target_include_directories(anatest_head PRIVATE "${CMAKE_SOURCE_DIR}/build/anatest/head" ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(anatest_head PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS ANATEST_HEAD)
     target_link_libraries(anatest_head PRIVATE d3d11 dxgi windowscodecs ole32 d3dcompiler)
 endif()
+
+# captest: zero-copy capture against the real Windows capture (its own test
+# window + the monitor it's on; prints numbers only). Built only on request:
+# cmake --build ... --target captest. Output in its own folder so its log
+# lines don't land in SR Loom's srweaver.log.
+add_executable(captest EXCLUDE_FROM_ALL tools/captest/captest.cpp src/Capture.cpp src/Converter.cpp ${CONVERTER_SHADER_HEADERS})
+target_include_directories(captest PRIVATE ${CMAKE_SOURCE_DIR}/src ${SHADER_OUT_DIR})
+target_compile_definitions(captest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(captest PRIVATE d3d11 dxgi d3dcompiler user32 gdi32 windowsapp)
+set_target_properties(captest PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/captest)

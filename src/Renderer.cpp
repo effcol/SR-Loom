@@ -6,6 +6,9 @@
 #include <thread>      // std::this_thread::sleep_for / yield for the render-rate cap
 #include <dcomp.h>     // DirectComposition presenter
 #include <d3dcompiler.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -113,6 +116,12 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
         if (SUCCEEDED(m_device->QueryInterface(__uuidof(IDXGIDevice1), (void**)&dxgiDevice1)))
         {
             dxgiDevice1->SetMaximumFrameLatency(1);
+            // Our GPU work ahead of other apps' in the scheduler: while a page
+            // scrolls the browser renders 4K at full rate on the same GPU, and a
+            // weave queued behind it misses the SR display's refresh (judder).
+            // (Ours is a few ms a frame; theirs isn't slowed noticeably.)
+            const HRESULT hp = dxgiDevice1->SetGPUThreadPriority(7);
+            Log("Renderer: GPU thread priority +7 %s (0x%08lX)", SUCCEEDED(hp) ? "set" : "refused", (unsigned long)hp);
             dxgiDevice1->Release();
         }
     }
@@ -242,6 +251,7 @@ cbuffer M : register(b0)
     float4 trInfo[16];    //   x = GpuTracker slot (-1 none), y = px per tracker row
     float4 excl[64];      // never visible (windows in front, taskbar, 2D windows)
     float4 exRad[16];     //   ... their corner radii (4 per float4)
+    float4 exOwner[16];   //   ... whose they are: the trRect index, or -1 = everyone's (4 per float4)
 };
 StructuredBuffer<int4> gpuRes : register(t0);
 float4 VSMain(uint id : SV_VertexID) : SV_Position
@@ -258,21 +268,55 @@ bool InsideRounded(float2 p, float4 r, float rad)
     const float2 c = clamp(p, r.xy + rad, r.zw - rad);   // nearest point of the inner rect
     return length(p - c) <= rad;
 }
+// Which rects can touch each tile of the screen (Renderer::ApplyMask): [0] =
+// (tiles across, down, tile width, height); per tile two uint4s -- the static
+// visible rects (64 bits), the holes (64 bits), then the tracked pictures
+// (16 bits, grown by the GPU tracker's search). Only those are tested: most
+// of a page is nowhere near a picture.
+StructuredBuffer<uint4> tiles : register(t1);
+uint TakeBit(inout uint lo, inout uint hi)
+{
+    if (lo) { const uint b = firstbitlow(lo); lo &= lo - 1; return b; }
+    const uint b = firstbitlow(hi); hi &= hi - 1; return 32 + b;
+}
 float4 PSMain(float4 pos : SV_Position) : SV_Target
 {
     float m = all ? 1.0 : 0.0;
+    const uint4 th = tiles[0];
+    const uint t = min((uint)pos.y / th.w, th.y - 1) * th.x + min((uint)pos.x / th.z, th.x - 1);
+    const uint4 ta = tiles[1 + 2 * t];
+    uint rLo = ta.x, rHi = ta.y, trBits = tiles[2 + 2 * t].x;
     uint i;
-    [loop] for (i = 0; i < count && m == 0; ++i)
-        if (Inside(pos.xy, rects[i])) m = 1.0;
-    [loop] for (i = 0; i < trCount && m == 0; ++i)
+    [loop] while (m == 0 && (rLo | rHi))
+        if (Inside(pos.xy, rects[TakeBit(rLo, rHi)])) m = 1.0;
+    [loop] while (m == 0 && trBits)
     {
+        i = firstbitlow(trBits); trBits &= trBits - 1;
         float dx = 0, dy = 0;
         const int slot = (int)trInfo[i].x;
         if (slot >= 0) { const int4 g = gpuRes[slot]; if (g.y) dy = g.x * trInfo[i].y; if (g.w) dx = g.z * trInfo[i].y; }
-        if (Inside(pos.xy, trRect[i] + float4(dx, dy, dx, dy)) && Inside(pos.xy, trClip[i])) m = 1.0;
+        if (!Inside(pos.xy, trRect[i] + float4(dx, dy, dx, dy)) || !Inside(pos.xy, trClip[i])) continue;
+        // ... unless one of THIS picture's own holes (a window in front of
+        // it) covers the spot. Another picture's holes don't: a window in
+        // front of a browser's pictures is often the one holding a picture
+        // of its own (Discord over Zen), which was cut out along the edge of
+        // the browser's area.
+        bool hidden = false;
+        uint eLo = ta.z, eHi = ta.w;
+        [loop] while (!hidden && (eLo | eHi))
+        {
+            const uint j = TakeBit(eLo, eHi);
+            if ((int)exOwner[j / 4][j % 4] == (int)i && InsideRounded(pos.xy, excl[j], exRad[j / 4][j % 4])) hidden = true;
+        }
+        if (!hidden) m = 1.0;
     }
-    [loop] for (i = 0; i < exCount && m != 0; ++i)
-        if (InsideRounded(pos.xy, excl[i], exRad[i / 4][i % 4])) m = 0.0;
+    // Holes in everything (the taskbar, 2D windows).
+    uint gLo = ta.z, gHi = ta.w;
+    [loop] while (m != 0 && (gLo | gHi))
+    {
+        i = TakeBit(gLo, gHi);
+        if ((int)exOwner[i / 4][i % 4] < 0 && InsideRounded(pos.xy, excl[i], exRad[i / 4][i % 4])) m = 0.0;
+    }
     return float4(m, m, m, m);
 }
 )";
@@ -302,12 +346,24 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     m_device->CreateBlendState(&bd, &m_maskBlend);
 
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth      = 16 + 16 * (64 + 16 * 3 + 64 + 16);
+    cb.ByteWidth      = 16 + 16 * (64 + 16 * 3 + 64 + 16 + 16);   // (... + exOwner)
     cb.Usage          = D3D11_USAGE_DYNAMIC;
     cb.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     m_device->CreateBuffer(&cb, nullptr, &m_maskCB);
-    return m_maskVS && m_maskPS && m_maskBlend && m_maskCB;
+    // The tile lists (PSMain's tiles): [0] header + two uint4 per tile.
+    D3D11_BUFFER_DESC tb{};
+    tb.ByteWidth           = 16 * (1 + 2 * kMaskTilesX * kMaskTilesY);
+    tb.Usage               = D3D11_USAGE_DYNAMIC;
+    tb.BindFlags           = D3D11_BIND_SHADER_RESOURCE;
+    tb.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
+    tb.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    tb.StructureByteStride = 16;
+    if (SUCCEEDED(m_device->CreateBuffer(&tb, nullptr, &m_maskTiles)))
+        m_device->CreateShaderResourceView(m_maskTiles, nullptr, &m_maskTilesSRV);
+    D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+    m_device->CreateRasterizerState(&rd, &m_scissorRS);
+    return m_maskVS && m_maskPS && m_maskBlend && m_maskCB && m_maskTilesSRV;
 }
 
 void Renderer::SetVisibleAll()
@@ -344,7 +400,37 @@ void Renderer::ApplyMask()
 {
     if (!m_rtv || !m_maskPS || !m_dcomp) return;
     m_maskDone = true;
+    // Does the SR weave leave the picture opaque (alpha 1, as cleared)? Then
+    // when everything is shown -- Fullscreen, a game -- the full-screen mask
+    // pass (~0.3 ms of GPU a frame at 4K) is skipped, and holes (the
+    // taskbar, a window in front) are drawn on their own. Found out once:
+    // one pixel of the weave read back a frame later (never waited on).
     D3D11_MAPPED_SUBRESOURCE m{};
+    if (m_alphaProbe == 1 && m_alphaProbeTex &&
+        SUCCEEDED(m_context->Map(m_alphaProbeTex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)))
+    {
+        const uint8_t a = static_cast<const uint8_t*>(m.pData)[3];
+        m_context->Unmap(m_alphaProbeTex, 0);
+        m_alphaProbe = a == 255 ? 2 : 3;
+        Log("Renderer: the SR weave %s -- full-screen mask pass %s", a == 255 ? "keeps the picture opaque" : "writes its own alpha",
+            a == 255 ? "skipped when nothing is hidden" : "kept");
+    }
+    if (m_alphaProbe == 0 && m_swapFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
+    {
+        D3D11_TEXTURE2D_DESC pd{};
+        pd.Width = 1; pd.Height = 1; pd.MipLevels = 1; pd.ArraySize = 1; pd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1; pd.Usage = D3D11_USAGE_STAGING; pd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Resource* bb = nullptr; m_rtv->GetResource(&bb);
+        if (bb && (m_alphaProbeTex || SUCCEEDED(m_device->CreateTexture2D(&pd, nullptr, &m_alphaProbeTex))))
+        {
+            D3D11_BOX box{ (UINT)m_width / 2, (UINT)m_height / 2, 0, (UINT)m_width / 2 + 1, (UINT)m_height / 2 + 1, 1 };
+            m_context->CopySubresourceRegion(m_alphaProbeTex, 0, 0, 0, 0, bb, 0, &box);   // (before the mask below)
+            m_alphaProbe = 1;
+        }
+        SAFE_RELEASE(bb);
+    }
+    const bool holesOnly = m_alphaProbe == 2 && m_maskAll && m_maskRects.empty() && m_maskTracked.empty();
+    if (holesOnly && m_maskExcl.empty()) return;   // (nothing hidden: nothing to do)
     if (FAILED(m_context->Map(m_maskCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
     uint32_t* head = static_cast<uint32_t*>(m.pData);
     head[0] = (uint32_t)m_maskRects.size();
@@ -359,7 +445,8 @@ void Renderer::ApplyMask()
     float* trInfo = trClip + 16 * 4; // 16
     float* excl   = trInfo + 16 * 4; // 64
     float* exRad  = excl + 64 * 4;   // 64 (16 float4s)
-    for (int i = 0; i < 64; ++i) exRad[i] = 0.0f;
+    float* exOwn  = exRad + 64;      // 64 (16 float4s)
+    for (int i = 0; i < 64; ++i) { exRad[i] = 0.0f; exOwn[i] = -1.0f; }
     for (size_t i = 0; i < m_maskRects.size(); ++i) put(rects + i * 4, m_maskRects[i]);
     for (size_t i = 0; i < m_maskTracked.size(); ++i)
     {
@@ -373,8 +460,46 @@ void Renderer::ApplyMask()
     {
         put(excl + i * 4, m_maskExcl[i].rect);
         exRad[i] = (float)m_maskExcl[i].radius;
+        exOwn[i] = (float)m_maskExcl[i].owner;
     }
     m_context->Unmap(m_maskCB, 0);
+
+    // Which rects can touch each tile (PSMain's tiles). A tracked picture may
+    // move by up to the GPU tracker's search this frame: its tiles cover that
+    // (within its viewport).
+    if (m_maskTiles && SUCCEEDED(m_context->Map(m_maskTiles, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+    {
+        uint32_t* t = static_cast<uint32_t*>(m.pData);
+        memset(t, 0, 16 * (1 + 2 * kMaskTilesX * kMaskTilesY));
+        const int tw = (m_width + kMaskTilesX - 1) / kMaskTilesX, th = (m_height + kMaskTilesY - 1) / kMaskTilesY;
+        t[0] = kMaskTilesX; t[1] = kMaskTilesY; t[2] = (uint32_t)(std::max)(tw, 1); t[3] = (uint32_t)(std::max)(th, 1);
+        // word: 0/1 static rects (lo/hi), 2/3 holes (lo/hi), 4 tracked.
+        auto mark = [&](RECT r, int word, int bit) {
+            if (r.right <= r.left || r.bottom <= r.top || tw <= 0 || th <= 0) return;
+            const int x0 = (std::max)(0, (int)r.left / tw), x1 = (std::min)(kMaskTilesX - 1, (int)(r.right - 1) / tw);
+            const int y0 = (std::max)(0, (int)r.top / th),  y1 = (std::min)(kMaskTilesY - 1, (int)(r.bottom - 1) / th);
+            const int w = word + (bit >= 32 ? 1 : 0);
+            const uint32_t b = 1u << (bit & 31);
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x)
+                    t[4 + (y * kMaskTilesX + x) * 8 + w] |= b;
+        };
+        for (size_t i = 0; i < m_maskRects.size() && i < 64; ++i) mark(m_maskRects[i], 0, (int)i);
+        for (size_t i = 0; i < m_maskExcl.size() && i < 64; ++i) mark(m_maskExcl[i].rect, 2, (int)i);
+        for (size_t i = 0; i < m_maskTracked.size() && i < 16; ++i)
+        {
+            const MaskTracked& k = m_maskTracked[i];
+            RECT r = k.rect;
+            if (k.slot >= 0)
+            {
+                const int gx = (int)std::ceil(48 * k.scale) + 1, gy = (int)std::ceil(96 * k.scale) + 1;   // (GpuTracker::kSearchX / kSearch)
+                InflateRect(&r, gx, gy);
+            }
+            RECT c{};
+            if (IntersectRect(&c, &r, &k.clip)) mark(c, 4, (int)i);
+        }
+        m_context->Unmap(m_maskTiles, 0);
+    }
 
     m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
     D3D11_VIEWPORT vp{ 0, 0, (FLOAT)m_width, (FLOAT)m_height, 0, 1 };
@@ -387,10 +512,26 @@ void Renderer::ApplyMask()
     m_context->PSSetShader(m_maskPS, nullptr, 0);
     m_context->PSSetConstantBuffers(0, 1, &m_maskCB);
     ID3D11ShaderResourceView* gpu = m_maskTracked.empty() ? nullptr : m_maskGpu;
-    m_context->PSSetShaderResources(0, 1, &gpu);
-    m_context->Draw(3, 0);
-    ID3D11ShaderResourceView* nullSRV = nullptr;
-    m_context->PSSetShaderResources(0, 1, &nullSRV);
+    ID3D11ShaderResourceView* srvs[2] = { gpu, m_maskTilesSRV };
+    m_context->PSSetShaderResources(0, 2, srvs);
+    if (holesOnly && m_scissorRS)
+    {
+        // (Everything else is opaque already: only each hole's own pixels.)
+        m_context->RSSetState(m_scissorRS);
+        for (const MaskCut& c : m_maskExcl)
+        {
+            D3D11_RECT sc{ (std::max)(c.rect.left, 0L), (std::max)(c.rect.top, 0L),
+                           (std::min)(c.rect.right, (LONG)m_width), (std::min)(c.rect.bottom, (LONG)m_height) };
+            if (sc.right <= sc.left || sc.bottom <= sc.top) continue;
+            m_context->RSSetScissorRects(1, &sc);
+            m_context->Draw(3, 0);
+        }
+        m_context->RSSetState(nullptr);
+    }
+    else
+        m_context->Draw(3, 0);
+    ID3D11ShaderResourceView* nulls[2] = {};
+    m_context->PSSetShaderResources(0, 2, nulls);
     m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }
 
@@ -545,8 +686,12 @@ void Renderer::SetTargetRefreshHz(double hz)
 
 void Renderer::WaitForFrame()
 {
+    using wclk = std::chrono::steady_clock;
+    const auto w0 = wclk::now();
     if (m_waitable)
         WaitForSingleObjectEx(m_waitable, 1000, TRUE);
+    m_lastCompositorWaitMs = std::chrono::duration<double, std::milli>(wclk::now() - w0).count();
+    m_lastVBlankWaitMs = 0.0;
 
     // Render-rate cap: hold here until one display refresh has passed since
     // the START of the previous frame (not the end of its present: that made
@@ -557,7 +702,13 @@ void Renderer::WaitForFrame()
     if (m_targetIntervalNs > 0)
     {
         using namespace std::chrono;
-        const auto target = m_lastFrameStart + nanoseconds(m_targetIntervalNs);
+        // With the display's vertical blank to sync on (below), the cap only
+        // has to get close: 80% of a refresh, the blank wait does the exact
+        // rest. Aiming at 98% left ~0.1 ms of slack, and a wake-up a millisecond
+        // or two late -- Windows under load (a video decoding, a browser
+        // scrolling) -- missed the refresh: the frame shown twice.
+        const int64_t capNs = m_vblankOutput ? (int64_t)(m_targetIntervalNs / 0.98 * 0.80) : m_targetIntervalNs;
+        const auto target = m_lastFrameStart + nanoseconds(capNs);
         for (;;)
         {
             const auto now = steady_clock::now();
@@ -589,12 +740,31 @@ void Renderer::WaitForFrame()
     // refresh, locked to the display (the cap alone drifted, 155-163 frames/s
     // at 160 Hz). Not when this frame is already late -- a whole refresh
     // since the last one started -- where waiting would skip a refresh.
+    // Nor when a blank has only just passed: waiting on the compositor (above)
+    // runs on Windows' own composition clock, which drifts against the
+    // display's, and it often let go just after a blank -- then "the next
+    // blank" was almost a whole refresh away and the frame showed twice (a
+    // judder, 10-35 times a second). Just past one, the frame is on time as
+    // it is. (When the last blank was is known from the last wait.)
     if (m_vblankOutput && m_targetIntervalNs > 0)
     {
         using namespace std::chrono;
-        const auto since = duration_cast<nanoseconds>(steady_clock::now() - m_lastFrameStart).count();
-        if (since < (int64_t)(m_targetIntervalNs / 0.98))
+        const auto now = steady_clock::now();
+        const int64_t period = (int64_t)(m_targetIntervalNs / 0.98);
+        const auto since = duration_cast<nanoseconds>(now - m_lastFrameStart).count();
+        bool justPast = false;
+        if (m_lastVBlank.time_since_epoch().count() != 0)
+        {
+            const int64_t phase = duration_cast<nanoseconds>(now - m_lastVBlank).count() % period;
+            justPast = phase < 1'500'000;
+        }
+        if (since < period && !justPast)
+        {
+            const auto v0 = wclk::now();
             m_vblankOutput->WaitForVBlank();
+            m_lastVBlank = wclk::now();
+            m_lastVBlankWaitMs = std::chrono::duration<double, std::milli>(m_lastVBlank - v0).count();
+        }
     }
     m_lastFrameStart = std::chrono::steady_clock::now();
 }
@@ -637,6 +807,8 @@ void Renderer::Shutdown()
 {
     SAFE_RELEASE(m_rtv);
     SAFE_RELEASE(m_swapChain);
+    SAFE_RELEASE(m_maskTilesSRV); SAFE_RELEASE(m_maskTiles);
+    SAFE_RELEASE(m_scissorRS); SAFE_RELEASE(m_alphaProbeTex); m_alphaProbe = 0;
     SAFE_RELEASE(m_maskCB); SAFE_RELEASE(m_maskBlend); SAFE_RELEASE(m_maskPS); SAFE_RELEASE(m_maskVS);
     SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
     SAFE_RELEASE(m_vblankOutput);
@@ -651,4 +823,13 @@ double Renderer::CompositionRateHz() const
     DCOMPOSITION_FRAME_STATISTICS st{};
     if (FAILED(m_dcomp->GetFrameStatistics(&st)) || st.currentCompositionRate.Denominator == 0) return 0.0;
     return (double)st.currentCompositionRate.Numerator / st.currentCompositionRate.Denominator;
+}
+
+double Renderer::MsToNextVBlank() const
+{
+    if (m_targetIntervalNs <= 0 || m_lastVBlank.time_since_epoch().count() == 0) return -1.0;
+    using namespace std::chrono;
+    const int64_t period = (int64_t)(m_targetIntervalNs / 0.98);
+    const int64_t phase = duration_cast<nanoseconds>(steady_clock::now() - m_lastVBlank).count() % period;
+    return (period - phase) / 1.0e6;
 }

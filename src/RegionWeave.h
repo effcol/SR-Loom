@@ -18,6 +18,7 @@
 
 namespace srw
 {
+    struct AnaTint;   // (ScreenAnalysis.h)
     struct WeaveRegion
     {
         int          id       = 0;
@@ -31,6 +32,7 @@ namespace srw
         bool         swapEyes = false;
         int          anaglyphCombo = 0;
         int          anaglyphMode  = 0;
+        std::shared_ptr<const AnaTint> anaTint;  // anaglyphMode 5: the one-colour picture's tint tables (AnalyseAnaPicture)
         bool         anaAuto  = false;        // its anaglyph colour pair / decode were detected (not the panel's)
         bool         autoSwap = false;        // detected with its eyes the other way round (flips the panel's Swap Eyes)
         HWND         trackWindow = nullptr;   // follow this window's client area, or null
@@ -104,7 +106,7 @@ namespace srw
 
         static constexpr DXGI_FORMAT kCompFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
-        Slot* SlotFor(int id);
+        Slot* SlotFor(int id, int w, int h);
         bool  EnsureCrop(Slot& s, int w, int h, DXGI_FORMAT texFmt, DXGI_FORMAT srvFmt);
         void  SetScissor(const RECT& r);
         bool  EnsureComposite(int w, int h);
@@ -136,7 +138,10 @@ namespace srw
 
         std::vector<WeaveRegion>  m_regions;
         std::vector<Slot>         m_slots;
-        std::vector<std::unique_ptr<Converter>> m_convPool;   // recycled (shader compile is slow)
+        // Recycled slots -- converter and crop, with their textures: a picture
+        // of the same size as one that went reuses them as they are (making
+        // textures stalls the frame a new picture turns up in).
+        std::vector<Slot>         m_slotPool;
         int                       m_nextId = 1;
     };
 }

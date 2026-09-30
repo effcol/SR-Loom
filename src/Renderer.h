@@ -43,7 +43,10 @@ namespace srw
         // GPU this frame, so the see-through cut-out moves with the picture),
         // minus areas never shown (windows in front, taskbar, 2D windows).
         struct MaskTracked { RECT rect{}; RECT clip{}; int slot = -1; float scale = 2.0f; };
-        struct MaskCut     { RECT rect{}; int radius = 0; };   // a hole (rounded corners)
+        // A hole (rounded corners). owner: the tracked picture it belongs to (a
+        // window in front of THAT picture -- other pictures there stay
+        // visible), or -1: a hole in everything (taskbar, 2D windows).
+        struct MaskCut     { RECT rect{}; int radius = 0; int owner = -1; };
         // Whole window except these holes (Fullscreen / Looking Glass cut-outs).
         void SetVisibleAllExcept(const std::vector<MaskCut>& holes);
         void SetVisibleTracked(const std::vector<MaskTracked>& tracked, const std::vector<MaskCut>& excl,
@@ -71,6 +74,13 @@ namespace srw
         // the GPU at thousands of fps. No-op on the bit-blt path (vsync paces it).
         // Also enforces the render-rate cap set by SetTargetRefreshHz, if any.
         void WaitForFrame();
+        // The last WaitForFrame's parts (ms): waiting for the compositor to take
+        // the previous frame, and for the SR display's vertical blank.
+        double LastCompositorWaitMs() const { return m_lastCompositorWaitMs; }
+        double LastVBlankWaitMs() const { return m_lastVBlankWaitMs; }
+        // Time left until the SR display's next refresh (ms), from the last one
+        // WaitForFrame saw; -1 if not known (no refresh sync).
+        double MsToNextVBlank() const;
 
         // Cap the render loop's Present rate to the given refresh in Hz. Pass 0 to
         // disable. Avoids burning GPU rendering faster than the SR panel can show;
@@ -100,6 +110,9 @@ namespace srw
         bool CreateDCompSwapChain();
         bool InitMask();
         bool                    m_maskDone  = false;   // applied this frame already (ApplyMaskNow)
+        int                     m_alphaProbe = 0;      // does the weave leave alpha 1? 0 unknown, 1 read back pending, 2 yes, 3 no (ApplyMask)
+        ID3D11Texture2D*        m_alphaProbeTex = nullptr;
+        ID3D11RasterizerState*  m_scissorRS = nullptr; // (the mask drawn hole by hole)
 
         IDCompositionDevice*    m_dcomp     = nullptr;
         IDCompositionTarget*    m_dcTarget  = nullptr;
@@ -108,6 +121,9 @@ namespace srw
         ID3D11PixelShader*      m_maskPS    = nullptr;
         ID3D11BlendState*       m_maskBlend = nullptr;
         ID3D11Buffer*           m_maskCB    = nullptr;
+        ID3D11Buffer*           m_maskTiles = nullptr;   // which rects touch each screen tile (the mask shader's t1)
+        ID3D11ShaderResourceView* m_maskTilesSRV = nullptr;
+        static constexpr int    kMaskTilesX = 32, kMaskTilesY = 18;
         bool                    m_maskAll   = true;
         std::vector<RECT>       m_maskRects;
         std::vector<MaskTracked> m_maskTracked;
@@ -140,6 +156,8 @@ namespace srw
         int64_t                              m_targetIntervalNs = 0;
         std::chrono::steady_clock::time_point m_lastPresentEnd{};
         std::chrono::steady_clock::time_point m_lastFrameStart{};   // render cap counts from here
+        double m_lastCompositorWaitMs = 0.0, m_lastVBlankWaitMs = 0.0;
+        std::chrono::steady_clock::time_point m_lastVBlank{};   // when the last WaitForVBlank returned (the display's phase)
         // The SR display's output: frames start on its vertical blank (see
         // WaitForFrame), locking the loop to its refresh rate.
         IDXGIOutput*                         m_vblankOutput = nullptr;

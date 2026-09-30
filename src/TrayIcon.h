@@ -167,7 +167,9 @@ namespace srw
         // Build and show the right-click context menu, with current state
         // reflected as checkmarks/radio marks. Commands post as WM_COMMAND.
         // Enumerates top-level windows into the Source submenu.
-        void ShowContextMenu(HWND hwnd, const MenuState& s);
+        // returnCmd: the chosen command is returned (0: none) instead of sent
+        // to hwnd as WM_COMMAND (the menu shown from its own thread).
+        UINT ShowContextMenu(HWND hwnd, const MenuState& s, bool returnCmd = false);
 
         // Resolve a window-list menu index (id - ID_TRAY_SRC_WINDOW_BASE) to its
         // HWND, captured when the menu was last shown. Null if out of range.

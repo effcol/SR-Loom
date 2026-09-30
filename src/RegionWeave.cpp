@@ -1,5 +1,6 @@
 // RegionWeave.cpp -- see RegionWeave.h.
 #include "RegionWeave.h"
+#include "ScreenAnalysis.h"
 
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -150,7 +151,8 @@ bool RegionWeaver::Initialize(ID3D11Device* device, ID3D11DeviceContext* context
 void RegionWeaver::Shutdown()
 {
     Clear();
-    m_convPool.clear();
+    for (auto& s : m_slotPool) { SafeRelease(s.cropRTV); SafeRelease(s.cropSRV); SafeRelease(s.crop); }
+    m_slotPool.clear();
     SafeRelease(m_compSRV); SafeRelease(m_compRTV); SafeRelease(m_comp);
     SafeRelease(m_lgSRV); SafeRelease(m_lgTex); m_lgW = m_lgH = 0;
     m_compW = m_compH = 0;
@@ -189,22 +191,35 @@ void RegionWeaver::Clear()
 
 void RegionWeaver::ReleaseSlot(Slot& s)
 {
-    SafeRelease(s.cropRTV);
-    SafeRelease(s.cropSRV);
-    SafeRelease(s.crop);
-    s.cropW = s.cropH = 0;
-    if (s.conv) m_convPool.push_back(std::move(s.conv));   // keep its compiled shaders
+    // Into the pool as it is -- converter (compiled shaders) and crop, with
+    // their textures -- for the next picture (SlotFor). A few at most.
+    if (!s.conv) { SafeRelease(s.cropRTV); SafeRelease(s.cropSRV); SafeRelease(s.crop); s.cropW = s.cropH = 0; return; }
+    m_slotPool.push_back(std::move(s));
+    s.crop = nullptr; s.cropSRV = nullptr; s.cropRTV = nullptr; s.cropW = s.cropH = 0;
+    constexpr size_t kPoolMax = 12;
+    if (m_slotPool.size() > kPoolMax)
+    {
+        Slot& old = m_slotPool.front();
+        SafeRelease(old.cropRTV); SafeRelease(old.cropSRV); SafeRelease(old.crop);
+        m_slotPool.erase(m_slotPool.begin());
+    }
 }
 
-RegionWeaver::Slot* RegionWeaver::SlotFor(int id)
+RegionWeaver::Slot* RegionWeaver::SlotFor(int id, int w, int h)
 {
     for (auto& s : m_slots) if (s.id == id) return &s;
     Slot s;
-    s.id = id;
-    if (!m_convPool.empty())
+    // From the pool: one last used for a picture this size first (its
+    // textures fit as they are), else the newest.
+    int pick = -1;
+    for (int i = (int)m_slotPool.size() - 1; i >= 0; --i)
+        if (m_slotPool[i].cropW == w && m_slotPool[i].cropH == h) { pick = i; break; }
+    if (pick < 0 && !m_slotPool.empty()) pick = (int)m_slotPool.size() - 1;
+    if (pick >= 0)
     {
-        s.conv = std::move(m_convPool.back());
-        m_convPool.pop_back();
+        s = std::move(m_slotPool[pick]);
+        m_slotPool[pick].crop = nullptr; m_slotPool[pick].cropSRV = nullptr; m_slotPool[pick].cropRTV = nullptr;
+        m_slotPool.erase(m_slotPool.begin() + pick);
     }
     else
     {
@@ -215,9 +230,11 @@ RegionWeaver::Slot* RegionWeaver::SlotFor(int id)
             return nullptr;
         }
     }
+    s.id = id;
     m_slots.push_back(std::move(s));
     return &m_slots.back();
 }
+
 
 bool RegionWeaver::EnsureCrop(Slot& s, int w, int h, DXGI_FORMAT texFmt, DXGI_FORMAT srvFmt)
 {
@@ -337,7 +354,7 @@ bool RegionWeaver::Build(ID3D11Texture2D* captureTex, ID3D11ShaderResourceView* 
         if (!IntersectRect(&src, &v, &frameRect)) continue;
         if (!gpu && !IntersectRect(&src, &src, &f)) continue;
 
-        Slot* s = SlotFor(r.id);
+        Slot* s = SlotFor(r.id, w, h);
         if (!s || !EnsureCrop(*s, w, h, capDesc.Format, captureSrvFormat)) continue;
 
         // Region constants (b1): used by the GPU crop and shifted placement.
@@ -389,6 +406,7 @@ bool RegionWeaver::Build(ID3D11Texture2D* captureTex, ID3D11ShaderResourceView* 
         }
 
         s->conv->SetFormat(r.format, r.swapEyes, r.anaglyphCombo, r.anaglyphMode);
+        s->conv->SetAnaTint(r.anaTint ? r.anaTint->single : nullptr, r.anaTint ? r.anaTint->missing : nullptr);
         s->conv->SetConvergence(0.0f);
         s->conv->SetTargetPaneSize(w, h);
         bool resized = false;

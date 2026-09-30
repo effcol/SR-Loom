@@ -123,7 +123,7 @@ HWND TrayIcon::WindowAt(size_t index) const
     return (index < m_windowList.size()) ? m_windowList[index] : nullptr;
 }
 
-void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
+UINT TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s, bool returnCmd)
 {
     const bool         weavingEnabled = s.weaving;
     const OutputMode   mode           = s.mode;
@@ -134,7 +134,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     const int          anaglyphMode   = s.anaglyphMode;
 
     HMENU menu = CreatePopupMenu();
-    if (!menu) return;
+    if (!menu) return 0;
 
     // Explicit "Open SR Loom" entry at the top. Left-click on the tray
     // icon also opens the panel, but that's non-obvious from the right-
@@ -204,7 +204,7 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
     };
 
     // Automatic Detection first (as in the panel's Stereo 3D Input list).
-    AppendMenuA(fmtMenu, MF_STRING | (s.autoInput ? MF_CHECKED : 0), ID_TRAY_AUTO_STEREO, "Automatic Detection");
+    AppendMenuA(fmtMenu, MF_STRING | (s.autoInput ? MF_CHECKED : 0), ID_TRAY_AUTO_STEREO, "Automatic Detection (experimental)");
     AppendMenuA(fmtMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU sbsMenu = CreatePopupMenu();
@@ -372,8 +372,10 @@ void TrayIcon::ShowContextMenu(HWND hwnd, const MenuState& s)
 
     // Required so the menu dismisses correctly when the user clicks elsewhere.
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+    const UINT cmd = (UINT)TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | (returnCmd ? (TPM_RETURNCMD | TPM_NONOTIFY) : 0),
+                                          pt.x, pt.y, 0, hwnd, nullptr);
     PostMessage(hwnd, WM_NULL, 0, 0);
 
     DestroyMenu(menu);  // also destroys the submenu
+    return returnCmd ? cmd : 0;
 }

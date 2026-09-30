@@ -5,6 +5,7 @@
 #include "Common.h"
 #include <d3d11.h>
 #include <cstdint>
+#include <vector>
 
 namespace srw
 {
@@ -19,6 +20,29 @@ namespace srw
 
         // anaCombo: 0..5 (see AnaglyphComboList); anaMode: 0..3 (AnaglyphModeList).
         void SetFormat(StereoFormat fmt, bool swapEyes, int anaCombo, int anaMode);
+        // Anaglyph mode 5 (a one-colour picture under it, AnalyseAnaPicture):
+        // its tint tables, AnaTint::single (256 x RGBA) and ::missing (256).
+        // Null: none. Only re-uploaded when the tables change.
+        void SetAnaTint(const uint8_t (*single)[4], const uint8_t* missing);
+        // Recovered Colour on a page of several anaglyphs: the pictures that were
+        // black-and-white (kind 1: Mono) or one colour (kind 2: its tint tables)
+        // under the anaglyph, each decoded that way inside its box (source uv).
+        // Everything else is still recovered. n = 0: none.
+        struct AnaBox { float u0 = 0, v0 = 0, u1 = 0, v1 = 0; int kind = 0;
+                        const uint8_t (*single)[4] = nullptr; const uint8_t* missing = nullptr;
+                        const uint8_t* pairA = nullptr; const uint8_t* pairB = nullptr;   // (AnaTint)
+                        float checkInsetU = 0, checkInsetV = 0; };   // (the per-frame check looks this far inside: past the padding)
+        void SetAnaBoxes(const AnaBox* boxes, int n);
+        // Diagnostics: this frame's PSAnaBoxCheck result per box (1 = still so);
+        // stalls on the GPU -- only for the log, now and then. False if none.
+        bool ReadAnaBoxValid(float out[32]);
+        // The boxes follow the page as it scrolls: a 1/16 snapshot of the frame
+        // the check judged (requested when that frame is handed to the check,
+        // taken at the next Convert), made the boxes' reference once their
+        // verdict is in (Commit). Each frame PSAnaBoxShift finds how far each
+        // box's picture has moved since.
+        void RequestAnaSnapshot() { m_snapRequested = true; }
+        void CommitAnaSnapshot();
 
         // Pulfrich settings (used only when format == Pulfrich).
         void SetPulfrich(PulfrichMode mode, int affectedEye, float ndTransmission, int delayFrames);
@@ -46,6 +70,12 @@ namespace srw
         // (0,0) disables -- panes default to the view's native pixel size and
         // the weaver scales to the panel.
         void SetTargetPaneSize(int w, int h) { m_targetPaneW = w; m_targetPaneH = h; }
+        // Each eye at most half the source's width (default; the display shows no
+        // more). Off: full-width eyes (tools/anatest's quality measurements).
+        void SetHalfWidthEyes(bool on) { m_halfWidthEyes = on; }
+        // Redraw only what changed since the last frame (default). Off: every
+        // frame in full (tools/anatest compares the two).
+        void SetChangeSkip(bool on) { m_changeSkipOn = on; }
 
         // VR180 / VR360 viewer parameters. yaw / pitch in RADIANS. zoom: 1.0
         // is ~90° horizontal FOV; higher = zoomed in. ipdScale shifts the
@@ -64,6 +94,34 @@ namespace srw
         // the previous output is still right and Convert skips the work.
         // 0 = unknown (always convert).
         void SetSourceVersion(uint64_t v) { m_srcVersion = v; }
+        // The next Convert's source view reads sRGB-encoded values as they are
+        // (a plain UNORM view: the capture's own frame, not a copy -- WGC's
+        // textures can't take an _SRGB view). The shaders then decode them,
+        // and filter after decoding, as the hardware would. identity: what the
+        // source is, for the settings key, when its view changes every frame
+        // (the capture's buffers take turns); nullptr = the view itself.
+        void SetSourceEncoded(bool encoded, const void* identity = nullptr) { m_srcEncoded = encoded; m_srcIdentity = identity; }
+        // Whether the current settings read an encoded source cheaply enough to
+        // beat copying it (4K, measured with anatest ANATEST_RAW): the layouts
+        // and the simple anaglyph modes, a few reads a pixel (+0-0.24 ms vs the
+        // 0.37 ms copy). DeAnaglyph (+2.7 ms) and Recovered (+9.7 ms) read it
+        // many times; Quilt, VR and the temporal formats aren't measured.
+        bool CheapEncodedSource() const { return CheapEncodedSource(m_fmt, m_anaMode); }
+        static bool CheapEncodedSource(StereoFormat fmt, int anaMode)
+        {
+            switch (fmt)
+            {
+            case StereoFormat::FullSBS: case StereoFormat::HalfSBS:
+            case StereoFormat::FullTAB: case StereoFormat::HalfTAB:
+            case StereoFormat::RowInterleaved: case StereoFormat::ColumnInterleaved:
+            case StereoFormat::Checkerboard: case StereoFormat::FramePacking:
+                return true;
+            case StereoFormat::Anaglyph:
+                return anaMode >= 1 && anaMode <= 3;   // (Filtered, Half Colour, Mono)
+            default:
+                return false;
+            }
+        }
 
         bool Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcHeight,
                      bool& outputResized);
@@ -116,13 +174,40 @@ namespace srw
         DispTarget m_src16;   // ... and 16x (the coarse search)
         DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
         DispTarget m_src4Prev;   // last frame's 1/4 source (to see what changed)
-        // Where the 3D picture is inside the captured area (PSPicCols/Rows/Rect):
-        // each 1/16 column's and row's share of anaglyph fringes, and the
-        // rectangle (1x1) the recovery and compose read at t10.
-        DispTarget m_picCols, m_picRows, m_picRect;
-        ID3D11PixelShader* m_psPicCols = nullptr;
-        ID3D11PixelShader* m_psPicRows = nullptr;
-        ID3D11PixelShader* m_psPicRect = nullptr;
+        // What the pictures under an anaglyph were (SetAnaTint / SetAnaBoxes):
+        // tint tables (256 x kTintRows, RGBA8, sRGB-encoded) at t10 -- rows 0-1
+        // the whole picture's, 2+2i / 3+2i box i's -- and the boxes (RGBA32F,
+        // 1 + 2 x kMaxBoxes: [0].x the count, then per box its rect and kind) at t11.
+        static constexpr int kMaxBoxes = 32, kTintRows = 2 + 2 * kMaxBoxes;
+        std::vector<uint8_t>      m_tintPx = std::vector<uint8_t>(256 * kTintRows * 4, 0);
+        float                     m_boxPx[(1 + 2 * kMaxBoxes) * 4] = {};
+        bool                      m_anaTablesDirty = false;
+        ID3D11Texture2D*          m_tintTex = nullptr;
+        ID3D11ShaderResourceView* m_tintSRV = nullptr;
+        ID3D11Texture2D*          m_boxTex = nullptr;
+        ID3D11ShaderResourceView* m_boxSRV = nullptr;
+        uint64_t                  m_tintHash = 0;   // (of the tables; 0 = none in use)
+        void UploadAnaTables();
+        // Every frame, whether each box still holds what it was judged to be
+        // (PSAnaBoxCheck on the 1/16 block averages): kMaxBoxes x 1, .r 1 = yes.
+        // A page scrolled, a colour picture moved in -- off at once.
+        DispTarget         m_boxValid, m_boxRows, m_boxMap;   // (PSAnaBoxRows: per box and row; PSAnaBoxMap: boxes per 16x16 block)
+        ID3D11PixelShader* m_psBoxRows = nullptr;
+        ID3D11PixelShader* m_psBoxMap = nullptr;
+        // What changed since the last frame (PSChange / PSChangeGrow): only those
+        // blocks are recovered again; the occlusion predicate skips the whole
+        // recovery when nothing did. m_changeValid: the output holds a whole
+        // frame for the current settings (else the next one is drawn in full).
+        DispTarget         m_change, m_changeGrow, m_boxMapPrev;
+        ID3D11PixelShader* m_psChange = nullptr;
+        ID3D11PixelShader* m_psChangeGrow = nullptr;
+        ID3D11Predicate*   m_changePred = nullptr;
+        bool               m_changeValid = false;
+        DispTarget         m_snapPending, m_snapActive, m_boxShiftCost, m_boxShift;   // (RequestAnaSnapshot, PSAnaBoxShift)
+        ID3D11PixelShader* m_psBoxShiftCost = nullptr;
+        ID3D11PixelShader* m_psBoxShift = nullptr;
+        bool               m_snapRequested = false, m_snapPendingValid = false, m_snapActiveValid = false;
+        ID3D11PixelShader* m_psBoxCheck = nullptr;
         bool       m_dispPrevValid = false;
         ID3D11PixelShader* m_psDown = nullptr;   // 4x box downsample
         // Packed gradient descriptors at the refine level (PSAnaDesc): 4 x uint4.
@@ -159,6 +244,8 @@ namespace srw
 
         // Unchanged-source skip (SetSourceVersion).
         uint64_t                  m_srcVersion  = 0;
+        bool                      m_srcEncoded  = false;     // (SetSourceEncoded)
+        const void*               m_srcIdentity = nullptr;
         uint64_t                  m_lastVersion = 0;
         uint64_t                  m_lastKey     = 0;
 
@@ -199,6 +286,8 @@ namespace srw
         float        m_quiltRightBlend = 0.0f;          // 0..1 fade from rightIdx to rightIdx+1
         int          m_targetPaneW = 0;                 // SR panel per-eye dims (0 = unset)
         int          m_targetPaneH = 0;
+        bool         m_halfWidthEyes = true;
+        bool         m_changeSkipOn = true;
         float        m_vrYaw   = 0.0f;                   // VR viewer: yaw (radians)
         float        m_vrPitch = 0.0f;                   // VR viewer: pitch (radians)
         float        m_vrZoom  = 1.0f;                   // VR viewer: zoom (1=~90° HFOV)

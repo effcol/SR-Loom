@@ -8,6 +8,7 @@
 #include "Common.h"
 #include <d3d11.h>
 #include <memory>
+#include <vector>
 
 namespace srw
 {
@@ -70,8 +71,23 @@ namespace srw
         // region beneath the viewer.
         void SetSourceRegion(int x, int y, int w, int h);
 
-        ID3D11ShaderResourceView* SRV() const { return m_srv; }
-        ID3D11Texture2D*          Texture() const { return m_tex; }   // the (cropped) copy target
+        // Zero-copy (call before Start*): a whole-frame capture isn't copied
+        // at all. The newest WGC frame is held (one of the pool's buffers)
+        // and DirectSRV() views it; the copy is made only if SRV()/Texture()
+        // are asked for (Auto Stereo, analysis, crops).
+        void SetZeroCopy(bool on) { m_zeroCopy = on; }
+
+        // The newest picture, the cheapest way: the held capture frame itself
+        // when zero-copy has it (encoded = true: a UNORM view of sRGB values,
+        // which the reader decodes; a different view as the pool's buffers
+        // take turns), else SRV() (encoded = false).
+        ID3D11ShaderResourceView* DirectSRV(bool& encoded);
+
+        // The copy (an _SRGB view), made now if zero-copy skipped it.
+        ID3D11ShaderResourceView* SRV()     { EnsureCopy(); return m_srv; }
+        ID3D11Texture2D*          Texture() { EnsureCopy(); return m_tex; }   // the (cropped) copy target
+        bool                      HasPicture() const { return m_tex != nullptr; }
+        ID3D11ShaderResourceView* CopyView() const { return m_srv; }   // (the copy's view, as it is: for comparing)
         int         Width()      const { return m_width; }   // region (weave-input) width
         int         Height()     const { return m_height; }
         int         FrameWidth()  const { return m_frameW; } // full captured-frame size
@@ -87,6 +103,9 @@ namespace srw
         bool EnsureFull(int width, int height);   // (re)create m_full at frame size
         bool ResolveRegion(int& rx, int& ry, int& rw, int& rh) const;   // clamp m_reg* to the frame
         bool RecropIfRegionChanged(bool& sizeChanged);   // re-crop without a new WGC frame
+        void EnsureCopy();            // zero-copy skipped the copy: make it from the held frame
+        void ReleaseDirectViews();
+        void DropRetiredViews(bool now);
 
         struct Impl;                       // holds the WinRT objects
         std::unique_ptr<Impl>     m_impl;
@@ -116,6 +135,19 @@ namespace srw
         int64_t                   m_lastFrameTime = 0;
         uint64_t                  m_version = 1;
         bool                      m_contentValid = false;   // m_tex holds a whole crop (partial copies build on it)
+        bool                      m_zeroCopy   = false;     // (SetZeroCopy)
+        bool                      m_direct     = false;     // the held frame is the newest whole picture
+        bool                      m_copyStale  = false;     // ... and m_tex hasn't been given it (EnsureCopy)
+        std::vector<RECT>         m_pendingDirty;           // ... what changed since it was (frame px)
+        bool                      m_pendingAll = false;     // ... or too much / unknown: all of it
+        // UNORM views of the pool's buffers (they take turns; each keeps its
+        // texture alive so a pointer can't be reused by another).
+        struct DirectView { ID3D11Texture2D* tex = nullptr; ID3D11ShaderResourceView* srv = nullptr; };
+        static constexpr int      kDirectViews = 8;
+        DirectView                m_views[kDirectViews];
+        DirectView                m_retired[kDirectViews];   // (ReleaseDirectViews)
+        int                       m_viewNext = 0;
+        int                       m_retireIn = 0;
         uint64_t                  m_statFrames = 0;
         int64_t                   m_statFirstT = 0, m_statLastT = 0;
         bool                      m_captureCursor = false;   // composite the OS cursor into the frame

@@ -48,6 +48,10 @@ namespace srw::Settings
     // camera -- switchable to compare. HKCU\Software\SRLoom\LateLatching.
     bool ReadLateLatching();
     void WriteLateLatching(bool enable);
+    // Zero-copy capture (default ON): the converter / weaver read the captured
+    // frame itself instead of a copy of it (no UI; for comparing).
+    // HKCU\Software\SRLoom\ZeroCopyCapture.
+    bool ReadZeroCopyCapture();
 
     // Diagnostics only (no UI): skip the SR weaver's weave call, to see
     // whether it paces the loop. HKCU\Software\SRLoom\DiagSkipWeave = 1.

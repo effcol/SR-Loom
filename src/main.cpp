@@ -39,6 +39,9 @@
 #include <dbghelp.h>
 #include <imm.h>
 #include <timeapi.h>   // timeBeginPeriod
+#include <avrt.h>      // AvSetMmThreadCharacteristics (MMCSS)
+#pragma comment(lib, "avrt.lib")
+#include <tuple>
 #include <commdlg.h>
 #include <windowsx.h>
 #include <shellapi.h>      // DragAcceptFiles, DragQueryFile, DragFinish
@@ -414,12 +417,20 @@ namespace
         std::map<int, uint64_t>          regionOccSig;  // region id -> layout signature
         std::map<int, long long>         regionOccArea; // region id -> covered area (px)
         std::map<int, DWORD>             regrowAt;      // content region id -> when to try
+        // A picture found while a window covered part of its viewport stays cut
+        // until a re-grow finds the rest: the covered area when it was found (or
+        // last checked), and when the covering last shrank below that -- while
+        // less is covered, re-grows are retried until one, run on a frame from
+        // after the change, has had a look.
+        std::map<int, long long>         regionFoundOcc;
+        std::map<int, DWORD>             regionUncoveredAt;
         // Content regions found cut off by their viewport's edge (a picture half
         // scrolled into view): which edges (1 top, 2 bottom, 4 left, 8 right)
         // and how far in they'd moved at the last re-grow try (analysis px).
         struct Truncation { int edges = 0; int lastGap = 0; };
         std::map<int, Truncation>        regionTrunc;
         std::map<int, int>               reacqMisses;   // re-acquire results rejected in a row
+        std::map<int, DWORD>             reacqFirstMiss; // ... when the first of them was (only dropped after a while)
         std::map<int, DWORD>             scrolledAt;    // content region id -> when it last moved (tick)
         std::map<int, DWORD>             regrowTriedAt; // ... and when a re-grow was last tried
         std::map<int, POINT>             regionViewPos; // content region id -> its viewport's top-left at the last track (analysis px)
@@ -431,6 +442,7 @@ namespace
             RECT old{};
             std::shared_ptr<LumaImage> img;
             std::future<std::pair<bool, RECT>> fut;
+            DWORD startedAt = 0;   // (GetTickCount)
         };
         std::map<int, AsyncFind> asyncFinds;
         std::map<int, std::deque<std::pair<int64_t, RECT>>> regionAnchorHist;   // region id -> (QPC 100 ns, anchor screen rect)
@@ -456,6 +468,7 @@ namespace
         // Automatic Detection + a chosen Window: Auto Stereo, but only the 3D
         // pictures inside this (top-level) window.
         HWND                         autoScopeWindow = nullptr;
+        bool                         analysisDeferred = false;   // Auto Stereo's CPU analysis runs after this frame's present
         bool                         overlayRgnValid = false;    // the window-overlay's rounded-corner shape is set (UpdateOverlayTracking)
         bool                         eyeOrderDetect = true;      // Settings::ReadEyeOrderDetect (polled)
         bool                         autoEyeSwap = false;        // whole-display weave (fullscreen 3D): detected with the eyes swapped
@@ -467,6 +480,29 @@ namespace
         DWORD                        manualEyeNext = 0;
         size_t                       manualEyeKey = 0;
         std::future<EyeOrder>        manualEyeJob;
+        // Anaglyph picked by hand (or a whole fullscreen one), Recovered Colour:
+        // what was the picture under it? Black-and-white: decoded as Mono;
+        // one colour (sepia, a duotone): with its tint (mode 5); colour:
+        // recovered. Checked every 1.5 s in the background (UpdateManualAnaColour).
+        // One picture box's verdict (source uv; kind 1 black-and-white, 2 one colour).
+        struct AnaBoxVerdict { float u0, v0, u1, v1; int kind; std::shared_ptr<const AnaTint> tint; DWORD seen = 0;
+                               float insetU = 0, insetV = 0; };   // (past the padding: where the picture itself starts)
+        // kind: the whole frame's (when no box was found); boxes: each picture's.
+        struct AnaVerdict { int kind = -1; std::shared_ptr<const AnaTint> tint; int boxes = 0, grey = 0, tinted = 0, colour = 0;
+                            std::vector<AnaBoxVerdict> special; std::vector<AnaBoxVerdict> coloured;
+                            std::vector<std::string> diag; };   // (per box, for the log)
+        int                          manualAnaKind = 0;           // 0 colour, 1 black-and-white, 2 one colour
+        std::shared_ptr<const AnaTint> manualAnaTint;             // (kind 2)
+        std::vector<AnaBoxVerdict>   manualAnaBoxes;              // the black-and-white / one-colour pictures on a page of several
+        int                          manualAnaVotes = 0;          // consecutive verdicts disagreeing with manualAnaKind
+        int                          manualAnaPhase = 0;          // 0 idle, 3 frame wanted (RenderFrame hands it over), 1 frame submitted, 2 judging
+        bool                         manualAnaSubmitWanted = false;
+        DWORD                        manualAnaNext = 0;
+        size_t                       manualAnaKey = 0;
+        DWORD                        manualAnaKeyAt = 0;          // when this picture was first seen
+        bool                         manualAnaLogged = false;     // this picture's first verdict is in the log
+        bool                         manualAnaStale = false;      // the running job is for an earlier picture
+        std::future<AnaVerdict>      manualAnaJob;
         RECT                         autoGlass{};                // Looking Glass + Auto Stereo: glass last woven (frame px)
         bool                         autoInputCropped = false;   // ... weave input is the glass crop (vs the whole composite)
         HWND                         fsCheckedWindow = nullptr;  // fullscreen window being / already checked
@@ -498,6 +534,11 @@ namespace
             std::chrono::steady_clock::time_point t0{}, tWait{};
             double wait = 0, work = 0, weave = 0, present = 0, total = 0, analysis = 0, readback = 0, worst = 0;
             double gui = 0, outside = 0;                     // panel drawing; all time outside the weave
+            double compWait = 0, vblankWait = 0;             // pace-wait's parts: the compositor taking the last frame, the vertical blank
+            int    late = 0;                                  // loops longer than 1.5 refreshes (a refresh shown twice: judder)
+            int    lateComp = 0, lateBlank = 0, lateWork = 0, lateOther = 0, lateCapture = 0, lateCap = 0, lateOutside = 0, latePresent = 0;   // ... what took the time in each
+            double lastCaptureWaitMs = 0;                     // this loop's wait for a new capture frame
+            std::chrono::steady_clock::time_point prevPresent{};  // the last present (for late frames)
             std::chrono::steady_clock::time_point lastEnd{}; // end of the previous weave
             int    loops = 0, frames = 0;
             DWORD  last = 0;
@@ -585,7 +626,9 @@ namespace
         // 2D windows / windows in front of Auto Stereo pictures: where they were
         // recently (QPC 100 ns timestamps), to cut them where the displayed
         // capture still shows them (see UpdateTaskbarCutout).
-        struct TimedCuts { int64_t t = 0; std::vector<RECT> r; std::vector<int> rad; };
+        // (owner: the region id a cut belongs to -- a window in front of that
+        // picture only; none / -1: a cut in everything.)
+        struct TimedCuts { int64_t t = 0; std::vector<RECT> r; std::vector<int> rad; std::vector<int> owner; };
         std::map<HWND, std::deque<TimedCuts>> keepHistory;
         std::deque<TimedCuts>  occHistory;
         DWORD                 lastFullscreenPollMs = 0;
@@ -2621,7 +2664,10 @@ namespace
                 MSG msg;
                 while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessage(&msg);
                 const DWORD now = GetTickCount();
-                if (s_dirty || now - lastBuild >= 30)
+                // (A burst of window events -- a menu fading in, a page redrawing
+                // under it -- rebuilt the list for every one, each rebuild asking
+                // the compositor about every window: at most one every 10 ms.)
+                if ((s_dirty && now - lastBuild >= 10) || now - lastBuild >= 30)
                 {
                     s_dirty = false;
                     lastBuild = now;
@@ -2631,7 +2677,9 @@ namespace
                     m_latest = std::move(snap);
                 }
                 // Wake on the next event (or in time for the periodic rebuild).
-                MsgWaitForMultipleObjects(0, nullptr, FALSE, 30, QS_ALLINPUT);
+                const DWORD since = GetTickCount() - lastBuild;
+                const DWORD wait = s_dirty ? (since >= 10 ? 0 : 10 - since) : 30;   // (an event waiting: as soon as 10 ms are up)
+                MsgWaitForMultipleObjects(0, nullptr, FALSE, wait, QS_ALLINPUT);
             }
             for (HWINEVENTHOOK h : hooks) UnhookWinEvent(h);
         }
@@ -2937,15 +2985,29 @@ namespace
                     tracked.push_back(mt);
                     auto oc = app.regionOcc.find(r.id);
                     if (oc != app.regionOcc.end())
-                        for (const RECT& o : oc->second) { occNow.r.push_back(o); occNow.rad.push_back(0); }
+                        for (const RECT& o : oc->second) { occNow.r.push_back(o); occNow.rad.push_back(0); occNow.owner.push_back(r.id); }
                 }
                 // Windows in front of pictures: cut where they are now AND
                 // where they were when the displayed capture was taken (the
                 // captured picture still shows them there).
                 recordHist(app.occHistory, std::move(occNow));
                 const TimedCuts* occNowE = &app.occHistory.back();
+                // Each such cut hides only its own picture (the renderer's
+                // owner = that picture's index in `tracked`): the window in
+                // front of a browser's pictures may hold a picture of its own.
+                std::map<int, int> trackedIndex;
+                {
+                    int ti = 0;
+                    for (const WeaveRegion& r : app.regionWeaver.Regions()) trackedIndex[r.id] = ti++;
+                }
                 for (const TimedCuts* e : { occNowE, atCapture(app.occHistory) })
-                    if (e) for (size_t i = 0; i < e->r.size(); ++i) excl.push_back({ toClient(e->r[i]), e->rad[i] });
+                    if (e) for (size_t i = 0; i < e->r.size(); ++i)
+                    {
+                        const int id = i < e->owner.size() ? e->owner[i] : -1;
+                        auto ti = trackedIndex.find(id);
+                        if (id >= 0 && ti == trackedIndex.end()) continue;   // (that picture is gone)
+                        excl.push_back({ toClient(e->r[i]), e->rad[i], id >= 0 ? ti->second : -1 });
+                    }
                 app.renderer.SetVisibleTracked(tracked, excl, app.gpuTracking ? app.gpuTracker.ResultsSRV() : nullptr);
             }
             else
@@ -4259,9 +4321,12 @@ namespace
         if (fmt == StereoFormat::Anaglyph && ana.known)
         {
             app.anaglyphCombo = ana.combo;
-            app.anaglyphMode  = ana.mode;
-            Log("Automatic Detection: anaglyph is %s -> %s decode", AnaComboName(ana.combo),
-                ana.mode == 3 ? "mono" : "recovered colour");
+            // (Recovered Colour; for a black-and-white or one-colour picture
+            // UpdateManualAnaColour decodes it as Mono / with its tint -- the
+            // setting itself isn't changed to them.)
+            app.anaglyphMode  = 4;
+            Log("Automatic Detection: anaglyph is %s (%s)", AnaComboName(ana.combo),
+                ana.mode == 3 ? "black-and-white" : ana.mode == 5 ? "one colour" : "colour");
         }
         app.autoEyeSwap = eyeSwap && app.eyeOrderDetect;
         if (app.autoEyeSwap) Log("Automatic Detection: eye order SWAPPED (the second half is the left eye)");
@@ -4381,7 +4446,7 @@ namespace
             if (app.video.IsOpen()) { srv = app.video.SRV(); w = app.video.Width(); h = app.video.Height(); }
             else { srv = app.weaver.SourceSRV(); w = app.weaver.SourceWidth(); h = app.weaver.SourceHeight(); }
         }
-        else if (app.capture.IsActive()) { srv = app.capture.SRV(); w = app.capture.Width(); h = app.capture.Height(); }
+        else if (app.capture.IsActive()) { srv = app.capture.CopyView(); w = app.capture.Width(); h = app.capture.Height(); }
         const bool on = app.weavingEnabled && app.eyeOrderDetect && layout && !app.autoStereo && !app.fsAutoWindow;
         if (!on || !srv || w <= 0 || h <= 0)
         {
@@ -4405,6 +4470,7 @@ namespace
         if (app.manualEyePhase == 0)
         {
             if ((LONG)(now - app.manualEyeNext) < 0) return;
+            if (srv == app.capture.CopyView()) srv = app.capture.SRV();   // (zero-copy: the copy is made when wanted)
             app.analyzer.Submit(srv, w, h, false);   // (SBS / TAB: luminance is enough)
             app.manualEyePhase = 1;
             return;
@@ -4436,6 +4502,237 @@ namespace
         app.manualEyeVotes = 0;
         Log("Eye order (%s): %s (shift all %d, top %d, bottom %d)", Profiles::FormatToString(f),
             eo.swap ? "SWAPPED" : "normal", eo.dxAll, eo.dxTop, eo.dxBottom);
+    }
+
+    // Anaglyph picked by hand (or a whole fullscreen one found by Automatic
+    // Detection) with Recovered Colour: every 0.7 s one frame is scanned in the
+    // background the way Auto Stereo does -- the anaglyph pictures' boxes --
+    // and each box checked for what the picture under the anaglyph was
+    // (AnalyseAnaPicture). A black-and-white one is decoded as Mono inside its
+    // box (there's no colour to recover; Recovered Colour would only guess
+    // some), a one-colour one (sepia, a duotone) with its tint; the rest of the
+    // frame is recovered as before (Converter::SetAnaBoxes). No box found: the
+    // whole frame is checked (a page or bars around the picture are plain grey
+    // and don't count) -- there a new picture's first verdict counts at once,
+    // after that a change needs two checks that agree.
+    void UpdateManualAnaColour(AppState& app)
+    {
+        ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0;
+        if (app.source == SourceKind::TestImage)
+        {
+            if (app.video.IsOpen()) { srv = app.video.SRV(); w = app.video.Width(); h = app.video.Height(); }
+            else { srv = app.weaver.SourceSRV(); w = app.weaver.SourceWidth(); h = app.weaver.SourceHeight(); }
+        }
+        else if (app.dxgiActive) { srv = app.captureDxgi.SRV(); w = app.captureDxgi.Width(); h = app.captureDxgi.Height(); }   // (what the converter gets)
+        else if (app.capture.IsActive()) { srv = app.capture.CopyView();   /* (only checked here) */ w = app.capture.Width(); h = app.capture.Height(); }
+        const bool on = app.weavingEnabled && app.format == StereoFormat::Anaglyph && app.anaglyphMode == 4 &&
+                        !app.autoStereo;
+        if (!on || !srv || w <= 0 || h <= 0)
+        {
+            app.manualAnaKind = 0; app.manualAnaTint.reset(); app.manualAnaBoxes.clear(); app.manualAnaVotes = 0; app.manualAnaKey = 0;
+            if (app.manualAnaPhase == 2) app.manualAnaStale = true;   // (a running job is collected below, and dropped)
+            else { app.manualAnaPhase = 0; app.manualAnaSubmitWanted = false; }
+            if (app.manualAnaPhase == 2 && app.manualAnaJob.valid() && app.manualAnaJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            { app.manualAnaJob.get(); app.manualAnaPhase = 0; app.manualAnaStale = false; }
+            return;
+        }
+        // A different picture: start over.
+        size_t key = std::hash<std::string>()(app.lastTestImagePath);
+        key = key * 31 + (size_t)app.source;
+        key = key * 31 + (size_t)(uintptr_t)app.sourceWindow;
+        key = key * 31 + (size_t)(uintptr_t)app.fsAutoWindow;
+        key = key * 31 + (size_t)app.anaglyphCombo;
+        const DWORD now = GetTickCount();
+        if (key != app.manualAnaKey)
+        {
+            app.manualAnaKey = key;
+            app.manualAnaKeyAt = now;
+            app.manualAnaLogged = false;
+            app.manualAnaKind = 0; app.manualAnaTint.reset(); app.manualAnaBoxes.clear(); app.manualAnaVotes = 0;
+            if (app.manualAnaPhase == 2) app.manualAnaStale = true;
+            else { app.manualAnaPhase = 0; app.manualAnaSubmitWanted = false; }
+            app.manualAnaNext = now;   // (at once: a black-and-white picture shown in colour for a moment first was a visible delay)
+        }
+        if (app.manualAnaPhase == 0)
+        {
+            if ((LONG)(now - app.manualAnaNext) < 0) return;
+            // (Handed to the analyser right before the converter runs, with the
+            // same frame -- which the converter keeps as the boxes' reference for
+            // following the page as it scrolls: RenderFrame.)
+            app.manualAnaSubmitWanted = true;
+            app.manualAnaPhase = 3;
+            return;
+        }
+        if (app.manualAnaPhase == 1)
+        {
+            auto img = std::make_shared<LumaImage>();
+            uint64_t id = 0;
+            if (!app.analyzer.Latest(*img, id, false)) return;   // (not read back yet)
+            if (!img->hasColour()) { app.manualAnaPhase = 0; app.manualAnaNext = now + 300; return; }
+            const int combo = app.anaglyphCombo;
+            app.manualAnaJob = std::async(std::launch::async, [img, combo]() {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                const RECT whole{ 0, 0, img->width, img->height };
+                ScanWindow sw; sw.bounds = whole;
+                ScanResult res;
+                StereoScanner::Scan(*img, { sw }, {}, res);
+                AppState::AnaVerdict v;
+                struct Hit { RECT r; int k; std::shared_ptr<const AnaTint> t; };
+                std::vector<Hit> hits;
+                // The pictures the scan judged 3D, and the others it found that show
+                // some sign of being an anaglyph (AnaglyphEvidence): small anaglyph
+                // thumbnails often miss the 3D test (and dropped out and came back
+                // check to check), while page parts -- red text, an icon -- can pass
+                // the black-and-white test and got greyed (stray boxes).
+                std::vector<RECT> cands;
+                for (const ScanHit& h : res.hits) cands.push_back(h.rect);
+                for (const RECT& p : res.pictures)
+                {
+                    bool hit = false;
+                    for (const ScanHit& h : res.hits) if (EqualRect(&h.rect, &p)) { hit = true; break; }
+                    if (!hit && AnaglyphEvidence(*img, p)) cands.push_back(p);
+                }
+                std::sort(cands.begin(), cands.end(), [](const RECT& a, const RECT& b) { return std::tie(a.top, a.left, a.bottom, a.right) < std::tie(b.top, b.left, b.bottom, b.right); });
+                cands.erase(std::unique(cands.begin(), cands.end(), [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; }), cands.end());
+                // A box holding other pictures (a block of a grid the scan also saw as
+                // one) goes: judged black-and-white it greyed the gaps, captions and
+                // links between them too -- a grey box wider than any picture.
+                {
+                    std::vector<RECT> keep;
+                    for (const RECT& a : cands)
+                    {
+                        bool holds = false;
+                        for (const RECT& b : cands)
+                        {
+                            if (EqualRect(&a, &b)) continue;
+                            RECT in{};
+                            const long bArea = (long)(b.right - b.left) * (b.bottom - b.top);
+                            if (IntersectRect(&in, &a, &b) && (long)(in.right - in.left) * (in.bottom - in.top) >= bArea * 8 / 10 &&
+                                (long)(a.right - a.left) * (a.bottom - a.top) > bArea * 3 / 2) { holds = true; break; }
+                        }
+                        if (!holds) keep.push_back(a);
+                    }
+                    cands.swap(keep);
+                }
+                for (const RECT& hr : cands)
+                {
+                    std::shared_ptr<const AnaTint> t;
+                    float apart = -1.0f;
+                    const int k = AnalyseAnaPicture(*img, hr, combo, &t, &apart);
+                    {
+                        char d[160];
+                        snprintf(d, sizeof(d), "(%ld,%ld %ldx%ld) %s, blocks apart %.3f", hr.left, hr.top,
+                                 hr.right - hr.left, hr.bottom - hr.top,
+                                 k == 1 ? "black-and-white" : k == 2 ? "one colour" : k == 0 ? "colour" : "can't tell", apart);
+                        v.diag.push_back(d);
+                    }
+                    if (k < 0) continue;
+                    ++v.boxes;
+                    (k == 1 ? v.grey : k == 2 ? v.tinted : v.colour)++;
+                    hits.push_back({ hr, k, t });
+                }
+                const float iw = 1.0f / (std::max)(img->width, 1), ih = 1.0f / (std::max)(img->height, 1);
+                for (const Hit& a : hits)
+                {
+                    if (a.k == 0)
+                    {
+                        v.coloured.push_back({ a.r.left * iw, a.r.top * ih, a.r.right * iw, a.r.bottom * ih, 0, nullptr });
+                        continue;
+                    }
+                    // A black-and-white box reaches well past the picture: Mono on
+                    // the plain page around it changes nothing, and it covers the
+                    // picture's edge (and the recovery's colour fringe on the page
+                    // beside it) even a little off after a scroll -- but never into
+                    // a colour picture next to it. A one-colour box keeps close.
+                    const int pad = a.k == 1 ? 2 : 1;   // (2 analysis px: wider looked like a box round the picture)
+                    int pl = pad, pt = pad, pr = pad, pb = pad;
+                    for (const Hit& c : hits)
+                    {
+                        if (c.k != 0) continue;
+                        const bool rowsMeet = c.r.top < a.r.bottom + pad && c.r.bottom > a.r.top - pad;
+                        const bool colsMeet = c.r.left < a.r.right + pad && c.r.right > a.r.left - pad;
+                        if (rowsMeet && c.r.right <= a.r.left && c.r.right > a.r.left - pad) pl = (std::min)(pl, (int)(a.r.left - c.r.right));
+                        if (rowsMeet && c.r.left >= a.r.right && c.r.left < a.r.right + pad) pr = (std::min)(pr, (int)(c.r.left - a.r.right));
+                        if (colsMeet && c.r.bottom <= a.r.top && c.r.bottom > a.r.top - pad) pt = (std::min)(pt, (int)(a.r.top - c.r.bottom));
+                        if (colsMeet && c.r.top >= a.r.bottom && c.r.top < a.r.bottom + pad) pb = (std::min)(pb, (int)(c.r.top - a.r.bottom));
+                    }
+                    v.special.push_back({ (std::max)(0L, a.r.left - pl) * iw, (std::max)(0L, a.r.top - pt) * ih,
+                                          (std::min)((LONG)img->width, a.r.right + pr) * iw,
+                                          (std::min)((LONG)img->height, a.r.bottom + pb) * ih, a.k, a.t, 0,
+                                          (pad + 2) * iw, (pad + 2) * ih });   // (+2: the found box can be a pixel or two off)
+                }
+                if (v.boxes == 0) v.kind = AnalyseAnaPicture(*img, whole, combo, &v.tint);
+                else v.kind = 0;   // (the boxes say it, each for itself)
+                return v;
+            });
+            app.manualAnaPhase = 2;
+            return;
+        }
+        if (app.manualAnaPhase == 3) return;   // (the frame is handed over in RenderFrame)
+        if (!app.manualAnaJob.valid()) { app.manualAnaPhase = 0; return; }   // (never ask a job that isn't there: it throws)
+        if (app.manualAnaJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+        AppState::AnaVerdict v = app.manualAnaJob.get();
+        app.manualAnaPhase = 0;
+        if (app.manualAnaStale) { app.manualAnaStale = false; app.manualAnaNext = now; return; }   // (an earlier picture's)
+        app.manualAnaNext = now + 700;
+        // (Diagnostics, the first 40 checks: each box. No GPU read-back here: it
+        // would stall the frame.)
+        {
+            static int diagLogs = 0;
+            if (diagLogs < 40)
+            {
+                ++diagLogs;
+                for (const std::string& d : v.diag) Log("  anaglyph box %s", d.c_str());
+            }
+        }
+        static const char* const kinds[] = { "colour (Recovered Colour)", "black-and-white (Mono)", "one colour (tinted Mono)" };
+        if (!app.manualAnaLogged || v.special.size() != app.manualAnaBoxes.size())
+        {
+            if (v.boxes > 0)
+                Log("Anaglyph %s: %d picture box%s -- %d black-and-white, %d one colour, %d colour",
+                    app.manualAnaLogged ? "check" : "first check", v.boxes, v.boxes == 1 ? "" : "es", v.grey, v.tinted, v.colour);
+            else if (!app.manualAnaLogged)
+                Log("Anaglyph first check: no picture box -- the whole frame is %s", v.kind < 0 ? "can't tell" : kinds[v.kind]);
+            app.manualAnaLogged = true;
+        }
+        // The boxes, kept from check to check: a scan that misses a picture
+        // once doesn't drop it (it stays up to 3 s after it was last found --
+        // the converter re-checks every box every frame anyway, PSAnaBoxCheck);
+        // one found again takes the new place and verdict; one now judged
+        // colour goes at once.
+        {
+            auto overlap = [](const AppState::AnaBoxVerdict& a, const AppState::AnaBoxVerdict& b) {
+                const float w = (std::min)(a.u1, b.u1) - (std::max)(a.u0, b.u0), h = (std::min)(a.v1, b.v1) - (std::max)(a.v0, b.v0);
+                if (w <= 0 || h <= 0) return 0.0f;
+                const float i = w * h, ua = (a.u1 - a.u0) * (a.v1 - a.v0), ub = (b.u1 - b.u0) * (b.v1 - b.v0);
+                return i / (std::max)(1e-9f, (std::min)(ua, ub));   // (of the smaller: a padded box vs the bare one)
+            };
+            std::vector<AppState::AnaBoxVerdict> kept;
+            for (auto& n : v.special) { n.seen = now; kept.push_back(n); }
+            for (const auto& old : app.manualAnaBoxes)
+            {
+                bool found = false, nowColour = false;
+                for (const auto& n : v.special) if (overlap(old, n) > 0.5f) { found = true; break; }
+                for (const auto& c : v.coloured) if (overlap(old, c) > 0.5f) { nowColour = true; break; }
+                if (!found && !nowColour && (LONG)(now - old.seen) < 3000 && kept.size() < 32) kept.push_back(old);
+            }
+            app.manualAnaBoxes = std::move(kept);
+            app.converter.CommitAnaSnapshot();   // (their positions are that frame's: the converter follows them from it)
+        }
+        if (v.kind < 0) return;
+        if (v.kind == app.manualAnaKind)
+        {
+            app.manualAnaVotes = 0;
+            if (v.kind == 2) app.manualAnaTint = v.tint;   // (the tint as it is now: a video's may drift)
+            return;
+        }
+        // (A new picture's first verdict counts at once: no colour guessed
+        // onto a black-and-white picture for 3 s after it opens.)
+        if (++app.manualAnaVotes < 2 && (LONG)(now - app.manualAnaKeyAt) > 2500) return;
+        app.manualAnaKind = v.kind;
+        app.manualAnaTint = v.tint;
+        app.manualAnaVotes = 0;
+        if (v.boxes == 0) Log("Anaglyph: the whole frame is %s", kinds[v.kind]);
     }
 
     void UpdateInputChoice(AppState& app)
@@ -4805,7 +5102,8 @@ namespace
         app.regionWeaver.Clear();
         app.regionTrackers.clear();
         app.regionOcc.clear(); app.regionOccSig.clear(); app.regionOccArea.clear(); app.regrowAt.clear();
-        app.regionTrunc.clear(); app.reacqMisses.clear(); app.scrolledAt.clear(); app.regrowTriedAt.clear();
+        app.regionFoundOcc.clear(); app.regionUncoveredAt.clear();
+        app.regionTrunc.clear(); app.reacqMisses.clear(); app.reacqFirstMiss.clear(); app.scrolledAt.clear(); app.regrowTriedAt.clear();
         app.regionViewPos.clear();
         app.regionAnchorHist.clear();
         app.scanPending.clear(); app.autoMisses.clear();
@@ -4847,7 +5145,8 @@ namespace
         app.regionTrackers.erase(id);
         app.regionOcc.erase(id); app.regionOccSig.erase(id); app.regionOccArea.erase(id);
         app.regrowAt.erase(id); app.autoMisses.erase(id); app.regionViewPos.erase(id);
-        app.regionTrunc.erase(id); app.reacqMisses.erase(id); app.scrolledAt.erase(id); app.regrowTriedAt.erase(id);
+        app.regionFoundOcc.erase(id); app.regionUncoveredAt.erase(id);
+        app.regionTrunc.erase(id); app.reacqMisses.erase(id); app.reacqFirstMiss.erase(id); app.scrolledAt.erase(id); app.regrowTriedAt.erase(id);
         app.regionAnchorHist.erase(id);
         app.regionsDirty = true;
         Log("Auto Stereo: region %d removed (%s)", id, why);
@@ -5081,6 +5380,20 @@ namespace
                 if (prev != app.regionOccArea.end() && area < prev->second)
                     app.regrowAt[r.id] = now + 200;   // let the capture catch up first
                 app.regionOccArea[r.id] = area;
+                // ... and keep at it while less is covered than when the picture
+                // was found: that one try could run on a frame from before the
+                // window moved (the capture lags), see nothing new, and the box
+                // stayed cut at the window's old edge -- a picture in Discord cut
+                // off along the edge of a browser that had been in front of it.
+                auto fo = app.regionFoundOcc.find(r.id);
+                if (fo == app.regionFoundOcc.end()) app.regionFoundOcc[r.id] = area;
+                else if (area < fo->second)
+                {
+                    if (!app.regionUncoveredAt.count(r.id)) app.regionUncoveredAt[r.id] = now;
+                    if (!app.regrowAt.count(r.id) && app.asyncFinds.find(r.id) == app.asyncFinds.end())
+                        app.regrowAt[r.id] = now + 700;
+                }
+                else app.regionUncoveredAt.erase(r.id);
             }
         }
         for (int id : dead)
@@ -5134,12 +5447,15 @@ namespace
         r.anaglyphMode  = app.anaglyphMode;
         if (fmt == StereoFormat::Anaglyph && ana && ana->known)
         {
-            // Its own colour pair, and Mono for a black-and-white picture.
+            // Its own colour pair, Mono for a black-and-white picture, its tint
+            // for a one-colour one (AnalyseAnaPicture).
             r.anaglyphCombo = ana->combo;
             r.anaglyphMode  = ana->mode;
+            r.anaTint       = ana->mode == 5 ? ana->tint : nullptr;
             r.anaAuto       = true;
             Log("Auto Stereo: anaglyph is %s, %s -> %s decode", AnaComboName(ana->combo),
-                ana->mode == 3 ? "black-and-white" : "colour", ana->mode == 3 ? "mono" : "recovered colour");
+                ana->mode == 3 ? "black-and-white" : ana->mode == 5 ? "one colour" : "colour",
+                ana->mode == 3 ? "mono" : ana->mode == 5 ? "tinted mono" : "recovered colour");
         }
         // (Not for an anaglyph: red is the left eye by the convention anaglyphs
         // are made to -- the glasses fix it -- so a "detected" swap was only ever
@@ -5449,6 +5765,7 @@ namespace
         const int cx = (old.left + old.right) / 2, cy = (old.top + old.bottom) / 2;
         AppState::AsyncFind j;
         j.regrow = regrow;
+        j.startedAt = GetTickCount();
         j.old    = old;
         j.img    = img;
         j.fut    = std::async(std::launch::async, [img, cx, cy, bounds]() {
@@ -5523,7 +5840,12 @@ namespace
                     {
                         Log("Auto Stereo: region %d re-find didn't match (%dx%d -> %s%dx%d, overlap %.2f), miss %d",
                             id, ow, oh, res.first ? "" : "none ", fw, fh, iou, misses + 1);
-                        if (++misses >= 3) lost.push_back(id);
+                        // (Dropped after 3 in a row AND a while: mid-scroll a few
+                        // quick misses in a row are normal -- dropping then made the
+                        // picture blink out and come back as a new region.)
+                        const DWORD nowMs = GetTickCount();
+                        if (misses++ == 0) app.reacqFirstMiss[id] = nowMs;
+                        if (misses >= 3 && nowMs - app.reacqFirstMiss[id] >= 400) lost.push_back(id);
                     }
                 }
                 else
@@ -5548,6 +5870,19 @@ namespace
                         Log("Auto Stereo: region %d grew to the whole image (%ld,%ld)-(%ld,%ld) analysis px",
                             id, found.left, found.top, found.right, found.bottom);
                     }
+                }
+            }
+            // (A re-grow run on a frame from after the uncovering has had its
+            // look: whatever it found, the covered area now is the new
+            // baseline -- no more retries unless more is uncovered.)
+            if (j.regrow)
+            {
+                auto ua = app.regionUncoveredAt.find(id);
+                auto oa = app.regionOccArea.find(id);
+                if (ua != app.regionUncoveredAt.end() && (LONG)(j.startedAt - ua->second) >= 400 && oa != app.regionOccArea.end())
+                {
+                    app.regionFoundOcc[id] = oa->second;
+                    app.regionUncoveredAt.erase(ua);
                 }
             }
             it = app.asyncFinds.erase(it);   // (ready: destroying the future doesn't block)
@@ -5729,7 +6064,13 @@ namespace
                 // Content AND surroundings changed -- e.g. a playing video
                 // that's also being scrolled. Look (in the background) for an
                 // image rectangle of about the same size around where it was.
-                LaunchAsyncFind(app, kv.first, false, t.Rect(), bounds);
+                // Where it should be NOW: lost mid-scroll, the old place holds
+                // something else (or nothing) -- searching there dropped pictures
+                // and made them anew a moment later (jumpy boxes). Ahead by its
+                // scroll speed (analysis px a frame) for the frames the search lags.
+                RECT predicted = t.Rect();
+                OffsetRect(&predicted, (int)std::lround(t.VelocityX() * 2.0f), (int)std::lround(t.VelocityY() * 2.0f));
+                LaunchAsyncFind(app, kv.first, false, predicted, bounds);
                 continue;
             }
             // More of the image may have come into view.
@@ -6009,10 +6350,19 @@ namespace
         // a video's) that arrives by then is woven and shown at that very
         // refresh -- the earliest it can be (3 ms is left for the weave and
         // present). A still screen: nothing arrives, the loop goes on.
+        // (Only while there's time to weave it before the display's next
+        // refresh -- counted from where that refresh actually is, not from
+        // now: a loop that began late in the refresh waited its full 3 ms and
+        // ran past it, the frame shown twice.)
         g_stall.Mark("pace wait (capture)");
-        if (app.paceOnCapture &&
-            !app.capture.WaitForNewFrame((DWORD)(std::max)(1.0, 1000.0 / SrRefreshHz(app) - 3.0)))
-            app.paceOnCapture = false;   // still screen: sync to the compositor as usual this loop
+        {
+            const auto tc0 = std::chrono::steady_clock::now();
+            const double toBlank = app.renderer.MsToNextVBlank();
+            const double budget = toBlank >= 0.0 ? toBlank - 3.0 : 1000.0 / SrRefreshHz(app) - 3.0;
+            if (app.paceOnCapture && (budget < 1.0 || !app.capture.WaitForNewFrame((DWORD)budget)))
+                app.paceOnCapture = false;   // still screen (or no time): sync to the compositor as usual this loop
+            app.prof.lastCaptureWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
+        }
         g_stall.Mark("render loop");
         app.prof.tWait = std::chrono::steady_clock::now();
         app.gpuTimer.Begin();
@@ -6033,6 +6383,7 @@ namespace
         // Resolve the current source frame: the test image, or a capture frame.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         int srcW = 0, srcH = 0;
+        bool srcEncoded = false;   // srcSRV is the capture's own frame: sRGB read as UNORM (zero-copy)
         bool capSizeChanged = false;
         bool gotFrame = false;   // a new capture frame arrived this iteration
         if (app.source == SourceKind::TestImage)
@@ -6141,7 +6492,17 @@ namespace
             else
             {
                 gotFrame = wgcGotFrame;
-                srcSRV = app.capture.SRV();
+                // Zero-copy: the converter reads the captured frame itself when
+                // it's the whole picture and the mode reads it cheaply. (Not the
+                // weaver: its own sRGB decode, setShaderSRGBConversion, was left
+                // out of its start-up picture -- washed out -- and switching it
+                // stopped the converter's output being taken up.) Auto Stereo
+                // crops per region from the copy.
+                // (The converter's anaglyph mode as SetFormat below gives it.)
+                const int convAnaMode = app.manualAnaKind == 1 ? 3 :
+                                        (app.manualAnaKind == 2 && app.manualAnaTint) ? 5 : app.anaglyphMode;
+                const bool direct = !app.autoStereo && srw::Converter::CheapEncodedSource(app.format, convAnaMode);
+                srcSRV = direct ? app.capture.DirectSRV(srcEncoded) : app.capture.SRV();
                 srcW   = app.capture.Width();
                 srcH   = app.capture.Height();
             }
@@ -6223,6 +6584,7 @@ namespace
                 }
             }
             srcSRV   = app.katanga.SRV();
+            srcEncoded = false;
             srcW     = app.katanga.Width();
             srcH     = app.katanga.Height();
             gotFrame = nowReceiving;
@@ -6286,7 +6648,7 @@ namespace
                 // while a pick or a scan is pending, analyse the latest frame
                 // even if nothing changed (a static page delivers no new
                 // frames). A scan's frame also carries red/cyan.
-                const bool analyse = app.capture.Texture() &&
+                const bool analyse = app.capture.HasPicture() &&
                     ((gotFrame && (!app.regionTrackers.empty() || !app.suppressed.empty())) ||
                      app.pickPending || app.scanWantColour);
                 if (analyse)
@@ -6297,9 +6659,17 @@ namespace
                 // ago: otherwise the woven picture trails behind scrolling.
                 app.analysisWaitNewest = !app.gpuTracking && analyse && gotFrame && !app.regionTrackers.empty();
                 {
-                    const auto t0 = std::chrono::steady_clock::now();
-                    { HitchWatch hw("Auto Stereo analysis/tracking/picks"); ProcessAutoStereoAnalysis(app); }
-                    app.autoTimeAnalysisMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    // With GPU scroll tracking the CPU tracker (on frames read back a
+                    // frame or two ago) only gives the GPU its starting point: its
+                    // work -- 1-2 ms a frame -- runs after this frame is presented,
+                    // not before its weave (it made frames miss the refresh).
+                    if (app.gpuTracking) app.analysisDeferred = true;
+                    else
+                    {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        { HitchWatch hw("Auto Stereo analysis/tracking/picks"); ProcessAutoStereoAnalysis(app); }
+                        app.autoTimeAnalysisMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    }
                     app.gpuTimer.Stamp(GpuFrameTimer::kAnalysis);
                 }
                 // GPU scroll tracking: find each content picture in THIS
@@ -6518,7 +6888,9 @@ namespace
         // scaling between the game's render res and the output window/display.
         const bool katangaFmt  = (app.format == StereoFormat::Katanga);
         const bool swapNow = app.swapEyes != ((app.autoEyeSwap && app.fsAutoWindow) || app.manualEyeSwap);   // (+ detected eye order)
-        const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !swapNow && noConv;
+        // (Not the capture's own frame -- zero-copy: that goes through the
+        // converter, which decodes it.)
+        const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !swapNow && noConv && !srcEncoded;
 
         if (identitySBS)
         {
@@ -6686,7 +7058,26 @@ namespace
                 }
             }
 
-            app.converter.SetFormat(app.format, swapNow, app.anaglyphCombo, app.anaglyphMode);
+            // (What the picture under an anaglyph was -- UpdateManualAnaColour:
+            // black-and-white -> Mono, one colour -> its tint.)
+            const bool anaTinted = app.manualAnaKind == 2 && app.manualAnaTint;
+            app.converter.SetFormat(app.format, swapNow, app.anaglyphCombo,
+                                    app.manualAnaKind == 1 ? 3 : anaTinted ? 5 : app.anaglyphMode);
+            app.converter.SetAnaTint(anaTinted ? app.manualAnaTint->single : nullptr,
+                                     anaTinted ? app.manualAnaTint->missing : nullptr);
+            {
+                // (... and on a page of several, each such picture in its own box.)
+                Converter::AnaBox boxes[32]; int nb = 0;
+                for (const auto& b : app.manualAnaBoxes)
+                {
+                    if (nb == 32) break;
+                    Converter::AnaBox& o = boxes[nb++];
+                    o.u0 = b.u0; o.v0 = b.v0; o.u1 = b.u1; o.v1 = b.v1; o.kind = b.kind;
+                    o.checkInsetU = b.insetU; o.checkInsetV = b.insetV;
+                    if (b.tint) { o.single = b.tint->single; o.missing = b.tint->missing; o.pairA = b.tint->pairA; o.pairB = b.tint->pairB; }
+                }
+                app.converter.SetAnaBoxes(boxes, nb);
+            }
             app.converter.SetConvergence(app.convergence * 0.03f);   // slider -1..1 -> ±3% width per eye
             {
                 int ndN = 0; const NdLevel* nd = PulfrichNdLevels(ndN);
@@ -6761,7 +7152,18 @@ namespace
             }
             bool resized = false;
             // (Unchanged capture: the converter keeps its last output.)
-            app.converter.SetSourceVersion(srcSRV && srcSRV == app.capture.SRV() ? app.capture.ContentVersion() : 0);
+            // The anaglyph check's frame (UpdateManualAnaColour): this very one, so the
+            // converter's snapshot (the boxes' reference as the page scrolls) is it too.
+            if (app.manualAnaSubmitWanted && srcSRV && srcW > 0 && srcH > 0)
+            {
+                app.analyzer.Submit(srcEncoded ? app.capture.SRV() : srcSRV, srcW, srcH, true);   // (the analyzer wants the _SRGB copy)
+                app.converter.RequestAnaSnapshot();
+                app.manualAnaSubmitWanted = false;
+                if (app.manualAnaPhase == 3) app.manualAnaPhase = 1;
+            }
+            const bool fromCapture = srcSRV && (srcEncoded || srcSRV == app.capture.CopyView());
+            app.converter.SetSourceVersion(fromCapture ? app.capture.ContentVersion() : 0);
+            app.converter.SetSourceEncoded(srcEncoded, srcEncoded ? &app.capture : nullptr);
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
                 app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
@@ -6792,6 +7194,13 @@ namespace
             const clk::time_point tEnd = clk::now();
             app.prof.lastEnd = tEnd;
             app.gpuTimer.End();
+            if (app.analysisDeferred)   // (see the Auto Stereo analysis above)
+            {
+                app.analysisDeferred = false;
+                const auto t0 = std::chrono::steady_clock::now();
+                { HitchWatch hw("Auto Stereo analysis/tracking/picks"); ProcessAutoStereoAnalysis(app); }
+                app.autoTimeAnalysisMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
 
             // Frame profile: every 5 s, where the loop's time went.
             AppState::FrameProfile& p = app.prof;
@@ -6804,6 +7213,36 @@ namespace
                 p.readback += app.autoStereo ? app.autoTimeReadbackMs : 0.0;
                 ++p.loops;
                 p.frames += gotFrame ? 1 : 0;
+                p.compWait += app.renderer.LastCompositorWaitMs(); p.vblankWait += app.renderer.LastVBlankWaitMs();
+                const double hz = SrRefreshHz(app);
+                // Late: this present more than 1.5 refreshes after the last one
+                // (what's seen -- a refresh shown twice). Put down to whichever
+                // part of the time between them took most: between loops (window
+                // messages, the panel), the compositor still holding the last
+                // frame, the refresh cap, the wait for the refresh, the wait for
+                // a new capture frame, our work, or weave + present.
+                const double sinceLast = p.prevPresent.time_since_epoch().count() != 0 ? ms(p.prevPresent, tEnd) : total;
+                const bool hadPrev = p.prevPresent.time_since_epoch().count() != 0;
+                const clk::time_point prevPresent = p.prevPresent;
+                p.prevPresent = tEnd;
+                if (hz > 0 && sinceLast > 1.5 * 1000.0 / hz)
+                {
+                    ++p.late;
+                    const double cw = app.renderer.LastCompositorWaitMs(), vw = app.renderer.LastVBlankWaitMs();
+                    const double cap = p.lastCaptureWaitMs;
+                    const double parts[7] = {
+                        hadPrev ? ms(prevPresent, p.t0) : 0.0,                                  // between loops
+                        cw,                                                                      // compositor
+                        (std::max)(0.0, ms(p.t0, p.tWait) - cw - vw - cap),                     // refresh cap
+                        vw,                                                                      // refresh wait
+                        cap,                                                                     // capture wait
+                        ms(p.tWait, tWork),                                                      // our work
+                        ms(tWork, tEnd) };                                                       // weave + present
+                    int* const bins[7] = { &p.lateOutside, &p.lateComp, &p.lateCap, &p.lateBlank, &p.lateCapture, &p.lateWork, &p.latePresent };
+                    int best = 0;
+                    for (int k = 1; k < 7; ++k) if (parts[k] > parts[best]) best = k;
+                    ++*bins[best];
+                }
             }
             if (GetTickCount() - p.last >= 5000)
             {
@@ -6819,6 +7258,11 @@ namespace
                         p.loops / secs, p.frames / secs, p.wait / p.loops, p.work / p.loops, p.analysis / p.loops, p.readback / p.loops,
                         p.weave / p.loops, p.present / p.loops, p.total / p.loops, p.worst,
                         p.outside / p.loops, p.gui / p.loops);
+                    // (Pacing: frames that took two refreshes -- each one a visible
+                    // stutter -- and what the loop waited on.)
+                    Log("  pacing: %.1f late frames/s (%d) -- most time in: between loops %d, compositor %d, refresh cap %d, refresh wait %d, capture wait %d, our work %d, weave+present %d | avg waits ms: compositor %.2f, vertical blank %.2f",
+                        p.late / secs, p.late, p.lateOutside, p.lateComp, p.lateCap, p.lateBlank, p.lateCapture, p.lateWork, p.latePresent,
+                        p.compWait / p.loops, p.vblankWait / p.loops);
                     // GPU side, and the rate Windows actually composes at
                     // (the loop can't outrun the compositor that shows it).
                     DWM_TIMING_INFO ti{ sizeof(ti) };
@@ -6953,7 +7397,24 @@ namespace
                 for (const auto& p : app->profiles) ms.profileNames.push_back(p.name);
                 if (!app->pendingUpdateUrl.empty()) ms.updateTag = app->pendingUpdateTag;
                 ms.autoInput = app->autoInput;
-                app->tray.ShowContextMenu(hwnd, ms);
+                // The menu on its own thread: its message loop ran on this one
+                // -- the render thread -- and the weave froze for as long as the
+                // menu was open. The chosen command comes back as WM_COMMAND.
+                static std::atomic<bool> s_menuOpen{ false };
+                if (!s_menuOpen.exchange(true))
+                {
+                    TrayIcon* tray = &app->tray;
+                    std::thread([ms, hwnd, tray]() {
+                        static const wchar_t* kCls = L"SRLoomTrayMenu";
+                        WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kCls;
+                        RegisterClassW(&wc);   // (fails harmlessly once registered)
+                        HWND owner = CreateWindowExW(WS_EX_TOOLWINDOW, kCls, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+                        const UINT cmd = owner ? tray->ShowContextMenu(owner, ms, true) : 0;
+                        if (owner) DestroyWindow(owner);
+                        if (cmd) PostMessageW(hwnd, WM_COMMAND, MAKEWPARAM(cmd, 0), 0);
+                        s_menuOpen = false;
+                    }).detach();
+                }
             }
             else if (app && LOWORD(lParam) == WM_LBUTTONUP)
             {
@@ -7963,6 +8424,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Initialize live capture (this is the default source).
     const bool capInit = app.capture.Initialize(app.renderer.Device(), app.renderer.Context());
     Log("WinMain: capture.Initialize=%d", capInit ? 1 : 0);
+    app.capture.SetZeroCopy(Settings::ReadZeroCopyCapture());
+    Log("WinMain: zero-copy capture %s", Settings::ReadZeroCopyCapture() ? "on" : "off");
     // DXGI Output Duplication is the fallback for exclusive-fullscreen capture; it
     // sits idle until the render loop detects WGC isn't delivering frames for a
     // foreign-display monitor source.
@@ -8289,8 +8752,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.profiles          = Profiles::Load();
     app.profilesAutoApply = Settings::ReadAutoApplyProfiles();
     app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
-    // Stereo 3D Input: start on the pinned default (Automatic Detection
-    // unless another one was pinned).
+    // Stereo 3D Input: start on the pinned default (Side-by-Side (half)
+    // unless another one was pinned -- Settings::ReadDefaultInput).
     {
         app.defaultInput = Settings::ReadDefaultInput();
         int n = 0;
@@ -8330,6 +8793,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // The render loop runs on this thread: ahead of normal-priority work (and
     // well ahead of the Auto Stereo scanner) so it isn't made to skip frames.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    // ... and registered with the Multimedia Class Scheduler as a game's
+    // render thread: Windows then schedules it promptly even while a video
+    // decodes or a browser scrolls -- a late wake-up is a missed refresh.
+    {
+        DWORD taskIndex = 0;
+        if (HANDLE mm = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex))
+        {
+            AvSetMmThreadPriority(mm, AVRT_PRIORITY_HIGH);
+            Log("WinMain: render thread registered with MMCSS (Games, high)");
+        }
+        else Log("WinMain: MMCSS registration failed (%lu)", GetLastError());
+    }
     // 1 ms timer resolution for this process: waits with short timeouts
     // (the capture wait, frame pacing) otherwise round up to Windows' 15.6 ms
     // default tick -- which held the weave to ~64 frames/s on any display.
@@ -8398,6 +8873,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             g_stall.Mark("render loop");
             UpdateInputChoice(app);      // Stereo 3D Input "Automatic Detection"
             UpdateManualEyeOrder(app);   // (a whole picture's eye order: layouts picked by hand)
+            UpdateManualAnaColour(app);  // (Anaglyph picked by hand: a black-and-white picture under it?)
             UpdateLastForeground(app);   // remember the user's active window for "make 3D"
             RenderFrame(app);
 

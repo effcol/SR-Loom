@@ -143,7 +143,30 @@ namespace srw
     struct StereoScores { float sbs = 0.0f, tab = 0.0f; };
     // An anaglyph's colour pair and best decode (the converter's combo index and
     // shader mode value: 3 mono for a black-and-white picture, 4 recovered colour).
-    struct AnaglyphKind { int combo = 0; int mode = 4; bool known = false; };
+    // A one-colour picture under an anaglyph (sepia, cyanotype, green on black,
+    // a duotone): its colours all lie on one curve, so each eye's colour follows
+    // from what that eye sees. `single`: the eye seen through one channel --
+    // that channel's value -> the full colour (RGB, sRGB-encoded). `missing`:
+    // the eye seen through two -- their average -> the third channel.
+    // pairA / pairB: the pair's two channels along the curve, per key (to
+    // re-check a picture is still this one colour: Converter::SetAnaBoxes).
+    struct AnaTint { uint8_t single[256][4] = {}; uint8_t missing[256] = {}; uint8_t pairA[256] = {}, pairB[256] = {}; };
+    // mode 5: a one-colour picture, decoded with `tint` (the converter's own
+    // mode, never shown in the menus).
+    struct AnaglyphKind { int combo = 0; int mode = 4; bool known = false; std::shared_ptr<const AnaTint> tint; };
+    // What the picture under an anaglyph was (pair `combo`, inside `r`):
+    // 1 black-and-white, 2 one colour (then *tint is set), 0 colour, -1 can't
+    // tell (a one-channel pair, too little that isn't plain grey).
+    // Black-and-white: the eye seen through two channels shows the same in
+    // both (red/cyan: green == blue) -- measured on 8x8 block averages, since
+    // a JPEG smears colour at every red/cyan fringe but keeps the averages.
+    // One colour: on smooth blocks one of those two channels follows the other
+    // along a single curve.
+    // apartShare (optional, diagnostics): the black-and-white test's share of blocks apart.
+    // Some sign the picture in r is an anaglyph at all (lighter than ClassifyStereo).
+    bool AnaglyphEvidence(const LumaImage& img, const RECT& r);
+    int AnalyseAnaPicture(const LumaImage& img, const RECT& r, int combo, std::shared_ptr<const AnaTint>* tint,
+                          float* apartShare = nullptr);
     // Which half of an SBS / TAB picture is the left eye: `swap` when the
     // second half (right / bottom) looks like the LEFT eye. dx*: the right
     // eye's shift against the left, over all / the top third / the bottom
@@ -258,6 +281,7 @@ namespace srw
         uint64_t                          frameId = 0;
         std::shared_ptr<const LumaImage>  image;    // the frame the rects refer to
         std::vector<ScanHit>              hits;
+        std::vector<RECT>                 pictures; // every picture judged (3D or not; not whole viewports)
         std::vector<std::pair<int, bool>> verified; // ScanVerify id -> still 3D in that format
         std::vector<std::string>          log;      // classifier diagnostics
         double                            ms = 0.0;

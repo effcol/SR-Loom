@@ -12,9 +12,14 @@ Texture2D<uint4> descTexD : register(t6);
 Texture2D    dispPrevTex : register(t7);   // anaglyph recovery: last frame's smoothed disparity
 Texture2D    srcPrevQ    : register(t8);   // ... and last frame's 1/4 source (what changed since)
 Texture2D    srcQ        : register(t9);   // anaglyph recovery: the 1/4 source again (the compose's edge-aware upsampling)
-Texture2D    picRectTex  : register(t10);  // anaglyph recovery: where the 3D picture is (PSPicRect: .xy top-left, .zw bottom-right, source uv)
-Texture2D    profColTex  : register(t11);  // ... (PSPicCols / PSPicRows: each column's / row's share of anaglyph fringes)
-Texture2D    profRowTex  : register(t12);
+Texture2D    anaTintTex  : register(t10);  // what the picture under the anaglyph was (Converter::SetAnaTint / SetAnaBoxes): tint tables, rows 0-1 the whole picture's, 2+2i/3+2i box i's (sRGB-encoded)
+Texture2D    anaBoxTex   : register(t11);  // ... the boxes: [0].x count, then per box [1+2i] its rect (source uv), [2+2i] .x kind (1 Mono, 2 tint) .y its tint row
+Texture2D    anaBoxOkTex : register(t12);  // ... whether each box still holds that, this frame (PSAnaBoxCheck: .r 1)
+Texture2D    anaBoxMapTex: register(t13);  // ... which of them touch each 16x16 block (PSAnaBoxMap: .xy index + 1)
+Texture2D    changePrevMapTex : register(t14);  // anaglyph recovery: last frame's box map (PSChange)
+Texture2D    changeTex   : register(t15);  // ... which 16x16 blocks to redraw this frame (PSChangeGrow: .r 1)
+Texture2D    anaSnapTex  : register(t16);  // ... the 1/16 source when the boxes were judged (Converter::CommitAnaSnapshot)
+Texture2D    anaShiftTex : register(t17);  // ... how far each box has moved since, this frame (PSAnaBoxShift: .r rows of blocks)
 SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
@@ -52,8 +57,8 @@ cbuffer Params : register(b0)
     float g_temporal;      // anaglyph recovery: last frame's disparity is there to steady this one (1)
     float g_lvlToSrcX;     // anaglyph recovery: the disparity levels cover whole 16-px blocks, a little past
     float g_lvlToSrcY;     // the picture's edge -- a level's uv x this = the picture's uv (>= 1)
-    float _pad_e;
-    float _pad_f;
+    float g_changeSkip;    // anaglyph recovery: 1 = redraw only the blocks changeTex marks (the rest is last frame's)
+    float g_srcDecode;     // 1: srcTex is sRGB-encoded read as UNORM (the capture's own frame, SetSourceEncoded) -- decoded on read
     float _pad_g;
 };
 
@@ -79,6 +84,61 @@ float anaEyeLuma(float3 c, int combo, int e)
     return                (e == 0) ? (c.g + c.b) * 0.5 : (c.r + c.b) * 0.5; // Cyan/Magenta
 }
 
+// sRGB <-> linear (the source's SRV and the output's RTV are sRGB views: the
+// shader sees linear light; the tint tables are in sRGB-encoded values).
+float3 srgbEncode(float3 l) { return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055; }
+float3 srgbDecode(float3 s) { return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4); }
+
+// Reading the source (t0). Normally an _SRGB view: the hardware decodes, then
+// filters. The capture's own frame (zero-copy) can only be viewed as UNORM, so
+// with g_srcDecode set the same is done here: each texel decoded, then the
+// bilinear blend (clamped at the edges, like the sampler) -- the same result.
+float4 SrcLoad(int3 p)
+{
+    float4 c = srcTex.Load(p);
+    if (g_srcDecode > 0.5) c.rgb = srgbDecode(saturate(c.rgb));
+    return c;
+}
+float4 SrcSampleLevel(SamplerState s, float2 uv, float lod)
+{
+    if (g_srcDecode < 0.5) return srcTex.SampleLevel(s, uv, lod);
+    uint W, H; srcTex.GetDimensions(W, H);
+    const float2 p = uv * float2(W, H) - 0.5;
+    const int2 mx = int2(W, H) - 1;
+    // On a texel's centre (1:1 layouts: Half SBS, the TAB halves...): that
+    // texel alone. (The hardware's own blend weights are 1/256 steps.)
+    const float2 r = round(p);
+    if (all(abs(p - r) < 1.0 / 512.0)) return SrcLoad(int3(clamp((int2)r, 0, mx), 0));
+    const float2 f = frac(p);
+    const int2 a = clamp((int2)floor(p), 0, mx), b = clamp((int2)floor(p) + 1, 0, mx);
+    const float4 c00 = SrcLoad(int3(a.x, a.y, 0)), c10 = SrcLoad(int3(b.x, a.y, 0));
+    const float4 c01 = SrcLoad(int3(a.x, b.y, 0)), c11 = SrcLoad(int3(b.x, b.y, 0));
+    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+}
+float4 SrcSample(SamplerState s, float2 uv) { return SrcSampleLevel(s, uv, 0); }   // (one mip level)
+// Row `row` of the tint table at value v (0..1), between its 256 entries.
+float4 tintLut(int row, float v)
+{
+    const float x = saturate(v) * 255.0;
+    const int i = min((int)x, 254);
+    return lerp(anaTintTex.Load(int3(i, row, 0)), anaTintTex.Load(int3(i + 1, row, 0)), x - i);
+}
+// A one-colour picture under the anaglyph (sepia, cyanotype, a duotone --
+// AnalyseAnaPicture): its colours lie on one curve, so each eye's colour
+// follows from what that eye sees. The eye seen through two channels keeps
+// both and gets the third from the curve (table row+1); the other eye's one
+// channel gives its whole colour (row). (Red/cyan, green/magenta, amber/blue.)
+float3 tintDecode(float3 c, int eye, int row)
+{
+    const float3 sc = srgbEncode(saturate(c));
+    const int s = g_anaCombo == 3 ? 1 : (g_anaCombo == 4 ? 2 : 0);   // the one-channel eye's channel
+    const int singleEye = g_anaCombo == 4 ? 1 : 0;                    // (amber/blue: the right eye)
+    if (eye == singleEye) return srgbDecode(tintLut(row, sc[s]).rgb);
+    const float key = (dot(sc, 1.0) - sc[s]) * 0.5;                   // the pair's average
+    const float m = tintLut(row + 1, key).r;                          // the third channel
+    return srgbDecode(float3(s == 0 ? m : sc.r, s == 1 ? m : sc.g, s == 2 ? m : sc.b));
+}
+
 // Anaglyph recovery: the channel matched for each view's disparity, per combo --
 // one that carries only that eye's picture (red vs green for red/cyan: blue is
 // left out, it adds noise). Amber/blue's left view is red+green.
@@ -93,13 +153,6 @@ float anaChanR(float3 c)
     if (g_anaCombo == 2 || g_anaCombo == 4) return c.b;          // Red/Blue, Amber/Blue
     if (g_anaCombo == 3 || g_anaCombo == 5) return c.r;          // Green/Magenta, Cyan/Magenta
     return c.g;                                                  // Red/Cyan, Red/Green
-}
-
-// The picture's rectangle (see PSPicRect), in the source's uv; unset -> all.
-float4 picRectSrc()
-{
-    const float4 r = picRectTex.Load(int3(0, 0, 0));
-    return (r.z > r.x && r.w > r.y) ? r : float4(0, 0, 1, 1);
 }
 
 float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
@@ -120,7 +173,7 @@ float3 decodeAnaglyph(float3 c, int combo, int e, int mode)
         float  hY = max(dot(h, float3(0.299, 0.587, 0.114)), 1e-3);
         return saturate(h * (eyeY / hY));
     }
-    if (mode == 3) return eyeY.xxx;                   // mono: per-eye luminance (not the dim
+    if (mode == 3 || mode == 5) return eyeY.xxx;                   // mono: per-eye luminance (not the dim
                                                       // single-channel-weighted grey, which was ~3x dark)
     return col;                                       // mode 1: colour (filtered)
 }
@@ -145,7 +198,7 @@ void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
     float rr[5], gg[5];
     [unroll] for (int w = 0; w < 5; ++w)
     {
-        float3 s = srcTex.SampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
+        float3 s = SrcSampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
         rr[w] = anaChanL(s); gg[w] = anaChanR(s);   // (rr: left view's channel, gg: right's)
     }
     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
@@ -163,7 +216,7 @@ void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn
         float rr[5], gg[5];
         [unroll] for (int i = 0; i < 5; ++i)
         {
-            float3 s = srcTex.SampleLevel(samp, uv + dirs[a] * (float)(i - 2), 0).rgb;
+            float3 s = SrcSampleLevel(samp, uv + dirs[a] * (float)(i - 2), 0).rgb;
             rr[i] = anaChanL(s); gg[i] = anaChanR(s);
         }
         [unroll] for (int k = 0; k < 4; ++k)
@@ -204,11 +257,7 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     float2 uv  = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     float  ty = 1.0 / max(g_coarseH, 1.0);
-    // Search 6% of the PICTURE's width (see PSPicRect), in this level's uv,
-    // and never outside the picture.
-    const float4 pr = picRectSrc();
-    const float picL = pr.x / g_lvlToSrcX, picR = pr.z / g_lvlToSrcX;
-    float  maxD = g_dispMaxUV * (picR - picL);
+    float  maxD = g_dispMaxUV;
     // Candidates every 8 source pixels (half a coarse texel), however wide
     // the area is: tying the step to the area's width searched the same
     // picture on a different candidate grid whenever the captured area
@@ -230,7 +279,7 @@ float4 PSAnaDisp(VSOut i) : SV_Target
         // (A candidate off the picture is never a match: its descriptor there is
         // the edge pixel repeated, which can look like one -- and then a whole
         // band beside the edge borrowed that single column: streaks.)
-        if (uv.x + d < picL || uv.x + d > picR) continue;
+        if (uv.x + d < 0.0 || uv.x + d > 1.0 / g_lvlToSrcX) continue;
         float cRed[16], cGrn[16]; buildDesc(uv + float2(d, 0), tx, ty, cRed, cGrn);
         float bias = abs(d) * 16.0 * g_coarseW * 0.0004;   // (a preference for small disparities, per pixel -- also not tied to the area's width)
         float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
@@ -270,7 +319,7 @@ float4 PSDown(VSOut i) : SV_Target
     float4 acc = 0;
     [unroll] for (int y = 0; y < 4; ++y)
     [unroll] for (int x = 0; x < 4; ++x)
-        acc += srcTex.SampleLevel(samp, c + t * float2(o[x], o[y]), 0) * (wt[x] * wt[y]);
+        acc += SrcSampleLevel(samp, c + t * float2(o[x], o[y]), 0) * (wt[x] * wt[y]);
     return acc / 64.0;
 }
 
@@ -323,8 +372,7 @@ float4 PSAnaRefine(VSOut i) : SV_Target
     int2   p  = int2(i.pos.xy);
     int    W  = (int)g_coarseW;
     float4 priorAll = dispTex.SampleLevel(samp, uv, 0.0);   // .rg disparity, .ba uniqueness
-    const float4 pr = picRectSrc();                          // (the picture, in this level's px -- see PSPicRect)
-    const float limL = pr.x / g_lvlToSrcX * W, lim = pr.z / g_lvlToSrcX * W;
+    const float lim = W / g_lvlToSrcX;                       // (the picture's right edge, in this level's px)
 
     float refL[16], refR[16]; loadDescL(p, refL); loadDescR(p, refR);
 
@@ -365,8 +413,8 @@ float4 PSAnaRefine(VSOut i) : SV_Target
             float sadL = descCost(refL, candR) + tie;   // ref left view vs candidate right view
             float sadR = descCost(refR, candL) + tie;   // ref right view vs candidate left view
             // (Off the picture: never, see PSAnaDisp.)
-            if (sadL < bestL && rawL >= limL && rawL < lim) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
-            if (sadR < bestR && rawR >= limL && rawR < lim) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
+            if (sadL < bestL && rawL >= 0 && rawL < lim) { bestL = sadL; dL = (float)(kL0 + k) * tx; }
+            if (sadR < bestR && rawR >= 0 && rawR < lim) { bestR = sadR; dR = (float)(kR0 + k) * tx; }
         }
     }
     return float4(dL, dR, priorAll.b, priorAll.a);   // carry uniqueness through
@@ -396,7 +444,7 @@ float4 PSAnaFill(VSOut i) : SV_Target
     // confL in .b (drives the left eye), confR in .a (right eye).
     if (conf > 0.5) return float4(d, dd.b * conf, dd.a * conf);
 
-    float3 myCol = srcTex.SampleLevel(samp, uv, 0.0).rgb;
+    float3 myCol = SrcSampleLevel(samp, uv, 0.0).rgb;
     float  best  = 1e9; float2 bestD = d; bool found = false;
     [loop] for (int s = 1; s <= 24; ++s)
     {
@@ -408,7 +456,7 @@ float4 PSAnaFill(VSOut i) : SV_Target
             float  nc  = saturate(1.0 - abs(nd.r + dispTex.SampleLevel(samp, float2(nuv.x + nd.r, nuv.y), 0.0).g) * inv);
             if (nc > 0.5)
             {
-                float3 ncol = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
+                float3 ncol = SrcSampleLevel(samp, nuv, 0.0).rgb;
                 float  cd = distance(myCol, ncol) + (float)s * 0.02;   // colour dist + slight spatial bias
                 if (cd < best) { best = cd; bestD = nd; found = true; }
             }
@@ -422,12 +470,192 @@ float4 PSAnaFill(VSOut i) : SV_Target
 // "constant disparity within a segment"): cross-bilateral blur of the disparity
 // map guided by source luminance, so disparities even out within a region but do
 // NOT bleed across luminance edges. Confidence (.b) is preserved.
+// ----- What changed since the last frame (anaglyph recovery) --------------
+// A page that isn't moving is still delivered as new frames (a caret, a small
+// animation, the capture simply ticking): recovering all of it every frame
+// spent milliseconds on pixels that come out the same. Per 16x16 block, did
+// its 4x4 averages (the 1/4 source, t0, vs last frame's at t8) or the boxes
+// decoded as black-and-white / one colour (t13 vs last frame's at t14) change?
+// Unchanged blocks are discarded -- the pass's occlusion predicate then skips
+// the whole recovery when nothing changed at all (Converter::Convert).
+// Target 1/16 size (cleared to 0): .r 1 = changed.
+float4 PSChange(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy);
+    float d = 0;
+    [unroll] for (int y = 0; y < 4; ++y)
+    [unroll] for (int x = 0; x < 4; ++x)
+    {
+        const int3 q = int3(b * 4 + int2(x, y), 0);
+        const float3 a = SrcLoad(q).rgb, p = srcPrevQ.Load(q).rgb;
+        d = max(d, max(max(abs(a.r - p.r), abs(a.g - p.g)), abs(a.b - p.b)));
+    }
+    // (Linear light, 4x4 averages: a single pixel changing by a few levels shows.)
+    const bool boxes = any(anaBoxMapTex.Load(int3(b, 0)).xy != changePrevMapTex.Load(int3(b, 0)).xy);
+    if (d < 0.0005 && !boxes) discard;
+    return 1;
+}
+
+// Target 1/16 size: a block is redrawn if a change is within reach of it --
+// the disparity search reaches g_dispMaxUV of the width sideways (a pixel's
+// colour can come from that far), the 1/4 smoothing a few blocks up and down.
+float4 PSChangeGrow(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy);
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int rx = (int)ceil(g_dispMaxUV * g_srcW / 16.0) + 1, ry = 3;
+    [loop] for (int y = max(0, b.y - ry); y <= min((int)H - 1, b.y + ry); ++y)
+    [loop] for (int x = max(0, b.x - rx); x <= min((int)W - 1, b.x + rx); ++x)
+        if (SrcLoad(int3(x, y, 0)).r > 0.5) return 1;
+    return 0;
+}
+// ----- Is each box still what it was judged? (Converter::SetAnaBoxes) -----
+// The black-and-white / one-colour boxes come from a check on an earlier frame.
+// Every frame this re-runs that check on the boxes' 16x16 block averages (the
+// 1/16 source, t0 -- the blocks AnalyseAnaPicture measures): black-and-white,
+// the pair's averages the same; one colour, on the box's curve (its tint
+// table row 3+2i: .g .b the pair per key). A page scrolled or a colour picture
+// moved in -- the box is off this frame, instead of greying what's there now.
+// Two passes, so a big picture isn't one GPU thread's work: each row of each
+// box (PSAnaBoxRows), then each box's rows summed (PSAnaBoxCheck).
+
+// Box bi's blocks wholly inside the picture (x0, y0, x1, y1): the box itself
+// reaches past it (a black-and-white one well past -- see
+// UpdateManualAnaColour), and a block there can hold the colour picture next
+// to it. bk.zw: that padding (uv).
+// Box bi's rectangle (source uv) where its picture is THIS frame: where the
+// check found it, moved by how far the page has scrolled since (PSAnaBoxShift,
+// t17: .r rows of 16-px blocks; unbound -> 0).
+float4 boxRect(int bi)
+{
+    const float4 br = anaBoxTex.Load(int3(1 + 2 * bi, 0, 0));
+    const float dy = anaShiftTex.Load(int3(bi, 0, 0)).r * 16.0 / g_srcH;
+    return br + float4(0, dy, 0, dy);
+}
+int4 boxInnerBlocks(int bi, uint W, uint H, bool moved = true)
+{
+    const float4 br = moved ? boxRect(bi) : anaBoxTex.Load(int3(1 + 2 * bi, 0, 0));   // (moved: where it is now)
+    const float4 bk = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0));
+    const float4 inner = float4(br.xy + bk.zw, br.zw - bk.zw);
+    return int4(max(0, (int)ceil(inner.x * g_srcW / 16.0)), max(0, (int)ceil(inner.y * g_srcH / 16.0)),
+                min((int)W, (int)floor(inner.z * g_srcW / 16.0)), min((int)H, (int)floor(inner.w * g_srcH / 16.0)));
+}
+
+// How far each box's picture has scrolled since the check (which judged a
+// frame a moment ago): its blocks in that frame (the snapshot, t16) against
+// this frame's (t0), up or down by 0..kBoxShift rows of 16-px blocks.
+// Target kMaxBoxes x (2 kBoxShift + 1): texel (box, j) -- the mean difference
+// at dy = j - kBoxShift (.r), and how many blocks were compared (.g).
+static const int kBoxShift = 48;   // (768 px either way: a fast scroll between checks)
+float BlockLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+float4 PSAnaBoxShiftCost(VSOut i) : SV_Target
+{
+    const int bi = (int)i.pos.x, dy = (int)i.pos.y - kBoxShift;
+    if (bi >= (int)anaBoxTex.Load(int3(0, 0, 0)).x) return float4(1e4, 0, 0, 0);
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int4 b = boxInnerBlocks(bi, W, H, false);   // (where the check found it: the snapshot's place)
+    const int sx = max(1, (b.z - b.x) / 24), sy = max(1, (b.w - b.y) / 24);   // (at most 24 x 24 blocks compared)
+    float d = 0, n = 0;
+    [loop] for (int y = b.y; y < b.w; y += sy)
+    {
+        const int yy = y + dy;
+        if (yy < 0 || yy >= (int)H) continue;
+        [loop] for (int x = b.x; x < b.z; x += sx)
+        {
+            d += abs(BlockLuma(SrcLoad(int3(x, yy, 0)).rgb) - BlockLuma(anaSnapTex.Load(int3(x, y, 0)).rgb));
+            n += 1;
+        }
+    }
+    return float4(n > 0 ? d / n : 1e4, n, 0, 0);
+}
+// Target kMaxBoxes x 1: .r the shift (rows of blocks) with the least
+// difference -- not moved unless another shift fits clearly better (a still
+// page, a picture with repeating rows). (PSAnaBoxShiftCost at t2.)
+float4 PSAnaBoxShift(VSOut i) : SV_Target
+{
+    const int bi = (int)i.pos.x;
+    const float c0 = dispTex.Load(int3(bi, kBoxShift, 0)).r;
+    float best = c0; int bestDy = 0;
+    [loop] for (int j = 0; j <= 2 * kBoxShift; ++j)
+    {
+        const float2 c = dispTex.Load(int3(bi, j, 0)).rg;
+        if (c.y < 4) continue;   // (too little of the box on screen at that shift)
+        if (c.x < best - 0.002) { best = c.x; bestDy = j - kBoxShift; }
+    }
+    return float4(bestDy, 1, 0, 0);
+}
+
+// Target kMaxBoxes x (1/16 height): texel (box, row) -- that row's blocks
+// in the box: .r how many say something (not plain grey), .g how many of
+// those don't fit.
+float4 PSAnaBoxRows(VSOut i) : SV_Target
+{
+    const int bi = (int)i.pos.x, y = (int)i.pos.y;
+    if (bi >= (int)anaBoxTex.Load(int3(0, 0, 0)).x) return 0;
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int4 b = boxInnerBlocks(bi, W, H);
+    if (y < b.y || y >= b.w) return 0;
+    const float4 bk = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0));
+    const int s = g_anaCombo == 3 ? 1 : (g_anaCombo == 4 ? 2 : 0);   // the one-channel eye's channel
+    const bool tinted = bk.x > 1.5;
+    const int row = (int)bk.y + 1;
+    float busy = 0, off = 0;
+    [loop] for (int x = b.x; x < b.z; ++x)
+    {
+        const float3 c = srgbEncode(saturate(SrcLoad(int3(x, y, 0)).rgb));
+        if (max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b) < 3.0 / 255.0) continue;   // plain grey: says nothing
+        busy += 1;
+        // (The pair: red/cyan g, b; green/magenta r, b; amber/blue r, g.)
+        const float a = s == 0 ? c.g : c.r, bb = s == 2 ? c.g : c.b;
+        if (!tinted) { off += abs(a - bb) > 6.0 / 255.0 ? 1 : 0; continue; }
+        const float4 cur = tintLut(row, (a + bb) * 0.5);
+        off += (abs(a - cur.g) > 10.0 / 255.0 || abs(bb - cur.b) > 10.0 / 255.0) ? 1 : 0;
+    }
+    return float4(busy, off, 0, 0);
+}
+
+// Target kMaxBoxes x 1: .r 1 = still so. (PSAnaBoxRows' result at t2.)
+float4 PSAnaBoxCheck(VSOut i) : SV_Target
+{
+    const int bi = (int)i.pos.x;
+    if (bi >= (int)anaBoxTex.Load(int3(0, 0, 0)).x) return 0;
+    uint W, H; dispTex.GetDimensions(W, H);
+    float busy = 0, off = 0;
+    [loop] for (int y = 0; y < (int)H; ++y) { const float2 v = dispTex.Load(int3(bi, y, 0)).rg; busy += v.x; off += v.y; }
+    const bool tinted = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0)).x > 1.5;
+    // (Black-and-white: as AnalyseAnaPicture, under 2% apart -- a colour
+    // picture is a third or more. One colour: block averages straddling an
+    // edge leave the curve now and then, colour does all over.)
+    // (Next to nothing to judge -- plain page now under it: a black-and-white
+    // box can stay, Mono leaves plain grey as it is; a tint would paint it.)
+    const bool ok = busy < 8 ? !tinted : off <= max(1.0, (tinted ? 0.2 : 0.03) * busy);
+    return ok ? 1 : 0;
+}
+
+// Target 1/16 source size: which boxes (still so, PSAnaBoxCheck at t12) touch
+// each 16x16 block -- .x, .y their index + 1 (0: none). The compose then
+// looks at just those instead of every box for every pixel.
+float4 PSAnaBoxMap(VSOut i) : SV_Target
+{
+    const int n = (int)anaBoxTex.Load(int3(0, 0, 0)).x;
+    const float2 b0 = floor(i.pos.xy) * 16.0 / float2(g_srcW, g_srcH), b1 = b0 + 16.0 / float2(g_srcW, g_srcH);
+    float2 found = 0;
+    [loop] for (int bi = 0; bi < n; ++bi)
+    {
+        if (anaBoxOkTex.Load(int3(bi, 0, 0)).r < 0.5) continue;
+        const float4 br = boxRect(bi);
+        if (br.x >= b1.x || br.z <= b0.x || br.y >= b1.y || br.w <= b0.y) continue;
+        if (found.x == 0) found.x = bi + 1; else { found.y = bi + 1; break; }
+    }
+    return float4(found, 0, 0);
+}
+
 float4 PSAnaSmooth(VSOut i) : SV_Target
 {
     float2 uv = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     float  ty = 1.0 / max(g_coarseH, 1.0);
-    float3 c0 = srcTex.SampleLevel(samp, uv, 0.0).rgb;
+    float3 c0 = SrcSampleLevel(samp, uv, 0.0).rgb;
     float  y0 = anaChanL(c0) + anaChanR(c0);       // both views' channels: luminance proxy
     float2 myConf = dispTex.SampleLevel(samp, uv, 0.0).ba;   // per-eye confidence (.b left, .a right)
 
@@ -445,7 +673,7 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
         const int idx = (dy + R) * 5 + (dx + R);
         float2 nuv = uv + float2((float)dx * tx, (float)dy * ty);
         float4 nd  = dispTex.SampleLevel(samp, nuv, 0.0);
-        float3 nc  = srcTex.SampleLevel(samp, nuv, 0.0).rgb;
+        float3 nc  = SrcSampleLevel(samp, nuv, 0.0).rgb;
         float  ws  = exp(-(float)(dx * dx + dy * dy) / 8.0);   // spatial
         float  wl  = exp(-abs(y0 - (anaChanL(nc) + anaChanR(nc))) * 6.0);      // luminance (edge-aware)
         nds[idx] = nd.rg; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
@@ -470,71 +698,6 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
         d = lerp(d, dispPrevTex.SampleLevel(samp, uv, 0.0).rg, keep);
     }
     return float4(d, myConf.x, myConf.y);
-}
-
-// ----- Where the picture is (anaglyph recovery) ----------------------------
-// The captured area can be more than the 3D picture: a page around it, black
-// bars, a desktop. The search range was 6% of the AREA's width (reaching far
-// past a small picture's real depth: far matches, blobs), matches could land
-// on the page, and the page itself got "recovered" -- colour borrowed into
-// plain grey. These passes find the picture from the anaglyph's own
-// signature: inside it the two eyes' channels disagree at many spots (the
-// colour fringes of anything with depth); a page, bars or plain UI are
-// neutral. Per column and row of the 1/16 picture, the share of such spots;
-// the picture is the span well above the page's. The recovery then searches
-// 6% of the PICTURE's width, keeps matches inside it, and leaves everything
-// outside it as it is. (A whole-screen anaglyph just gives the whole screen.)
-// (A spot counts as picture if the eyes' channels disagree there OR it has any
-// structure -- a page, bars or plain UI are flat. Being generous matters: a
-// real row left out of the rectangle is shown unrecovered.)
-float anaSignature(float3 c) { return abs(anaChanL(c) - anaChanR(c)) > 0.03 ? 1.0 : 0.0; }
-float picEvidence(int x, int y)
-{
-    const float3 c = srcTex.Load(int3(x, y, 0)).rgb;
-    uint W, H; srcTex.GetDimensions(W, H);   // (neighbours clamped: past the edge reads black)
-    const float3 r = srcTex.Load(int3(min(x + 1, (int)W - 1), y, 0)).rgb, d = srcTex.Load(int3(x, min(y + 1, (int)H - 1), 0)).rgb;
-    const float s = max(max(abs(c.r - r.r), abs(c.g - r.g)), max(abs(c.r - d.r), abs(c.g - d.g)));
-    return max(anaSignature(c), s > 0.01 ? 1.0 : 0.0);
-}
-// Target W16 x 1: each column's share.
-float4 PSPicCols(VSOut i) : SV_Target
-{
-    uint W, H; srcTex.GetDimensions(W, H);
-    const int x = (int)i.pos.x; float n = 0;
-    [loop] for (int y = 0; y < (int)H; ++y) n += picEvidence(x, y);
-    return float4(n / H, 0, 0, 0);
-}
-// Target 1 x H16: each row's share.
-float4 PSPicRows(VSOut i) : SV_Target
-{
-    uint W, H; srcTex.GetDimensions(W, H);
-    const int y = (int)i.pos.y; float n = 0;
-    [loop] for (int x = 0; x < (int)W; ++x) n += picEvidence(x, y);
-    return float4(n / W, 0, 0, 0);
-}
-// Target 1x1: the rectangle, in the source's uv. First and last column (row)
-// above a quarter of the busiest one's share (and 2%), padded by one coarse
-// texel (the picture's edge lies somewhere inside that texel). Nothing clear:
-// the whole area.
-float2 picSpan(Texture2D prof, int n, bool rows)
-{
-    float mx = 0;
-    [loop] for (int k = 0; k < n; ++k) mx = max(mx, prof.Load(int3(rows ? 0 : k, rows ? k : 0, 0)).r);
-    const float thr = max(0.1 * mx, 0.01);
-    int a = -1, b = -1;
-    [loop] for (int k2 = 0; k2 < n; ++k2)
-        if (prof.Load(int3(rows ? 0 : k2, rows ? k2 : 0, 0)).r >= thr) { if (a < 0) a = k2; b = k2; }
-    if (a < 0) return float2(0, n);
-    return float2(a, b + 1);   // (texels [a, b] inclusive: the one holding the picture's edge has the edge's structure)
-}
-float4 PSPicRect(VSOut i) : SV_Target
-{
-    uint cw, one, rh, one2;
-    profRowTex.GetDimensions(one, rh); profColTex.GetDimensions(cw, one2);
-    const float2 sx = picSpan(profColTex, (int)cw, false), sy = picSpan(profRowTex, (int)rh, true);
-    // (Coarse texels are 16 source px: to the source's uv.)
-    const float2 k = float2(16.0 / g_srcW, 16.0 / g_srcH);
-    return saturate(float4(sx.x * k.x, sy.x * k.y, sx.y * k.x, sy.y * k.y));
 }
 // (There was a push-pull colour fill here -- confidence-weighted colour
 // pyramids filling low-confidence pixels. Its sampler never read past the
@@ -578,7 +741,7 @@ float3 sampleLanczos3Cell(float2 uvWithinCell, int2 cellMinPx, int2 cellSizePx)
             float w = wx * wy;
             int2 q = clamp(int2(ip.x + dx, ip.y + dy),
                            int2(0, 0), cellSizePx - int2(1, 1));
-            acc  += srcTex.Load(int3(cellMinPx + q, 0)).rgb * w;
+            acc  += SrcLoad(int3(cellMinPx + q, 0)).rgb * w;
             wsum += w;
         }
     }
@@ -587,7 +750,7 @@ float3 sampleLanczos3Cell(float2 uvWithinCell, int2 cellMinPx, int2 cellSizePx)
 
 float4 ConvertCore(VSOut i)
 {
-    if (g_format == 99) return srcTex.Sample(samp, i.uv);   // 1:1 copy (history blit)
+    if (g_format == 99) return SrcSample(samp, i.uv);   // 1:1 copy (history blit)
 
     float2 uv = i.uv;                       // 0..1 across the SBS output
     bool rightPane = uv.x >= 0.5;           // which output half we're filling
@@ -604,34 +767,73 @@ float4 ConvertCore(VSOut i)
     if (g_format == 1)        // Top-and-bottom: top=left, bottom=right
     {
         float2 s = float2(e.x, right ? 0.5 + e.y * 0.5 : e.y * 0.5);
-        return srcTex.Sample(samp, s);
+        return SrcSample(samp, s);
     }
     else if (g_format == 3)   // Row interleaved: even rows=left, odd=right
     {
         float row = floor(e.y * (g_srcH * 0.5)) * 2.0 + (right ? 1.0 : 0.0);
-        return srcTex.Sample(samp, float2(e.x, (row + 0.5) / g_srcH));
+        return SrcSample(samp, float2(e.x, (row + 0.5) / g_srcH));
     }
     else if (g_format == 4)   // Column interleaved: even cols=left, odd=right
     {
-        float col = floor(e.x * (g_srcW * 0.5)) * 2.0 + (right ? 1.0 : 0.0);
-        return srcTex.Sample(samp, float2((col + 0.5) / g_srcW, e.y));
+        // (An eye is every other column: each output pixel is exactly one of
+        // them -- read it as it is.)
+        const int2 sz = int2(g_srcW, g_srcH);
+        const int col = clamp((int)floor(e.x * (g_srcW * 0.5)) * 2 + (right ? 1 : 0), 0, sz.x - 1);
+        return SrcLoad(int3(col, clamp((int)floor(e.y * g_srcH), 0, sz.y - 1), 0));
     }
-    else if (g_format == 5)   // Checkerboard
+    else if (g_format == 5)   // Checkerboard: (x + y) even = left, odd = right
     {
-        float2 sz = float2(g_srcW, g_srcH);
-        float2 p  = floor(e * sz);
-        int parity = ((int)p.x + (int)p.y) & 1;
-        if (parity == (right ? 1 : 0))
-            return srcTex.Sample(samp, (p + 0.5) / sz);
-        // wanted parity is the other texel; average horizontal neighbours
-        float4 a = srcTex.Sample(samp, (float2(p.x + 1, p.y) + 0.5) / sz);
-        float4 b = srcTex.Sample(samp, (float2(p.x - 1, p.y) + 0.5) / sz);
-        return 0.5 * (a + b);
+        // In row y an eye's pixels are x = 2i + ((y + eye) & 1): each output
+        // pixel (an eye is half the width) is exactly one of them -- read it
+        // as it is. (It used to average the two neighbours for half of them:
+        // three reads, and a blur.)
+        const int2 sz = int2(g_srcW, g_srcH);
+        const int y = clamp((int)floor(e.y * g_srcH), 0, sz.y - 1);
+        const int x = clamp((int)floor(e.x * (g_srcW * 0.5)) * 2 + ((y + (right ? 1 : 0)) & 1), 0, sz.x - 1);
+        return SrcLoad(int3(x, y, 0));
     }
     else if (g_format == 2)   // Anaglyph: decode per combo + mode
     {
+        // (Recovery: a block nothing changed near since the last frame keeps
+        // last frame's output -- see PSChange.)
+        if (g_changeSkip > 0.5)
+        {
+            uint cw, chh; changeTex.GetDimensions(cw, chh);
+            if (cw > 0 && changeTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 16.0), 0, int2(cw, chh) - 1), 0)).r < 0.5) discard;
+        }
         int eye = right ? 1 : 0;
-        float3 c = srcTex.Sample(samp, e).rgb;
+        float3 c = SrcSample(samp, e).rgb;
+
+        // A one-colour picture under the whole anaglyph: its tint (tintDecode).
+        if (g_anaMode == 5 && anaTintTex.Load(int3(0, 0, 0)).a > 0.5)   // (no tables bound: Mono below)
+            return float4(tintDecode(c, eye, 0), 1);
+        // Recovered Colour on a page of several: the pictures that were black-and-
+        // white (Mono) or one colour (their tint) are decoded so inside their
+        // boxes (Converter::SetAnaBoxes); the rest is recovered.
+        if (g_anaMode == 4)
+        {
+            // (The boxes touching this 16x16 block, still so this frame: PSAnaBoxMap.)
+            uint mw, mh; anaBoxMapTex.GetDimensions(mw, mh);
+            const float2 cand = mw > 0 ? anaBoxMapTex.Load(int3(min(int2(e * float2(g_srcW, g_srcH) / 16.0), int2(mw, mh) - 1), 0)).xy : 0;
+            [unroll] for (int ci = 0; ci < 2; ++ci)
+            {
+                const int bi = (int)cand[ci] - 1;
+                if (bi < 0) break;
+                const float4 br = boxRect(bi);
+                if (e.x < br.x || e.x > br.z || e.y < br.y || e.y > br.w) continue;
+                const float4 bk = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0));
+                if (bk.x > 1.5)
+                {
+                    // (Plain grey here -- page the box reaches over after a scroll: as
+                    // it is; the tint would paint it.)
+                    const float3 sc = srgbEncode(saturate(c));
+                    if (max(max(sc.r, sc.g), sc.b) - min(min(sc.r, sc.g), sc.b) < 3.0 / 255.0) return float4(c, 1);
+                    return float4(tintDecode(c, eye, (int)bk.y), 1);
+                }
+                if (bk.x > 0.5) return float4(decodeAnaglyph(c, g_anaCombo, eye, 3), 1);
+            }
+        }
 
         // Multi-scale aligned recovery (red/cyan only). Reads the coarse disparity
         // map (PSAnaDisp), refines it at full resolution, checks left-right
@@ -641,11 +843,6 @@ float4 ConvertCore(VSOut i)
         {
             float px = 1.0 / g_srcW;
             float py = 1.0 / g_srcH;
-            // Outside the 3D picture (a page, bars -- see PSPicRect) nothing is
-            // recovered: it's shown as it is, the same in both eyes. (It used to
-            // borrow colour from the picture next to it: blobs on the page.)
-            const float4 picR = picRectSrc();
-            if (e.x < picR.x || e.x > picR.z || e.y < picR.y || e.y > picR.w) return float4(c, 1);
             // Where both eyes see the same plain grey here -- the anaglyph flat and
             // neutral around this pixel -- what's shown already IS each eye's
             // colour: nothing to recover (a page beside the picture, plain grey
@@ -655,7 +852,7 @@ float4 ConvertCore(VSOut i)
                 [unroll] for (int fy = -1; fy <= 1; ++fy)
                 [unroll] for (int fx = -1; fx <= 1; ++fx)
                 {
-                    const float3 q = srcTex.SampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * float2(1.0 / g_srcW, 1.0 / g_srcH), 0).rgb;
+                    const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * float2(px, py), 0).rgb;
                     dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
                     dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
                 }
@@ -707,7 +904,7 @@ float4 ConvertCore(VSOut i)
             float sr[11], sg[11];
             [unroll] for (int q = 0; q < 11; ++q)
             {
-                float3 s = srcTex.SampleLevel(samp, float2(e.x + d0 + (float)(q - 5) * px, e.y), 0).rgb;
+                float3 s = SrcSampleLevel(samp, float2(e.x + d0 + (float)(q - 5) * px, e.y), 0).rgb;
                 sr[q] = anaChanL(s); sg[q] = anaChanR(s);
             }
             float sads[7];
@@ -732,8 +929,6 @@ float4 ConvertCore(VSOut i)
                 float delta = (abs(den) > 1e-5) ? 0.5 * (cm - cp) / den : 0.0;
                 dRef += clamp(delta, -1.0, 1.0) * px;
             }
-            // (The borrow stays inside the picture: beyond its edge is the page.)
-            dRef = clamp(e.x + dRef, picR.x, picR.z - px) - e.x;
 
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
 
@@ -765,14 +960,14 @@ float4 ConvertCore(VSOut i)
             // cross-eye colour across edges -> the persistent borrow-edge
             // marbelling. SIRA's superpixel containment serves the same purpose;
             // luminance-weighting is the shader-feasible analogue.
-            float3 centreC = srcTex.SampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
+            float3 centreC = SrcSampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
             float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
             float3 there = 0;
             float  tw    = 1e-4;
             [unroll] for (int by = -1; by <= 1; ++by)
             [unroll] for (int bx = -1; bx <= 1; ++bx)
             {
-                float3 s = srcTex.SampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+                float3 s = SrcSampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
                 float  sY = dot(s, float3(0.299, 0.587, 0.114));
                 float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
                 there += s * w;
@@ -800,7 +995,7 @@ float4 ConvertCore(VSOut i)
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);   // sharp per-eye luminance
             float3 acc = 0;
             [unroll] for (int k = -4; k <= 4; ++k)
-                acc += srcTex.Sample(samp, float2(e.x + (float)k / g_srcW, e.y)).rgb;
+                acc += SrcSample(samp, float2(e.x + (float)k / g_srcW, e.y)).rgb;
             float3 cb = acc / 9.0;                         // horizontally blurred colour
             float anaY = max(dot(cb, float3(0.299, 0.587, 0.114)), 1e-3);
             return float4(saturate(cb * (eyeY / anaY)), 1);
@@ -809,7 +1004,7 @@ float4 ConvertCore(VSOut i)
     }
     else if (g_format == 6)   // Pulfrich: mono source -> per-eye delay / ND darken
     {
-        float3 cur = srcTex.Sample(samp, e).rgb;
+        float3 cur = SrcSample(samp, e).rgb;
         int eyeIdx = right ? 1 : 0;
         if (eyeIdx != g_pulfEye) return float4(cur, 1);          // unaffected eye = current
         if (g_pulfMode == 1)    return float4(cur * g_ndTrans, 1); // ND: darken this eye
@@ -842,7 +1037,7 @@ float4 ConvertCore(VSOut i)
         float row  = right ? clamp(bottomStart + g_fpEyeAlign + srcRow, bottomStart, totalLines - 1.0)
                            : srcRow;
         float v = (row + 0.5) / totalLines;
-        return srcTex.Sample(samp, float2(e.x, v));
+        return SrcSample(samp, float2(e.x, v));
     }
     else if (g_format == 8)   // Frame sequential: alternating L/R frames over time
     {
@@ -850,7 +1045,7 @@ float4 ConvertCore(VSOut i)
         // previous frame (= the other eye in genuinely frame-sequential content).
         // e.x is the within-pane 0..1, mapping to the full source. Swap eyes flips
         // which eye is current vs previous if the parity is wrong.
-        if (right) return float4(srcTex.Sample(samp, e).rgb, 1);
+        if (right) return float4(SrcSample(samp, e).rgb, 1);
         return float4(srcPrev.Sample(samp, e).rgb, 1);
     }
     else if (g_format == 9)   // Quilt: cols x rows grid of views; pick a pair
@@ -959,7 +1154,7 @@ float4 ConvertCore(VSOut i)
         else
             uv = float2(u, (right ? 0.5 + v * 0.5 : v * 0.5));
 
-        return float4(srcTex.SampleLevel(samp, uv, 0).rgb, 1);
+        return float4(SrcSampleLevel(samp, uv, 0).rgb, 1);
     }
 
     // Default: side-by-side. left=left half, right=right half.
@@ -970,7 +1165,7 @@ float4 ConvertCore(VSOut i)
     float vy = e.y;
     if (g_format == 11) vy = e.y * 0.5 + 0.25;
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, vy);
-    return srcTex.Sample(samp, s);
+    return SrcSample(samp, s);
 }
 
 float4 PSMain(VSOut i) : SV_Target

@@ -8,6 +8,9 @@
 // out.png is the left eye (x < 0: the right eye); with a crop, that part of
 // it, enlarged 2x (nearest) so the pixels can be inspected.
 #include "Converter.h"
+#ifndef ANATEST_HEAD
+#include "ScreenAnalysis.h"
+#endif
 #include <wincodec.h>
 #include <d3d11.h>
 #include <cstdio>
@@ -22,6 +25,69 @@
 #pragma comment(lib, "ole32.lib")
 
 using namespace srw;
+
+// Zero-copy check (ANATEST_RAW=1 with ANATEST_FORMATS): the converter given a
+// plain UNORM view of the same pixels plus SetSourceEncoded -- what SR Loom does
+// with the capture's own frame -- must match the _SRGB view's output. Prints the
+// largest byte difference, how many bytes differ, and both GPU times.
+static std::vector<uint8_t> ReadOutputBytes(ID3D11Device* dev, ID3D11DeviceContext* ctx, Converter& cv)
+{
+    std::vector<uint8_t> out;
+    ID3D11Resource* r = nullptr; cv.OutputSRV()->GetResource(&r);
+    ID3D11Texture2D* ot = nullptr; r->QueryInterface(&ot); r->Release();
+    D3D11_TEXTURE2D_DESC od{}; ot->GetDesc(&od);
+    od.Usage = D3D11_USAGE_STAGING; od.BindFlags = 0; od.CPUAccessFlags = D3D11_CPU_ACCESS_READ; od.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr; dev->CreateTexture2D(&od, nullptr, &st);
+    ctx->CopyResource(st, ot); ot->Release();
+    D3D11_MAPPED_SUBRESOURCE mm{}; ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm);
+    out.resize((size_t)od.Width * od.Height * 4);
+    for (UINT y = 0; y < od.Height; ++y)
+        memcpy(&out[(size_t)y * od.Width * 4], (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch, (size_t)od.Width * 4);
+    ctx->Unmap(st, 0); st->Release();
+    return out;
+}
+
+static double TimeConversions(ID3D11Device* dev, ID3D11DeviceContext* ctx, Converter& cv, ID3D11ShaderResourceView* v, int w, int h)
+{
+    D3D11_QUERY_DESC dq{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, tq{ D3D11_QUERY_TIMESTAMP, 0 };
+    ID3D11Query *dj = nullptr, *q0 = nullptr, *q1 = nullptr;
+    dev->CreateQuery(&dq, &dj); dev->CreateQuery(&tq, &q0); dev->CreateQuery(&tq, &q1);
+    ctx->Begin(dj); ctx->End(q0);
+    for (int k = 0; k < 40; ++k) { cv.SetSourceVersion(0); bool r2 = false; cv.Convert(v, w, h, r2); }
+    ctx->End(q1); ctx->End(dj);
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{}; UINT64 a = 0, b = 0;
+    while (ctx->GetData(dj, &dd, sizeof(dd), 0) != S_OK) Sleep(1);
+    ctx->GetData(q0, &a, sizeof(a), 0); ctx->GetData(q1, &b, sizeof(b), 0);
+    dj->Release(); q0->Release(); q1->Release();
+    return (!dd.Disjoint && dd.Frequency) ? (double)(b - a) / dd.Frequency * 1000.0 / 40.0 : -1.0;
+}
+
+// setup: puts a fresh converter into the mode under test.
+template <typename Setup>
+static void RawCompare(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, ID3D11ShaderResourceView* srgbView,
+                       int w, int h, const char* name, Setup setup)
+{
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd{}; vd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView* raw = nullptr; dev->CreateShaderResourceView(tex, &vd, &raw);
+    Converter a, b; a.Initialize(dev, ctx); b.Initialize(dev, ctx);
+    setup(a); setup(b);
+    b.SetSourceEncoded(true);
+    bool rs = false;
+    a.Convert(srgbView, w, h, rs); a.Convert(srgbView, w, h, rs);
+    b.Convert(raw, w, h, rs); b.Convert(raw, w, h, rs);
+    const auto oa = ReadOutputBytes(dev, ctx, a), ob = ReadOutputBytes(dev, ctx, b);
+    int maxd = 0; size_t over1 = 0, diff = 0;
+    for (size_t i = 0; i < oa.size() && i < ob.size(); ++i)
+    {
+        if ((i & 3) == 3) continue;   // (alpha)
+        const int d = std::abs((int)oa[i] - (int)ob[i]);
+        maxd = (std::max)(maxd, d); if (d) ++diff; if (d > 1) ++over1;
+    }
+    const double ta = TimeConversions(dev, ctx, a, srgbView, w, h), tb = TimeConversions(dev, ctx, b, raw, w, h);
+    wprintf(L"  zero-copy %-22S max diff %d, bytes differing %.4f%% (>1: %.4f%%) | GPU sRGB view %.3f ms, raw+decode %.3f ms\n",
+            name, maxd, 100.0 * diff / (oa.size() * 0.75), 100.0 * over1 / (oa.size() * 0.75), ta, tb);
+    a.Shutdown(); b.Shutdown(); raw->Release();
+}
 
 static bool LoadImageRGBA(const wchar_t* path, std::vector<uint8_t>& px, UINT& w, UINT& h)
 {
@@ -133,6 +199,23 @@ int wmain(int argc, wchar_t** argv)
             w = tw; h = th;
         }
     }
+    // ANATEST_SCALE=w: the input box-scaled to w px wide first (a thumbnail).
+    if (const char* sc = getenv("ANATEST_SCALE"))
+    {
+        const UINT nw = (UINT)atoi(sc), nh = (UINT)((double)h * nw / w);
+        if (nw > 0 && nw < w)
+        {
+            std::vector<uint8_t> o((size_t)nw * nh * 4, 255);
+            for (UINT y = 0; y < nh; ++y) for (UINT x = 0; x < nw; ++x)
+            {
+                const UINT x0 = x * w / nw, x1 = (std::max)(x0 + 1, (x + 1) * w / nw), y0 = y * h / nh, y1 = (std::max)(y0 + 1, (y + 1) * h / nh);
+                UINT acc[3] = {}, n = 0;
+                for (UINT yy = y0; yy < y1; ++yy) for (UINT xx = x0; xx < x1; ++xx) { for (int c = 0; c < 3; ++c) acc[c] += px[((size_t)yy * w + xx) * 4 + c]; ++n; }
+                for (int c = 0; c < 3; ++c) o[((size_t)y * nw + x) * 4 + c] = (uint8_t)(acc[c] / n);
+            }
+            px.swap(o); w = nw; h = nh;
+        }
+    }
     // ANATEST_RIGHT=right.png: the input is a stereo pair's LEFT photo and
     // this its right one (e.g. Middlebury); scored like a quilt pair.
     // ANATEST_HALF=1 halves both first (box 2x2) -- full-size Middlebury
@@ -197,6 +280,17 @@ int wmain(int argc, wchar_t** argv)
             std::vector<uint8_t> canvas((size_t)CW * CH * 4, (uint8_t)grey);
             for (size_t i = 3; i < canvas.size(); i += 4) canvas[i] = 255;
             for (UINT y = 0; y < h; ++y) memcpy(&canvas[((size_t)(oy + y) * CW + ox) * 4], &px[(size_t)y * w * 4], (size_t)w * 4);
+            // ANATEST_UI: a browser-like interface on the canvas -- a coloured
+            // tab bar across the top and a column of colourful icons down the left.
+            if (getenv("ANATEST_UI"))
+            {
+                const uint8_t pal[6][3] = { {220,40,40}, {40,160,60}, {50,90,220}, {240,190,30}, {150,60,200}, {30,180,190} };
+                for (int y = 0; y < 36 && y < CH; ++y) for (int x = 0; x < CW; ++x)
+                { uint8_t* p = &canvas[((size_t)y * CW + x) * 4]; const uint8_t* c = pal[(x / 180) % 6]; p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; }
+                for (int k = 0; k < 14; ++k)
+                    for (int y = 60 + k * 56; y < 60 + k * 56 + 36 && y < CH; ++y) for (int x = 10; x < 46; ++x)
+                    { uint8_t* p = &canvas[((size_t)y * CW + x) * 4]; const uint8_t* c = pal[k % 6]; p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; }
+            }
             px.swap(canvas); canvasGrey = grey;
             picX = (UINT)ox; picY = (UINT)oy;
             w = (UINT)CW; h = (UINT)CH;
@@ -209,6 +303,14 @@ int wmain(int argc, wchar_t** argv)
         for (size_t i = 0; i < px.size(); i += 4) for (int c = 0; c < 3; ++c) s[c] += px[i + c];
         const double n = px.size() / 4.0;
         wprintf(L"input mean r %.1f g %.1f b %.1f\n", s[0] / n, s[1] / n, s[2] / n);
+        // (Greyscale under a red/cyan anaglyph: green = blue everywhere.)
+        double gb = 0, rc = 0;
+        for (size_t i = 0; i < px.size(); i += 4)
+        {
+            gb += std::abs((int)px[i + 1] - (int)px[i + 2]);
+            rc += std::abs((int)px[i] - ((int)px[i + 1] + (int)px[i + 2]) / 2);
+        }
+        wprintf(L"input mean |g-b| %.2f, mean |r-cyan| %.2f\n", gb / n, rc / n);
     }
     if (const wchar_t* si = _wgetenv(L"ANATEST_SAVEIN")) SavePNG(si, px.data(), w, h, w * 4);
 
@@ -339,7 +441,342 @@ int wmain(int argc, wchar_t** argv)
 
     Converter conv;
     if (!conv.Initialize(dev, ctx)) { fwprintf(stderr, L"converter init failed\n"); return 1; }
+#ifndef ANATEST_HEAD
+    // ANATEST_FORMATS=right.png (the input is the pair's left picture): every
+    // packed layout checked end to end. The pair packed the way each layout
+    // defines it, converted, and each output eye scored against the true left
+    // and right pictures (PSNR, at the eye's size). Right: the "left" eye
+    // matches the left picture far better than the right one, and vice versa.
+    if (const wchar_t* fr = _wgetenv(L"ANATEST_FORMATS"))
+    {
+        std::vector<uint8_t> R; UINT rw = 0, rh = 0;
+        if (!LoadImageRGBA(fr, R, rw, rh) || rw != w || rh != h) { fwprintf(stderr, L"right picture must match the left's size\n"); return 1; }
+        const std::vector<uint8_t>& L = px;
+        auto at = [&](const std::vector<uint8_t>& v, int x, int y) { return &v[((size_t)y * w + x) * 4]; };
+        // A picture resampled (box) to ow x oh.
+        auto resample = [&](const std::vector<uint8_t>& v, int ow, int oh) {
+            std::vector<uint8_t> o((size_t)ow * oh * 4);
+            for (int y = 0; y < oh; ++y) for (int x = 0; x < ow; ++x) {
+                const int x0 = x * (int)w / ow, x1 = (std::max)(x0 + 1, (x + 1) * (int)w / ow), y0 = y * (int)h / oh, y1 = (std::max)(y0 + 1, (y + 1) * (int)h / oh);
+                int s[4] = {}, n = 0;
+                for (int yy = y0; yy < y1; ++yy) for (int xx = x0; xx < x1; ++xx) { const uint8_t* p = at(v, xx, yy); for (int c = 0; c < 4; ++c) s[c] += p[c]; ++n; }
+                for (int c = 0; c < 4; ++c) o[((size_t)y * ow + x) * 4 + c] = (uint8_t)(s[c] / n);
+            }
+            return o;
+        };
+        auto psnr = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+            double s = 0; size_t n = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); i += 4) for (int c = 0; c < 3; ++c) { const double d = (double)a[i + c] - b[i + c]; s += d * d; ++n; }
+            return 10.0 * std::log10(255.0 * 255.0 / (std::max)(s / (std::max)(n, (size_t)1), 1e-9));
+        };
+        struct Case { const char* name; StereoFormat f; int sw, sh; };
+        const Case cases[] = {
+            { "half SBS",           StereoFormat::HalfSBS,           (int)w,     (int)h },
+            { "half top-bottom",    StereoFormat::HalfTAB,           (int)w,     (int)h },
+            { "full top-bottom",    StereoFormat::FullTAB,           (int)w,     (int)h * 2 },
+            { "row interleaved",    StereoFormat::RowInterleaved,    (int)w,     (int)h },
+            { "column interleaved", StereoFormat::ColumnInterleaved, (int)w,     (int)h },
+            { "checkerboard",       StereoFormat::Checkerboard,      (int)w,     (int)h },
+            { "full SBS (32:9 in 16:9)", StereoFormat::FullSBS,       (int)w,     (int)h },
+            { "frame packing",      StereoFormat::FramePacking,      (int)w,     (int)h * 2 + (int)h * 45 / 1080 },
+        };
+        for (const Case& c : cases)
+        {
+            // Packed as the layout defines it.
+            std::vector<uint8_t> s((size_t)c.sw * c.sh * 4, 255);
+            auto put = [&](int x, int y, const uint8_t* p) { memcpy(&s[((size_t)y * c.sw + x) * 4], p, 4); };
+            std::vector<uint8_t> Lh, Rh;
+            if (c.f == StereoFormat::HalfSBS) { Lh = resample(L, w / 2, h); Rh = resample(R, w / 2, h); }
+            if (c.f == StereoFormat::HalfTAB) { Lh = resample(L, w, h / 2); Rh = resample(R, w, h / 2); }
+            if (c.f == StereoFormat::FullSBS) { Lh = resample(L, w / 2, h / 2); Rh = resample(R, w / 2, h / 2); }
+            for (int y = 0; y < c.sh; ++y)
+                for (int x = 0; x < c.sw; ++x)
+                {
+                    const uint8_t* p = nullptr;
+                    switch (c.f)
+                    {
+                    case StereoFormat::HalfSBS: p = x < (int)w / 2 ? &Lh[((size_t)y * (w / 2) + x) * 4] : &Rh[((size_t)y * (w / 2) + (std::min)(x - (int)w / 2, (int)w / 2 - 1)) * 4]; break;
+                    case StereoFormat::HalfTAB: p = y < (int)h / 2 ? &Lh[((size_t)y * w + x) * 4] : &Rh[((size_t)(std::min)(y - (int)h / 2, (int)h / 2 - 1) * w + x) * 4]; break;
+                    case StereoFormat::FullTAB: p = y < (int)h ? at(L, x, y) : at(R, x, y - h); break;
+                    case StereoFormat::RowInterleaved: p = (y & 1) ? at(R, x, y) : at(L, x, y); break;
+                    case StereoFormat::ColumnInterleaved: p = (x & 1) ? at(R, x, y) : at(L, x, y); break;
+                    case StereoFormat::Checkerboard: p = ((x + y) & 1) ? at(R, x, y) : at(L, x, y); break;
+                    case StereoFormat::FullSBS:   // (black above and below the 32:9 strip)
+                    {
+                        static const uint8_t black[4] = { 0, 0, 0, 255 };
+                        const int sy = y - (int)h / 4;
+                        if (sy < 0 || sy >= (int)h / 2) { p = black; break; }
+                        p = x < (int)w / 2 ? &Lh[((size_t)sy * (w / 2) + x) * 4] : &Rh[((size_t)sy * (w / 2) + (std::min)(x - (int)w / 2, (int)w / 2 - 1)) * 4];
+                        break;
+                    }
+                    case StereoFormat::FramePacking:   // left eye, gap (black), right eye
+                    {
+                        static const uint8_t black[4] = { 0, 0, 0, 255 };
+                        const int gap = c.sh - 2 * (int)h;
+                        p = y < (int)h ? at(L, x, y) : (y < (int)h + gap ? black : at(R, x, y - (int)h - gap));
+                        break;
+                    }
+                    default: break;
+                    }
+                    put(x, y, p);
+                }
+            D3D11_TEXTURE2D_DESC sd2{};
+            sd2.Width = c.sw; sd2.Height = c.sh; sd2.MipLevels = 1; sd2.ArraySize = 1; sd2.SampleDesc.Count = 1;
+            sd2.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; sd2.Usage = D3D11_USAGE_DEFAULT; sd2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA sdd{ s.data(), (UINT)c.sw * 4, 0 };
+            ID3D11Texture2D* t2 = nullptr; dev->CreateTexture2D(&sd2, &sdd, &t2);
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
+            ID3D11ShaderResourceView* v2 = nullptr; dev->CreateShaderResourceView(t2, &vd2, &v2);
+            Converter cv; cv.Initialize(dev, ctx);
+            cv.SetFormat(c.f, false, 0, 4);
+            if (c.f == StereoFormat::FramePacking) cv.SetFramePacking((float)h / c.sh, (float)(c.sh - 2 * (int)h) / c.sh, 0.0f);
+            bool rs = false; cv.Convert(v2, c.sw, c.sh, rs);
+            // The output, both eyes.
+            ID3D11Resource* r = nullptr; cv.OutputSRV()->GetResource(&r);
+            ID3D11Texture2D* ot = nullptr; r->QueryInterface(&ot); r->Release();
+            D3D11_TEXTURE2D_DESC od{}; ot->GetDesc(&od);
+            od.Usage = D3D11_USAGE_STAGING; od.BindFlags = 0; od.CPUAccessFlags = D3D11_CPU_ACCESS_READ; od.MiscFlags = 0;
+            ID3D11Texture2D* st = nullptr; dev->CreateTexture2D(&od, nullptr, &st);
+            ctx->CopyResource(st, ot); ot->Release();
+            D3D11_MAPPED_SUBRESOURCE mm{}; ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm);
+            const int ew = (int)od.Width / 2, eh = (int)od.Height;
+            std::vector<uint8_t> eL((size_t)ew * eh * 4), eR(eL.size());
+            for (int y = 0; y < eh; ++y)
+            {
+                memcpy(&eL[(size_t)y * ew * 4], (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch, (size_t)ew * 4);
+                memcpy(&eR[(size_t)y * ew * 4], (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch + (size_t)ew * 4, (size_t)ew * 4);
+            }
+            ctx->Unmap(st, 0); st->Release();
+            const auto tL = resample(L, ew, eh), tR = resample(R, ew, eh);
+            const double ll = psnr(eL, tL), lr = psnr(eL, tR), rr = psnr(eR, tR), rl = psnr(eR, tL);
+            const bool ok = ll > lr + 3 && rr > rl + 3;
+            wprintf(L"%-20S eyes %dx%d | left eye: vs left %.1f dB, vs right %.1f | right eye: vs right %.1f, vs left %.1f  -> %s\n",
+                    c.name, ew, eh, ll, lr, rr, rl, ok ? L"OK" : L"WRONG");
+            // (GPU time of one conversion: 40 in a row between timestamps.)
+            {
+                D3D11_QUERY_DESC dq{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, tq{ D3D11_QUERY_TIMESTAMP, 0 };
+                ID3D11Query *dj = nullptr, *t0 = nullptr, *t1 = nullptr;
+                dev->CreateQuery(&dq, &dj); dev->CreateQuery(&tq, &t0); dev->CreateQuery(&tq, &t1);
+                ctx->Begin(dj); ctx->End(t0);
+                for (int k = 0; k < 40; ++k) { cv.SetSourceVersion(0); bool r2 = false; cv.Convert(v2, c.sw, c.sh, r2); }
+                ctx->End(t1); ctx->End(dj);
+                D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{}; UINT64 a = 0, b = 0;
+                while (ctx->GetData(dj, &dd, sizeof(dd), 0) != S_OK) Sleep(1);
+                ctx->GetData(t0, &a, sizeof(a), 0); ctx->GetData(t1, &b, sizeof(b), 0);
+                if (!dd.Disjoint && dd.Frequency) wprintf(L"%-20S GPU %.3f ms per conversion\n", c.name, (double)(b - a) / dd.Frequency * 1000.0 / 40.0);
+                dj->Release(); t0->Release(); t1->Release();
+            }
+            if (_wgetenv(L"ANATEST_RAW"))
+                RawCompare(dev, ctx, t2, v2, c.sw, c.sh, c.name, [&](Converter& x) {
+                    x.SetHalfWidthEyes(true);
+                    x.SetFormat(c.f, false, 0, 4);
+                    if (c.f == StereoFormat::FramePacking) x.SetFramePacking((float)h / c.sh, (float)(c.sh - 2 * (int)h) / c.sh, 0.0f); });
+            cv.Shutdown(); v2->Release(); t2->Release();
+        }
+        // The anaglyph modes' GPU time (a red/cyan anaglyph of the pair).
+        {
+            std::vector<uint8_t> a((size_t)w * h * 4);
+            for (size_t i = 0; i < a.size(); i += 4) { a[i] = L[i]; a[i + 1] = R[i + 1]; a[i + 2] = R[i + 2]; a[i + 3] = 255; }
+            D3D11_TEXTURE2D_DESC sd2{};
+            sd2.Width = w; sd2.Height = h; sd2.MipLevels = 1; sd2.ArraySize = 1; sd2.SampleDesc.Count = 1;
+            sd2.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; sd2.Usage = D3D11_USAGE_DEFAULT; sd2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA sdd{ a.data(), w * 4, 0 };
+            ID3D11Texture2D* t2 = nullptr; dev->CreateTexture2D(&sd2, &sdd, &t2);
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
+            ID3D11ShaderResourceView* v2 = nullptr; dev->CreateShaderResourceView(t2, &vd2, &v2);
+            struct M { const char* name; int mode; bool skip; };
+            const M ms[] = { { "anaglyph DeAnaglyph", 0, false }, { "anaglyph Filtered", 1, false }, { "anaglyph Half Colour", 2, false },
+                             { "anaglyph Mono", 3, false }, { "Recovered, all redrawn", 4, false }, { "Recovered, still page", 4, true } };
+            for (const M& m : ms)
+            {
+                Converter cv; cv.Initialize(dev, ctx);
+                cv.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
+                cv.SetChangeSkip(m.skip);
+                bool r2 = false; cv.Convert(v2, (int)w, (int)h, r2); cv.Convert(v2, (int)w, (int)h, r2);
+                D3D11_QUERY_DESC dq{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, tq{ D3D11_QUERY_TIMESTAMP, 0 };
+                ID3D11Query *dj = nullptr, *q0 = nullptr, *q1 = nullptr;
+                dev->CreateQuery(&dq, &dj); dev->CreateQuery(&tq, &q0); dev->CreateQuery(&tq, &q1);
+                ctx->Begin(dj); ctx->End(q0);
+                for (int k = 0; k < 40; ++k) { cv.SetSourceVersion(0); cv.Convert(v2, (int)w, (int)h, r2); }
+                ctx->End(q1); ctx->End(dj);
+                D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{}; UINT64 x0 = 0, x1 = 0;
+                while (ctx->GetData(dj, &dd, sizeof(dd), 0) != S_OK) Sleep(1);
+                ctx->GetData(q0, &x0, sizeof(x0), 0); ctx->GetData(q1, &x1, sizeof(x1), 0);
+                if (!dd.Disjoint && dd.Frequency) wprintf(L"%-24S GPU %.3f ms per conversion\n", m.name, (double)(x1 - x0) / dd.Frequency * 1000.0 / 40.0);
+                dj->Release(); q0->Release(); q1->Release(); cv.Shutdown();
+                if (_wgetenv(L"ANATEST_RAW"))
+                    RawCompare(dev, ctx, t2, v2, (int)w, (int)h, m.name, [&](Converter& x) {
+                        x.SetHalfWidthEyes(true);
+                        x.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
+                        x.SetChangeSkip(m.skip); });
+            }
+            v2->Release(); t2->Release();
+        }
+        return 0;
+    }
+#endif
     conv.SetFormat(StereoFormat::Anaglyph, false, combo, mode);
+    conv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);   // (full-width eyes: the measurements below assume them)
+#ifndef ANATEST_HEAD
+    // Mode 3 or 5: what the app's check (AnalyseAnaPicture) makes of the whole
+    // image; 5 decodes with its tint tables.
+    if (mode == 3 || mode == 5)
+    {
+        LumaImage li; li.width = (int)w; li.height = (int)h;
+        li.pixels.resize((size_t)w * h); li.red.resize(li.pixels.size()); li.green.resize(li.pixels.size());
+        li.blue.resize(li.pixels.size()); li.cyan.resize(li.pixels.size());
+        for (size_t i = 0; i < li.pixels.size(); ++i)
+        {
+            li.red[i] = px[i * 4]; li.green[i] = px[i * 4 + 1]; li.blue[i] = px[i * 4 + 2];
+            li.cyan[i] = (uint8_t)((li.green[i] + li.blue[i] + 1) / 2);
+            li.pixels[i] = (uint8_t)((li.red[i] * 77 + li.green[i] * 150 + li.blue[i] * 29) >> 8);
+        }
+        std::shared_ptr<const AnaTint> tint;
+        const int kind = AnalyseAnaPicture(li, RECT{ 0, 0, (LONG)w, (LONG)h }, combo, &tint);
+        wprintf(L"picture under the anaglyph: %s\n", kind == 1 ? L"black-and-white" : kind == 2 ? L"one colour" : kind == 0 ? L"colour" : L"can't tell");
+        if (mode == 5 && tint) conv.SetAnaTint(tint->single, tint->missing);
+    }
+    // ANATEST_BOXES (mode 4): a page of several anaglyphs, as the app's manual
+    // check does it -- Auto Stereo's scan for the picture boxes, each checked
+    // (AnalyseAnaPicture), the black-and-white / one-colour ones decoded so
+    // inside their box.
+    static std::vector<std::shared_ptr<const AnaTint>> boxTints;
+    if (mode == 4 && getenv("ANATEST_BOXES"))
+    {
+        // (ANATEST_BOXFROM=page.png: the boxes judged on that frame -- e.g. before
+        // a scroll -- and used on this one.)
+        std::vector<uint8_t> bpx = px; UINT bw = w, bh = h;
+        if (const wchar_t* bf = _wgetenv(L"ANATEST_BOXFROM")) { if (!LoadImageRGBA(bf, bpx, bw, bh) || bw != w || bh != h) bpx = px; }
+        LumaImage li; li.width = (int)w; li.height = (int)h;
+        li.pixels.resize((size_t)w * h); li.red.resize(li.pixels.size()); li.green.resize(li.pixels.size());
+        li.blue.resize(li.pixels.size()); li.cyan.resize(li.pixels.size());
+        for (size_t i = 0; i < li.pixels.size(); ++i)
+        {
+            li.red[i] = bpx[i * 4]; li.green[i] = bpx[i * 4 + 1]; li.blue[i] = bpx[i * 4 + 2];
+            li.cyan[i] = (uint8_t)((li.green[i] + li.blue[i] + 1) / 2);
+            li.pixels[i] = (uint8_t)((li.red[i] * 77 + li.green[i] * 150 + li.blue[i] * 29) >> 8);
+        }
+        ScanWindow sw; sw.bounds = { 0, 0, (LONG)w, (LONG)h };
+        ScanResult res;
+        StereoScanner::Scan(li, { sw }, {}, res);
+        Converter::AnaBox boxes[32]; int nb = 0;
+        for (const ScanHit& hit : res.hits)
+        {
+            std::shared_ptr<const AnaTint> t;
+            const int k = AnalyseAnaPicture(li, hit.rect, combo, &t);
+            wprintf(L"box (%ld,%ld)-(%ld,%ld): %s\n", hit.rect.left, hit.rect.top, hit.rect.right, hit.rect.bottom,
+                    k == 1 ? L"black-and-white" : k == 2 ? L"one colour" : k == 0 ? L"colour" : L"can't tell");
+            if (k < 1 || nb == 32) continue;
+            boxTints.push_back(t);
+            Converter::AnaBox& b = boxes[nb++];
+            const int pad = k == 1 ? 16 : 2;   // (as the app: a black-and-white box reaches past the picture)
+            b.u0 = (hit.rect.left - pad) / (float)w; b.v0 = (hit.rect.top - pad) / (float)h;
+            b.u1 = (hit.rect.right + pad) / (float)w; b.v1 = (hit.rect.bottom + pad) / (float)h;
+            b.checkInsetU = getenv("ANATEST_NOINSET") ? 0.0f : (pad + 2) / (float)w;   // (NOINSET: as before the fix)
+            b.checkInsetV = getenv("ANATEST_NOINSET") ? 0.0f : (pad + 2) / (float)h;
+            b.kind = k;
+            if (t) { b.single = t->single; b.missing = t->missing; b.pairA = t->pairA; b.pairB = t->pairB; }
+        }
+        // (With ANATEST_BOXFROM: that frame converted first, as the app does --
+        // its snapshot the boxes' reference -- so they follow the page to this one.)
+        if (_wgetenv(L"ANATEST_BOXFROM") && bpx.size() == px.size())
+        {
+            ctx->UpdateSubresource(src, 0, nullptr, bpx.data(), w * 4, 0);
+            conv.RequestAnaSnapshot();
+            bool rs0 = false; conv.Convert(srv, (int)w, (int)h, rs0);
+            conv.CommitAnaSnapshot();
+            ctx->UpdateSubresource(src, 0, nullptr, px.data(), w * 4, 0);
+        }
+        conv.SetAnaBoxes(boxes, nb);
+    }
+#endif
+#ifndef ANATEST_HEAD
+    // ANATEST_CHANGETEST=dy,n: only the changed blocks redrawn (PSChange) must
+    // give the same picture as drawing it all. n frames where the right 40% of
+    // the image scrolls dy px a frame (a scrolling pane; the rest still), then
+    // the last frame's output against a fresh converter's single full frame.
+    // Also each frame's GPU time.
+    if (const char* ct = getenv("ANATEST_CHANGETEST"))
+    {
+        int cdy = 0, cn = 0; sscanf_s(ct, "%d,%d", &cdy, &cn);
+        auto frame = [&](int f) {
+            std::vector<uint8_t> o(px);
+            const UINT x0 = w * 6 / 10;
+            for (UINT y = 0; y < h; ++y)
+            {
+                const int sy = (int)y + f * cdy;
+                for (UINT x = x0; x < w; ++x)
+                {
+                    const size_t d = ((size_t)y * w + x) * 4;
+                    if (sy < 0 || sy >= (int)h) { o[d] = o[d + 1] = o[d + 2] = 245; o[d + 3] = 255; }
+                    else memcpy(&o[d], &px[((size_t)sy * w + x) * 4], 4);
+                }
+            }
+            return o;
+        };
+        auto readOut = [&](Converter& c) {
+            ID3D11Resource* r = nullptr; c.OutputSRV()->GetResource(&r);
+            ID3D11Texture2D* t = nullptr; r->QueryInterface(&t); r->Release();
+            D3D11_TEXTURE2D_DESC d{}; t->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ID3D11Texture2D* st = nullptr; dev->CreateTexture2D(&d, nullptr, &st);
+            ctx->CopyResource(st, t); t->Release();
+            D3D11_MAPPED_SUBRESOURCE mm{}; ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm);
+            std::vector<uint8_t> o((size_t)d.Width * d.Height * 4);
+            for (UINT y = 0; y < d.Height; ++y) memcpy(&o[(size_t)y * d.Width * 4], (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch, (size_t)d.Width * 4);
+            ctx->Unmap(st, 0); st->Release();
+            return o;
+        };
+        bool rs = false;
+        double ms[8] = {}; int cnt = 0;
+        conv.TakeRecoveryTimes(ms, cnt);
+        for (int f = 0; f < cn; ++f)
+        {
+            const auto fr = frame(f);
+            ctx->UpdateSubresource(src, 0, nullptr, fr.data(), w * 4, 0);
+            conv.Convert(srv, (int)w, (int)h, rs);
+            ctx->Flush();
+            if (f % 8 == 7) Sleep(20);
+        }
+        Sleep(100);
+        conv.TakeRecoveryTimes(ms, cnt);
+        double tot = 0; for (double v : ms) tot += v;
+        const auto a = readOut(conv);
+        // (Still frames: the same picture again and again.)
+        double msS[8] = {}; int cntS = 0;
+        conv.TakeRecoveryTimes(msS, cntS);
+        for (int f = 0; f < 40; ++f) { conv.Convert(srv, (int)w, (int)h, rs); ctx->Flush(); if (f % 8 == 7) Sleep(20); }
+        Sleep(100);
+        conv.TakeRecoveryTimes(msS, cntS);
+        double totS = 0; for (double v : msS) totS += v;
+        // The same frames with every frame drawn in full.
+        Converter fresh;
+        fresh.Initialize(dev, ctx);
+        fresh.SetFormat(StereoFormat::Anaglyph, false, combo, mode);
+        fresh.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);
+        fresh.SetChangeSkip(false);
+        double msF[8] = {}; int cntF = 0;
+        for (int f = 0; f < cn; ++f)
+        {
+            const auto fr = frame(f);
+            ctx->UpdateSubresource(src, 0, nullptr, fr.data(), w * 4, 0);
+            fresh.Convert(srv, (int)w, (int)h, rs);
+            ctx->Flush();
+            if (f % 8 == 7) Sleep(20);
+        }
+        Sleep(100);
+        fresh.TakeRecoveryTimes(msF, cntF);
+        double totF = 0; for (double v : msF) totF += v;
+        wprintf(L"  (every frame in full: %.2f ms/frame, %d timed)\n", totF, cntF);
+        const auto b = readOut(fresh);
+        long bad = 0; int worst = 0;
+        for (size_t i = 0; i < a.size() && i < b.size(); i += 4)
+            for (int k = 0; k < 3; ++k) { const int dd = std::abs((int)a[i + k] - (int)b[i + k]); worst = (std::max)(worst, dd); if (dd > 8) { ++bad; break; } }
+        wprintf(L"change test: %d frames, part scrolling: recovery %.2f ms/frame (%d timed) | still frames %.2f ms/frame (%d timed) | "
+                L"vs a full redraw: %ld px differ by > 8 of %zu (worst %d)\n", cn, tot, cnt, totS, cntS, bad, a.size() / 4, worst);
+        fresh.Shutdown();
+    }
+#endif
     bool resized = false;
     // ANATEST_SCROLL=dx,dy,n (with a canvas): n frames, the picture moving
     // (dx,dy) px each -- a scroll. Reports the flicker: between each frame
@@ -388,6 +825,13 @@ int wmain(int argc, wchar_t** argv)
     }
     else
     for (int i = 0; i < frames; ++i) conv.Convert(srv, (int)w, (int)h, resized);
+#ifndef ANATEST_HEAD
+    if (getenv("ANATEST_BOXES"))
+    {
+        float ok[32];
+        if (conv.ReadAnaBoxValid(ok)) { wprintf(L"boxes on this frame (per-frame check):"); for (int i = 0; i < (int)boxTints.size() && i < 32; ++i) wprintf(L" %d", ok[i] > 0.5f ? 1 : 0); wprintf(L"\n"); }
+    }
+#endif
 #ifndef ANATEST_HEAD   // (the old converter has no timing read-back)
     // ANATEST_TIME=n: n more frames, then the recovery's GPU time per stage.
     if (const char* tn = getenv("ANATEST_TIME"))
