@@ -20,6 +20,7 @@ Texture2D    changePrevMapTex : register(t14);  // anaglyph recovery: last frame
 Texture2D    changeTex   : register(t15);  // ... which 16x16 blocks to redraw this frame (PSChangeGrow: .r 1)
 Texture2D    anaSnapTex  : register(t16);  // ... the 1/16 source when the boxes were judged (Converter::CommitAnaSnapshot)
 Texture2D    anaShiftTex : register(t17);  // ... how far each box has moved since, this frame (PSAnaBoxShift: .r rows of blocks)
+Texture2D    pairTex     : register(t18);  // Recovered Colour at full width: dRef / conf per pixel pair (PSAnaPair)
 SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
@@ -59,7 +60,7 @@ cbuffer Params : register(b0)
     float g_lvlToSrcY;     // the picture's edge -- a level's uv x this = the picture's uv (>= 1)
     float g_changeSkip;    // anaglyph recovery: 1 = redraw only the blocks changeTex marks (the rest is last frame's)
     float g_srcDecode;     // 1: srcTex is sRGB-encoded read as UNORM (the capture's own frame, SetSourceEncoded) -- decoded on read
-    float _pad_g;
+    float g_pairRefine;    // anaglyph recovery: 1 = the compose reads dRef / conf from pairTex (PSAnaPair)
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
@@ -679,7 +680,7 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
         nds[idx] = nd.rg; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
     }
     float2 d = nds[12]; float bestL = 1e9, bestR = 1e9;
-    [loop] for (int a = 0; a < 25; ++a)
+    [unroll] for (int a = 0; a < 25; ++a)   // (unrolled: nds / nws then stay in registers, not indexed memory)
     {
         float sL = 0, sR = 0;
         [unroll] for (int b = 0; b < 25; ++b) { sL += nws[b] * abs(nds[a].x - nds[b].x); sR += nws[b] * abs(nds[a].y - nds[b].y); }
@@ -748,9 +749,166 @@ float3 sampleLanczos3Cell(float2 uvWithinCell, int2 cellMinPx, int2 cellSizePx)
     return acc / max(wsum, 1e-5);
 }
 
-float4 ConvertCore(VSOut i)
+// (The disparity maps' value here, joint-bilateral upsampled: .r left->right,
+// .g right->left (uv), .b/.a confidence.) Both eyes share it.
+float4 AnaDispAt(float2 e, float3 c)
 {
-    if (g_format == 99) return SrcSample(samp, i.uv);   // 1:1 copy (history blit)
+    // (The disparity levels cover whole 16-px blocks past the picture's
+    // edge: their uv, and their disparities, are the picture's / g_lvlToSrc.)
+    // Edge-aware upsampling (joint bilateral, Kopf et al. 2007): the
+    // 2x2 disparity texels around this pixel (bilinear's), each weighted by how like
+    // this pixel its 4x4 block's colour is. A texel straddling an edge
+    // carries the disparity of whatever dominates it; plain bilinear
+    // handed that to every pixel it covered -- page or background
+    // pixels beside a picture or object took ITS disparity, and their
+    // borrow landed on it: the fringe blobs.
+    float4 dC = 0; float jw = 0;
+    {
+        uint dw, dh; dispTex.GetDimensions(dw, dh);
+        const float2 lp = e / float2(g_lvlToSrcX, g_lvlToSrcY) * float2(dw, dh) - 0.5;   // level texel space
+        const int2 b0 = int2(floor(lp));
+        [unroll] for (int jy = 0; jy <= 1; ++jy)
+        [unroll] for (int jx = 0; jx <= 1; ++jx)
+        {
+            const int2 q = clamp(b0 + int2(jx, jy), int2(0, 0), int2(dw - 1, dh - 1));
+            const float2 dd = abs(lp - (float2)(b0 + int2(jx, jy)));
+            const float ws = max(0.0, 1.0 - dd.x) * max(0.0, 1.0 - dd.y);        // (bilinear's own weights)
+            const float3 qc = srcQ.Load(int3(q, 0)).rgb;
+            const float wc = exp(-dot(abs(qc - c), float3(1, 1, 1)) * 8.0);
+            const float wgt = ws * wc + 1e-6 * ws;
+            dC += dispTex.Load(int3(q, 0)) * wgt; jw += wgt;
+        }
+        dC /= max(jw, 1e-8);
+    }
+    return dC;
+}
+
+// ... the search for one eye, from the disparity maps' start (dC) and the
+// gradient window at e (gradWindow; it gives both eyes' channels).
+void AnaSearch(float2 e, int eye, float4 dC, float rgR[4], float rgG[4], float px, out float dRef, out float conf)
+{
+    float d0 = ((eye == 0) ? dC.r : dC.g) * g_lvlToSrcX; // this eye -> the other
+    // COUPLE the eyes: a region unreliable in EITHER eye is treated unreliable
+    // in BOTH (min), so it's inpainted symmetrically -> no one-eye-clean /
+    // other-eye-splotch rivalry. (Both pyramids are regional averages of the
+    // same scene, so they fill to near-identical colour.)
+    float baseConf = min(dC.b, dC.a);                    // consistency x uniqueness, coupled
+
+
+    // Full-res refine (±3 px) with sub-pixel parabola fit on the cost curve.
+    // The 7 candidates' 5-tap windows (taps and candidates both 1 px apart)
+    // cover just 11 positions: candidate r, tap w sits at d0 + (r + w - 5) px.
+    // Fetch each once -- the same values as a window per candidate, from 11
+    // texture reads instead of 35.
+    float sr[11], sg[11];
+    [unroll] for (int q = 0; q < 11; ++q)
+    {
+        float3 s = SrcSampleLevel(samp, float2(e.x + d0 + (float)(q - 5) * px, e.y), 0).rgb;
+        sr[q] = anaChanL(s); sg[q] = anaChanR(s);
+    }
+    float sads[7];
+    [unroll] for (int r = 0; r < 7; ++r)
+    {
+        float sd = 0.0;
+        [unroll] for (int k2 = 0; k2 < 4; ++k2)
+            sd += (eye == 0) ? abs(rgR[k2] - (sg[r + k2 + 1] - sg[r + k2]))    // left: red ref vs green cand
+                             : abs(rgG[k2] - (sr[r + k2 + 1] - sr[r + k2]));   // right: green ref vs red cand
+        sads[r] = sd;
+    }
+    // (Ties go to the centre -- the disparity from the maps -- not to the
+    // first candidate, which shifted every flat area by -3 px.)
+    [unroll] for (int t0 = 0; t0 < 7; ++t0) sads[t0] += abs((float)(t0 - 3)) * 0.002;
+    int bi = 3; float bs = sads[3];
+    [unroll] for (int t = 0; t < 7; ++t) if (sads[t] < bs) { bs = sads[t]; bi = t; }
+    dRef = d0 + (float)(bi - 3) * px;
+    if (bi > 0 && bi < 6)   // parabola vertex from the two neighbouring costs
+    {
+        float cm = sads[bi - 1], cc0 = sads[bi], cp = sads[bi + 1];
+        float den = cm - 2.0 * cc0 + cp;
+        float delta = (abs(den) > 1e-5) ? 0.5 * (cm - cp) / den : 0.0;
+        dRef += clamp(delta, -1.0, 1.0) * px;
+    }
+
+
+    // Borrow trust: the disparity match relies on the REFERENCE channel (red
+    // for the left eye, green for the right). Where that channel is flat the
+    // match is meaningless and the borrow lands anywhere -> spurious cross-eye
+    // colour (the high-contrast red). Gate ONLY the borrowed channel(s) by the
+    // reference's gradient energy, blending them toward this eye's luminance
+    // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
+    // colour is preserved (this is NOT a global desaturation).
+    // Confidence of this pixel's cross-eye borrow = reference-channel
+    // structure x match quality. Written to ALPHA; the colour-propagation
+    // pass keeps confident pixels and OVERWRITES low-confidence ones (flat
+    // regions, occlusions, spurious-red borrows) with colour diffused from
+    // reliable same-region neighbours -- SIRA-style colorization without
+    // desaturation (real colour) or eye-mixing (no bleed).
+    float refEnergy = 0;
+    [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
+    // x baseConf folds in the disparity map's left-right consistency AND match
+    // uniqueness, so a confidently-WRONG borrow (e.g. ambiguous text strokes,
+    // high contrast but a rival match) is now low-confidence and gets filled.
+    conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
+}
+
+// Recovered Colour: where this pixel's missing colour is in the other eye (dRef,
+// uv x offset) and how far to trust it (conf). The disparity maps give the
+// start; a +-3 px search on the gradients at full resolution pins it down.
+void AnaRefine(float2 e, int eye, float3 c, float px, out float dRef, out float conf)
+{
+    const float4 dC = AnaDispAt(e, c);
+    float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
+    AnaSearch(e, eye, dC, rgR, rgG, px, dRef, conf);
+}
+
+// Recovered Colour at full-width eyes: the refine once per horizontal pixel
+// pair, for both eyes (it was the costliest part of the compose, and the
+// disparity it finds barely changes from one pixel to the next). Both eyes look
+// at the same source pixel unless convergence shifts them apart, so what they
+// share (the pixel, the disparity maps' value, the gradient window) is worked
+// out once. Target: one texel per pair; .rg the left eye's dRef / conf, .ba
+// the right eye's. The compose reads it.
+float4 PSAnaPair(VSOut i) : SV_Target
+{
+    const int ew = (int)g_paneW;
+    const int xe = min((int)i.pos.x * 2, ew - 1);   // (the pair's first pixel)
+    const float2 e = float2(((float)xe + 0.5) / (float)ew, i.uv.y);
+    // (Each eye's place in the source, as ConvertCore works it out.)
+    const float2 eL = float2(e.x + g_convergence, e.y), eR = float2(e.x - g_convergence, e.y);
+    if (g_changeSkip > 0.5)   // (as the compose: unchanged blocks keep last frame's)
+    {
+        uint cw, chh; changeTex.GetDimensions(cw, chh);
+        if (cw > 0 && changeTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 16.0), 0, int2(cw, chh) - 1), 0)).r < 0.5) discard;
+    }
+    const float px = 1.0 / g_srcW;
+    float dL, cL, dR, cR;
+    if (g_convergence == 0.0)
+    {
+        const float3 c = SrcSample(samp, e).rgb;
+        const float4 dC = AnaDispAt(e, c);
+        float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
+        AnaSearch(e, 0, dC, rgR, rgG, px, dL, cL);
+        AnaSearch(e, 1, dC, rgR, rgG, px, dR, cR);
+    }
+    else
+    {
+        AnaRefine(eL, 0, SrcSample(samp, eL).rgb, px, dL, cL);
+        AnaRefine(eR, 1, SrcSample(samp, eR).rgb, px, dR, cR);
+    }
+    return float4(dL, cL, dR, cR);
+}
+
+// forceFmt: compiled for one format alone (>= 0; -1: the format from the
+// constant buffer). Every other format then folds away -- a much smaller shader,
+// so the GPU runs more pixels at once and hides its texture reads better.
+// recoveryOnly: the Recovered Colour compose alone (PSAnaCompose); its per-pixel
+// refine folds away too (PSAnaPair has done it). noRecovery: the anaglyph modes
+// without Recovered Colour.
+float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRecovery = false)
+{
+    const int fmt   = recoveryOnly ? 2 : forceFmt >= 0 ? forceFmt : g_format;
+    const int amode = recoveryOnly ? 4 : g_anaMode;
+    if (fmt == 99) return SrcSample(samp, i.uv);   // 1:1 copy (history blit)
 
     float2 uv = i.uv;                       // 0..1 across the SBS output
     bool rightPane = uv.x >= 0.5;           // which output half we're filling
@@ -764,17 +922,17 @@ float4 ConvertCore(VSOut i)
     // directions, moving the zero-disparity plane in/out of the screen.
     e.x += (right ? -g_convergence : g_convergence);
 
-    if (g_format == 1)        // Top-and-bottom: top=left, bottom=right
+    if (fmt == 1)        // Top-and-bottom: top=left, bottom=right
     {
         float2 s = float2(e.x, right ? 0.5 + e.y * 0.5 : e.y * 0.5);
         return SrcSample(samp, s);
     }
-    else if (g_format == 3)   // Row interleaved: even rows=left, odd=right
+    else if (fmt == 3)   // Row interleaved: even rows=left, odd=right
     {
         float row = floor(e.y * (g_srcH * 0.5)) * 2.0 + (right ? 1.0 : 0.0);
         return SrcSample(samp, float2(e.x, (row + 0.5) / g_srcH));
     }
-    else if (g_format == 4)   // Column interleaved: even cols=left, odd=right
+    else if (fmt == 4)   // Column interleaved: even cols=left, odd=right
     {
         // (An eye is every other column: each output pixel is exactly one of
         // them -- read it as it is.)
@@ -782,18 +940,29 @@ float4 ConvertCore(VSOut i)
         const int col = clamp((int)floor(e.x * (g_srcW * 0.5)) * 2 + (right ? 1 : 0), 0, sz.x - 1);
         return SrcLoad(int3(col, clamp((int)floor(e.y * g_srcH), 0, sz.y - 1), 0));
     }
-    else if (g_format == 5)   // Checkerboard: (x + y) even = left, odd = right
+    else if (fmt == 5)   // Checkerboard: (x + y) even = left, odd = right
     {
-        // In row y an eye's pixels are x = 2i + ((y + eye) & 1): each output
-        // pixel (an eye is half the width) is exactly one of them -- read it
-        // as it is. (It used to average the two neighbours for half of them:
-        // three reads, and a blur.)
+        // Each eye has half the pixels, in a diamond pattern over the whole
+        // picture, so it's rebuilt at full size: its own pixels exactly, and
+        // each missing one from its four neighbours -- all four the same eye's
+        // -- along whichever pair (left/right or up/down) differs less, so an
+        // edge stays sharp. (Taking only the eye's pixel from each column pair
+        // shifted every other row by half a column: zig-zag vertical edges.)
         const int2 sz = int2(g_srcW, g_srcH);
         const int y = clamp((int)floor(e.y * g_srcH), 0, sz.y - 1);
-        const int x = clamp((int)floor(e.x * (g_srcW * 0.5)) * 2 + ((y + (right ? 1 : 0)) & 1), 0, sz.x - 1);
-        return SrcLoad(int3(x, y, 0));
+        const int x = clamp((int)floor(e.x * g_srcW), 0, sz.x - 1);
+        const int eyeBit = right ? 1 : 0;
+        if (((x + y + eyeBit) & 1) == 0) return SrcLoad(int3(x, y, 0));   // (this eye's own pixel)
+        // (At the picture's edge a missing neighbour falls back to the one opposite.)
+        const float3 l = SrcLoad(int3(x > 0 ? x - 1 : x + 1, y, 0)).rgb;
+        const float3 r = SrcLoad(int3(x < sz.x - 1 ? x + 1 : x - 1, y, 0)).rgb;
+        const float3 u = SrcLoad(int3(x, y > 0 ? y - 1 : y + 1, 0)).rgb;
+        const float3 d = SrcLoad(int3(x, y < sz.y - 1 ? y + 1 : y - 1, 0)).rgb;
+        const float dh = dot(abs(l - r), float3(1, 1, 1)), dv = dot(abs(u - d), float3(1, 1, 1));
+        const float3 o = dh < dv * 0.8 ? (l + r) * 0.5 : dv < dh * 0.8 ? (u + d) * 0.5 : (l + r + u + d) * 0.25;
+        return float4(o, 1);
     }
-    else if (g_format == 2)   // Anaglyph: decode per combo + mode
+    else if (fmt == 2)   // Anaglyph: decode per combo + mode
     {
         // (Recovery: a block nothing changed near since the last frame keeps
         // last frame's output -- see PSChange.)
@@ -806,12 +975,12 @@ float4 ConvertCore(VSOut i)
         float3 c = SrcSample(samp, e).rgb;
 
         // A one-colour picture under the whole anaglyph: its tint (tintDecode).
-        if (g_anaMode == 5 && anaTintTex.Load(int3(0, 0, 0)).a > 0.5)   // (no tables bound: Mono below)
+        if (amode == 5 && anaTintTex.Load(int3(0, 0, 0)).a > 0.5)   // (no tables bound: Mono below)
             return float4(tintDecode(c, eye, 0), 1);
         // Recovered Colour on a page of several: the pictures that were black-and-
         // white (Mono) or one colour (their tint) are decoded so inside their
         // boxes (Converter::SetAnaBoxes); the rest is recovered.
-        if (g_anaMode == 4)
+        if (!noRecovery && amode == 4)
         {
             // (The boxes touching this 16x16 block, still so this frame: PSAnaBoxMap.)
             uint mw, mh; anaBoxMapTex.GetDimensions(mw, mh);
@@ -839,7 +1008,7 @@ float4 ConvertCore(VSOut i)
         // map (PSAnaDisp), refines it at full resolution, checks left-right
         // consistency to flag occlusions, then borrows only the disparity-aligned
         // CHROMA (each eye keeps its own sharp luminance) -> de-fringed full colour.
-        if (g_anaMode == 4)   // (any colour pair: see anaChanL / anaChanR)
+        if (!noRecovery && amode == 4)   // (any colour pair: see anaChanL / anaChanR)
         {
             float px = 1.0 / g_srcW;
             float py = 1.0 / g_srcH;
@@ -858,99 +1027,21 @@ float4 ConvertCore(VSOut i)
                 }
                 if (dev < 0.01) return float4(c, 1);
             }
-            // (The disparity levels cover whole 16-px blocks past the picture's
-            // edge: their uv, and their disparities, are the picture's / g_lvlToSrc.)
-            // Edge-aware upsampling (joint bilateral, Kopf et al. 2007): the
-            // 2x2 disparity texels around this pixel (bilinear's), each weighted by how like
-            // this pixel its 4x4 block's colour is. A texel straddling an edge
-            // carries the disparity of whatever dominates it; plain bilinear
-            // handed that to every pixel it covered -- page or background
-            // pixels beside a picture or object took ITS disparity, and their
-            // borrow landed on it: the fringe blobs.
-            float4 dC = 0; float jw = 0;
+            // Where to borrow from (the other eye), and how far to trust it:
+            // worked out once per pixel pair by PSAnaPair when that ran (the
+            // disparity barely changes from one pixel to the next), else here.
+            float dRef, conf;
+            if (recoveryOnly || g_pairRefine > 0.5)
             {
-                uint dw, dh; dispTex.GetDimensions(dw, dh);
-                const float2 lp = e / float2(g_lvlToSrcX, g_lvlToSrcY) * float2(dw, dh) - 0.5;   // level texel space
-                const int2 b0 = int2(floor(lp));
-                [unroll] for (int jy = 0; jy <= 1; ++jy)
-                [unroll] for (int jx = 0; jx <= 1; ++jx)
-                {
-                    const int2 q = clamp(b0 + int2(jx, jy), int2(0, 0), int2(dw - 1, dh - 1));
-                    const float2 dd = abs(lp - (float2)(b0 + int2(jx, jy)));
-                    const float ws = max(0.0, 1.0 - dd.x) * max(0.0, 1.0 - dd.y);        // (bilinear's own weights)
-                    const float3 qc = srcQ.Load(int3(q, 0)).rgb;
-                    const float wc = exp(-dot(abs(qc - c), float3(1, 1, 1)) * 8.0);
-                    const float wgt = ws * wc + 1e-6 * ws;
-                    dC += dispTex.Load(int3(q, 0)) * wgt; jw += wgt;
-                }
-                dC /= max(jw, 1e-8);
+                const int ew = (int)g_paneW;
+                const int ox = (int)i.pos.x, pane = ox >= ew ? 1 : 0;   // (this output pixel: which half, where in it)
+                const float4 pp = pairTex.Load(int3(clamp(ox - pane * ew, 0, ew - 1) / 2, (int)i.pos.y, 0));
+                const float2 pr = eye == 0 ? pp.rg : pp.ba;   // (.rg the left eye's, .ba the right's)
+                dRef = pr.x; conf = pr.y;
             }
-            float d0 = ((eye == 0) ? dC.r : dC.g) * g_lvlToSrcX; // this eye -> the other
-            // COUPLE the eyes: a region unreliable in EITHER eye is treated unreliable
-            // in BOTH (min), so it's inpainted symmetrically -> no one-eye-clean /
-            // other-eye-splotch rivalry. (Both pyramids are regional averages of the
-            // same scene, so they fill to near-identical colour.)
-            float baseConf = min(dC.b, dC.a);                    // consistency x uniqueness, coupled
-
-            // Reference gradient descriptor at e (red for the left eye, green for the
-            // right) for the full-res gradient-matching refine.
-            float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
-
-            // Full-res refine (±3 px) with sub-pixel parabola fit on the cost curve.
-            // The 7 candidates' 5-tap windows (taps and candidates both 1 px apart)
-            // cover just 11 positions: candidate r, tap w sits at d0 + (r + w - 5) px.
-            // Fetch each once -- the same values as a window per candidate, from 11
-            // texture reads instead of 35.
-            float sr[11], sg[11];
-            [unroll] for (int q = 0; q < 11; ++q)
-            {
-                float3 s = SrcSampleLevel(samp, float2(e.x + d0 + (float)(q - 5) * px, e.y), 0).rgb;
-                sr[q] = anaChanL(s); sg[q] = anaChanR(s);
-            }
-            float sads[7];
-            [unroll] for (int r = 0; r < 7; ++r)
-            {
-                float sd = 0.0;
-                [unroll] for (int k2 = 0; k2 < 4; ++k2)
-                    sd += (eye == 0) ? abs(rgR[k2] - (sg[r + k2 + 1] - sg[r + k2]))    // left: red ref vs green cand
-                                     : abs(rgG[k2] - (sr[r + k2 + 1] - sr[r + k2]));   // right: green ref vs red cand
-                sads[r] = sd;
-            }
-            // (Ties go to the centre -- the disparity from the maps -- not to the
-            // first candidate, which shifted every flat area by -3 px.)
-            [unroll] for (int t0 = 0; t0 < 7; ++t0) sads[t0] += abs((float)(t0 - 3)) * 0.002;
-            int bi = 3; float bs = sads[3];
-            [unroll] for (int t = 0; t < 7; ++t) if (sads[t] < bs) { bs = sads[t]; bi = t; }
-            float dRef = d0 + (float)(bi - 3) * px;
-            if (bi > 0 && bi < 6)   // parabola vertex from the two neighbouring costs
-            {
-                float cm = sads[bi - 1], cc0 = sads[bi], cp = sads[bi + 1];
-                float den = cm - 2.0 * cc0 + cp;
-                float delta = (abs(den) > 1e-5) ? 0.5 * (cm - cp) / den : 0.0;
-                dRef += clamp(delta, -1.0, 1.0) * px;
-            }
-
+            else if (!recoveryOnly) AnaRefine(e, eye, c, px, dRef, conf);
+            else { dRef = 0; conf = 0; }   // (PSAnaCompose only runs with PSAnaPair's result)
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
-
-            // Borrow trust: the disparity match relies on the REFERENCE channel (red
-            // for the left eye, green for the right). Where that channel is flat the
-            // match is meaningless and the borrow lands anywhere -> spurious cross-eye
-            // colour (the high-contrast red). Gate ONLY the borrowed channel(s) by the
-            // reference's gradient energy, blending them toward this eye's luminance
-            // when unreliable. Each eye's OWN channel(s) are untouched, so genuine
-            // colour is preserved (this is NOT a global desaturation).
-            // Confidence of this pixel's cross-eye borrow = reference-channel
-            // structure x match quality. Written to ALPHA; the colour-propagation
-            // pass keeps confident pixels and OVERWRITES low-confidence ones (flat
-            // regions, occlusions, spurious-red borrows) with colour diffused from
-            // reliable same-region neighbours -- SIRA-style colorization without
-            // desaturation (real colour) or eye-mixing (no bleed).
-            float refEnergy = 0;
-            [unroll] for (int k = 0; k < 4; ++k) refEnergy += abs((eye == 0) ? rgR[k] : rgG[k]);
-            // x baseConf folds in the disparity map's left-right consistency AND match
-            // uniqueness, so a confidently-WRONG borrow (e.g. ambiguous text strokes,
-            // high contrast but a rival match) is now low-confidence and gets filled.
-            float conf = saturate(refEnergy * 8.0) * saturate(1.0 - bs * 1.2) * baseConf;
 
             // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
             // matched centre tap defines the "patch region"; each neighbour is
@@ -990,19 +1081,26 @@ float4 ConvertCore(VSOut i)
             return float4(saturate(scaled), conf);
         }
 
-        if (g_anaMode == 0 || g_anaMode == 4) // Recovered colour: per-eye luminance + shared,
+        if (amode == 0 || (!noRecovery && amode == 4)) // Recovered colour: per-eye luminance + shared,
         {                                      // horizontally blurred chrominance (reduces fringing).
             float eyeY = anaEyeLuma(c, g_anaCombo, eye);   // sharp per-eye luminance
-            float3 acc = 0;
-            [unroll] for (int k = -4; k <= 4; ++k)
-                acc += SrcSample(samp, float2(e.x + (float)k / g_srcW, e.y)).rgb;
+            // The 9 pixels around it in the row: the centre, and four pairs each
+            // read in one go -- a sample exactly between two pixels is their
+            // average (bilinear) -- the same sum from 5 reads instead of 9.
+            const float h = 1.0 / g_srcW;
+            float3 acc = SrcSample(samp, e).rgb;
+            [unroll] for (int k = 0; k < 2; ++k)
+            {
+                const float o = (1.5 + 2.0 * k) * h;   // (between pixels 1,2 then 3,4 away)
+                acc += 2.0 * (SrcSample(samp, float2(e.x - o, e.y)).rgb + SrcSample(samp, float2(e.x + o, e.y)).rgb);
+            }
             float3 cb = acc / 9.0;                         // horizontally blurred colour
             float anaY = max(dot(cb, float3(0.299, 0.587, 0.114)), 1e-3);
             return float4(saturate(cb * (eyeY / anaY)), 1);
         }
-        return float4(decodeAnaglyph(c, g_anaCombo, eye, g_anaMode), 1);
+        return float4(decodeAnaglyph(c, g_anaCombo, eye, amode), 1);
     }
-    else if (g_format == 6)   // Pulfrich: mono source -> per-eye delay / ND darken
+    else if (fmt == 6)   // Pulfrich: mono source -> per-eye delay / ND darken
     {
         float3 cur = SrcSample(samp, e).rgb;
         int eyeIdx = right ? 1 : 0;
@@ -1023,7 +1121,7 @@ float4 ConvertCore(VSOut i)
     // not the even-split midpoint), and samples at pixel centres so bilinear doesn't
     // bleed in the blanking rows. g_fpEyeAlign is a fractional source-pixel shift on
     // the bottom eye for residual misalignment.
-    else if (g_format == 7)   // HDMI 1.4 frame packing: top eye, gap, bottom eye
+    else if (fmt == 7)   // HDMI 1.4 frame packing: top eye, gap, bottom eye
     {
         float totalLines  = g_srcH;
         float topLines    = floor(g_fpEyeFrac * totalLines + 0.5);
@@ -1039,7 +1137,7 @@ float4 ConvertCore(VSOut i)
         float v = (row + 0.5) / totalLines;
         return SrcSample(samp, float2(e.x, v));
     }
-    else if (g_format == 8)   // Frame sequential: alternating L/R frames over time
+    else if (fmt == 8)   // Frame sequential: alternating L/R frames over time
     {
         // Each eye is a FULL frame. One eye shows the current frame, the other the
         // previous frame (= the other eye in genuinely frame-sequential content).
@@ -1048,7 +1146,7 @@ float4 ConvertCore(VSOut i)
         if (right) return float4(SrcSample(samp, e).rgb, 1);
         return float4(srcPrev.Sample(samp, e).rgb, 1);
     }
-    else if (g_format == 9)   // Quilt: cols x rows grid of views; pick a pair
+    else if (fmt == 9)   // Quilt: cols x rows grid of views; pick a pair
     {
         // Looking Glass convention: views indexed left-to-right, BOTTOM-to-top.
         // View 0 = bottom-left cell = leftmost camera position; view (cols*rows-1)
@@ -1102,7 +1200,7 @@ float4 ConvertCore(VSOut i)
         }
         return float4(result, 1);
     }
-    else if (g_format == 10)  // VR180 / VR360 equirectangular projection
+    else if (fmt == 10)  // VR180 / VR360 equirectangular projection
     {
         // Build a per-eye perspective view from an equirectangular source:
         //   1. The output pane represents a flat camera with horizontal FOV
@@ -1163,15 +1261,36 @@ float4 ConvertCore(VSOut i)
     // displayed on a 16:9 source (screen capture or aspect-fit video).
     // HalfSBS (format 0) treats the whole source as already-shaped SBS.
     float vy = e.y;
-    if (g_format == 11) vy = e.y * 0.5 + 0.25;
+    if (fmt == 11) vy = e.y * 0.5 + 0.25;
     float2 s = float2(right ? 0.5 + e.x * 0.5 : e.x * 0.5, vy);
     return SrcSample(samp, s);
 }
 
 float4 PSMain(VSOut i) : SV_Target
 {
-    float4 r = ConvertCore(i);
+    float4 r = ConvertCoreImpl(i, false);
     // (Anaglyph recovery carries its confidence in alpha; the output is opaque.)
     if (g_format == 2 && g_anaMode == 4) r.a = 1.0;
     return r;
 }
+
+// Recovered Colour's compose on its own (see ConvertCoreImpl): used when
+// PSAnaPair has worked out the refine per pixel pair.
+float4 PSAnaCompose(VSOut i) : SV_Target
+{
+    float4 r = ConvertCoreImpl(i, true);
+    r.a = 1.0;   // (the recovery carries its confidence in alpha; the output is opaque)
+    return r;
+}
+
+// The common formats each compiled on their own (see ConvertCoreImpl): smaller
+// shaders than PSMain, which holds every format. Converter::Convert picks one;
+// the rest (Pulfrich, frame-sequential, Quilt, VR, the history copy) use PSMain.
+float4 PSFmtHalfSBS(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 0); }    // (and Katanga)
+float4 PSFmtFullSBS(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 11); }
+float4 PSFmtTAB(VSOut i)     : SV_Target { return ConvertCoreImpl(i, false, 1); }
+float4 PSFmtRow(VSOut i)     : SV_Target { return ConvertCoreImpl(i, false, 3); }
+float4 PSFmtColumn(VSOut i)  : SV_Target { return ConvertCoreImpl(i, false, 4); }
+float4 PSFmtChecker(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 5); }
+float4 PSFmtFramePack(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 7); }
+float4 PSFmtAnaglyph(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 2, true); }   // (not Recovered Colour)

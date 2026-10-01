@@ -35,6 +35,14 @@ namespace srw
         int Width()  const { return m_width;  }
         int Height() const { return m_height; }
         DXGI_FORMAT Format() const { return m_format; }
+        // The texture holds sRGB colour values but can only be viewed as plain
+        // UNORM (the original Katanga strips the sRGB type from the game's
+        // format): the reader has to decode them (Converter::SetSourceEncoded).
+        bool Encoded() const { return m_encoded; }
+        // Right eye in the left half: the original Katanga's layout (and
+        // geo-11's katanga modes) -- told apart by that same plain 8-bit
+        // format. The 3D Slicer bridge sends sRGB-typed, left eye first.
+        bool RightEyeFirst() const { return m_rightFirst; }
 
         // Bumped every time a (new) shared texture is opened. A publisher
         // that resizes (e.g. the 3D Slicer bridge's render-scale slider)
@@ -63,6 +71,8 @@ namespace srw
         int                       m_width          = 0;
         int                       m_height         = 0;
         DXGI_FORMAT               m_format         = DXGI_FORMAT_UNKNOWN;
+        bool                      m_encoded        = false;
+        bool                      m_rightFirst     = false;
         DWORD                     m_lastPollTick   = 0;
         unsigned                  m_generation     = 0;
     };

@@ -6465,7 +6465,7 @@ namespace
         // Resolve the current source frame: the test image, or a capture frame.
         ID3D11ShaderResourceView* srcSRV = nullptr;
         int srcW = 0, srcH = 0;
-        bool srcEncoded = false;   // srcSRV is the capture's own frame: sRGB read as UNORM (zero-copy)
+        bool srcEncoded = false;   // srcSRV holds sRGB values read as UNORM: the capture's own frame (zero-copy) or a Katanga texture
         bool capSizeChanged = false;
         bool gotFrame = false;   // a new capture frame arrived this iteration
         if (app.source == SourceKind::TestImage)
@@ -6666,7 +6666,7 @@ namespace
                 }
             }
             srcSRV   = app.katanga.SRV();
-            srcEncoded = false;
+            srcEncoded = app.katanga.Encoded();   // (the original Katanga's plain 8-bit texture: decoded in the converter)
             srcW     = app.katanga.Width();
             srcH     = app.katanga.Height();
             gotFrame = nowReceiving;
@@ -6969,7 +6969,9 @@ namespace
         // identity fast path so the weaver's internal bilinear handles any
         // scaling between the game's render res and the output window/display.
         const bool katangaFmt  = (app.format == StereoFormat::Katanga);
-        const bool swapNow = app.swapEyes != ((app.autoEyeSwap && app.fsAutoWindow) || app.manualEyeSwap);   // (+ detected eye order)
+        // (+ detected eye order; + the original Katanga's right-eye-first layout)
+        const bool katangaRightFirst = katangaFmt && app.katanga.IsReceiving() && app.katanga.RightEyeFirst();
+        const bool swapNow = (app.swapEyes != ((app.autoEyeSwap && app.fsAutoWindow) || app.manualEyeSwap)) != katangaRightFirst;
         // (Not the capture's own frame -- zero-copy: that goes through the
         // converter, which decodes it.)
         const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !swapNow && noConv && !srcEncoded;
@@ -7243,9 +7245,12 @@ namespace
                 app.manualAnaSubmitWanted = false;
                 if (app.manualAnaPhase == 3) app.manualAnaPhase = 1;
             }
-            const bool fromCapture = srcSRV && (srcEncoded || srcSRV == app.capture.CopyView());
+            // (The capture's picture: its content version lets an unchanged one skip
+            // the conversion. A Katanga texture has none -- always converted.)
+            const bool fromKatanga = katangaFmt && srcSRV == app.katanga.SRV();
+            const bool fromCapture = srcSRV && !fromKatanga && (srcEncoded || srcSRV == app.capture.CopyView());
             app.converter.SetSourceVersion(fromCapture ? app.capture.ContentVersion() : 0);
-            app.converter.SetSourceEncoded(srcEncoded, srcEncoded ? &app.capture : nullptr);
+            app.converter.SetSourceEncoded(srcEncoded, fromCapture && srcEncoded ? &app.capture : nullptr);
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
                 app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),

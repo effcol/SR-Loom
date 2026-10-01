@@ -128,8 +128,30 @@ bool KatangaSource::TryOpenTexture(HANDLE sharedHandle)
     // Match the SRV format to whatever Katanga sent. For sRGB-typed BGRA the
     // existing weaver pipeline accepts it directly via setInputViewTexture's
     // DXGI_FORMAT parameter.
+    // Colour: a game's 8-bit picture is sRGB-encoded. An sRGB-typed texture is
+    // decoded by the hardware as it is read; a TYPELESS one can be viewed as
+    // sRGB; a plain UNORM one (the original Katanga strips the sRGB type)
+    // can't be -- it's read as it is and decoded in the converter, or it came
+    // out washed out. (Float formats are linear already.)
+    DXGI_FORMAT viewFormat = td.Format;
+    bool encoded = false;
+    switch (td.Format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: viewFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; break;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: viewFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB; break;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: viewFormat = DXGI_FORMAT_B8G8R8X8_UNORM_SRGB; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_UNORM: encoded = true; break;
+    default: break;
+    }
+    // The original Katanga's layout is right eye | left eye, and it's the one
+    // that sends plain 8-bit UNORM (the 3D Slicer bridge: sRGB-typed, left first).
+    const bool rightFirst = (td.Format == DXGI_FORMAT_R8G8B8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format              = td.Format;
+    sd.Format              = viewFormat;
     sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MipLevels = 1;
     ID3D11ShaderResourceView* srv = nullptr;
@@ -140,8 +162,12 @@ bool KatangaSource::TryOpenTexture(HANDLE sharedHandle)
     m_srv    = srv;
     m_width  = (int)td.Width;
     m_height = (int)td.Height;
-    m_format = td.Format;
+    m_format = viewFormat;
+    m_encoded = encoded;
+    m_rightFirst = rightFirst;
     ++m_generation;
+    Log("KatangaSource: %ux%u, format %d -- %s, %s eye first", td.Width, td.Height, (int)td.Format,
+        encoded ? "sRGB decoded in the converter" : "read as it is", rightFirst ? "right" : "left");
     return true;
 }
 
@@ -166,4 +192,5 @@ void KatangaSource::ReleaseTexture()
     m_width  = 0;
     m_height = 0;
     m_format = DXGI_FORMAT_UNKNOWN;
+    m_encoded = m_rightFirst = false;
 }

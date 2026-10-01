@@ -70,9 +70,12 @@ namespace srw
         // (0,0) disables -- panes default to the view's native pixel size and
         // the weaver scales to the panel.
         void SetTargetPaneSize(int w, int h) { m_targetPaneW = w; m_targetPaneH = h; }
-        // Each eye at most half the source's width (default; the display shows no
-        // more). Off: full-width eyes (tools/anatest's quality measurements).
+        // Recovered Colour: each eye at most half the source's width (off by default:
+        // PSAnaPair made full width affordable). (Other modes always keep full width.)
         void SetHalfWidthEyes(bool on) { m_halfWidthEyes = on; }
+        // Recovered Colour at full width: the refine once per pixel pair (default).
+        // Off: per pixel, as before (tools/anatest comparisons).
+        void SetPairRefine(bool on) { m_pairRefineOn = on; }
         // Redraw only what changed since the last frame (default). Off: every
         // frame in full (tools/anatest compares the two).
         void SetChangeSkip(bool on) { m_changeSkipOn = on; }
@@ -102,9 +105,9 @@ namespace srw
         // (the capture's buffers take turns); nullptr = the view itself.
         void SetSourceEncoded(bool encoded, const void* identity = nullptr) { m_srcEncoded = encoded; m_srcIdentity = identity; }
         // Whether the current settings read an encoded source cheaply enough to
-        // beat copying it (4K, measured with anatest ANATEST_RAW): the layouts
-        // and the simple anaglyph modes, a few reads a pixel (+0-0.24 ms vs the
-        // 0.37 ms copy). DeAnaglyph (+2.7 ms) and Recovered (+9.7 ms) read it
+        // beat copying it (4K, measured with anatest ANATEST_RAW, full-width eyes):
+        // the layouts and the simple anaglyph modes (+0-0.2 ms against the 0.37 ms
+        // copy). Frame packing (+0.6), DeAnaglyph (+2 ms) and Recovered read it
         // many times; Quilt, VR and the temporal formats aren't measured.
         bool CheapEncodedSource() const { return CheapEncodedSource(m_fmt, m_anaMode); }
         static bool CheapEncodedSource(StereoFormat fmt, int anaMode)
@@ -114,7 +117,7 @@ namespace srw
             case StereoFormat::FullSBS: case StereoFormat::HalfSBS:
             case StereoFormat::FullTAB: case StereoFormat::HalfTAB:
             case StereoFormat::RowInterleaved: case StereoFormat::ColumnInterleaved:
-            case StereoFormat::Checkerboard: case StereoFormat::FramePacking:
+            case StereoFormat::Checkerboard:
                 return true;
             case StereoFormat::Anaglyph:
                 return anaMode >= 1 && anaMode <= 3;   // (Filtered, Half Colour, Mono)
@@ -139,13 +142,14 @@ namespace srw
             ID3D11RenderTargetView*   rtv = nullptr;
             ID3D11ShaderResourceView* srv = nullptr;
             int w = 0, h = 0;
+            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         };
 
         bool EnsureOutput(int width, int height);
         void ReleaseOutput();
         bool EnsureHistory(int width, int height);
         void ReleaseHistory();
-        bool EnsureDispTarget(DispTarget& t, int width, int height);
+        bool EnsureDispTarget(DispTarget& t, int width, int height, DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT);
         void ReleaseDispTarget(DispTarget& t);
         void ReleaseDisparity();   // releases all disparity levels
         bool EnsureDescTargets(int width, int height);
@@ -162,6 +166,11 @@ namespace srw
         ID3D11PixelShader*       m_psRefine = nullptr;  // pyramid refine from a coarser level
         ID3D11PixelShader*       m_psFill   = nullptr;  // occlusion fill + confidence
         ID3D11PixelShader*       m_psSmooth  = nullptr;  // edge-aware disparity smoothing
+        ID3D11PixelShader*       m_psPair    = nullptr;  // Recovered Colour at full width: the refine per pixel pair (PSAnaPair)
+        ID3D11PixelShader*       m_psAnaCompose = nullptr;  // ... and its compose alone (PSAnaCompose), after PSAnaPair
+        // The common formats' own shaders (PSFmt*: Half SBS / Katanga, Full SBS, TAB,
+        // row, column, checkerboard, frame packing, anaglyph without Recovered).
+        ID3D11PixelShader*       m_psFmt[8] = {};
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -170,6 +179,7 @@ namespace srw
         DispTarget m_disp1;   // refined   (1/4)
         DispTarget m_disp2;   // occlusion-filled (1/4)
         DispTarget m_dispF;   // edge-aware smoothed (1/4); the compose pass reads this
+        DispTarget m_pair;    // ... both eyes' dRef / conf per pixel pair (PSAnaPair; full-width eyes)
         DispTarget m_src4;    // the source averaged down 4x (4x4 blocks) -- what the 1/4 passes read
         DispTarget m_src16;   // ... and 16x (the coarse search)
         DispTarget m_dispPrev;   // last frame's smoothed disparity (video: steadies the next)
@@ -286,7 +296,8 @@ namespace srw
         float        m_quiltRightBlend = 0.0f;          // 0..1 fade from rightIdx to rightIdx+1
         int          m_targetPaneW = 0;                 // SR panel per-eye dims (0 = unset)
         int          m_targetPaneH = 0;
-        bool         m_halfWidthEyes = true;
+        bool         m_halfWidthEyes = false;   // (Recovered Colour: full width since PSAnaPair made it affordable)
+        bool         m_pairRefineOn  = true;
         bool         m_changeSkipOn = true;
         float        m_vrYaw   = 0.0f;                   // VR viewer: yaw (radians)
         float        m_vrPitch = 0.0f;                   // VR viewer: pitch (radians)

@@ -15,6 +15,16 @@
 #include "Converter_PSAnaRefine.h"
 #include "Converter_PSAnaFill.h"
 #include "Converter_PSAnaSmooth.h"
+#include "Converter_PSAnaPair.h"
+#include "Converter_PSAnaCompose.h"
+#include "Converter_PSFmtAnaglyph.h"
+#include "Converter_PSFmtFramePack.h"
+#include "Converter_PSFmtChecker.h"
+#include "Converter_PSFmtColumn.h"
+#include "Converter_PSFmtRow.h"
+#include "Converter_PSFmtTAB.h"
+#include "Converter_PSFmtFullSBS.h"
+#include "Converter_PSFmtHalfSBS.h"
 #include "Converter_PSAnaBoxCheck.h"
 #include "Converter_PSAnaBoxRows.h"
 #include "Converter_PSAnaBoxMap.h"
@@ -67,7 +77,8 @@ namespace
             // shape -- so downstream weaver / LG window samples it 1:1
             // and the content doesn't get anisotropic distortion.
             ew = w / 2; eh = h / 2; break;
-        case StereoFormat::HalfSBS:           ew = w / 2; eh = h;     break;
+        case StereoFormat::HalfSBS:
+        case StereoFormat::Katanga:           ew = w / 2; eh = h;     break;   // (Katanga: side by side, full size per eye)
         case StereoFormat::FullTAB:
         case StereoFormat::HalfTAB:
         case StereoFormat::RowInterleaved:    ew = w;     eh = h / 2; break;
@@ -96,7 +107,7 @@ namespace
                int quiltRightIdx; float paneW; float paneH; float quiltLBlend;
                float quiltRBlend; float vrYaw; float vrPitch; float vrZoom;
                int vrIs360; int vrIsSBS; float temporal; float lvlToSrcX;
-               float lvlToSrcY; float changeSkip; float srcDecode; float _pad_g; };
+               float lvlToSrcY; float changeSkip; float srcDecode; float pairRefine; };
 
 }
 
@@ -121,6 +132,16 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         { g_Converter_PSAnaRefine,    sizeof(g_Converter_PSAnaRefine),    &m_psRefine    },
         { g_Converter_PSAnaFill,      sizeof(g_Converter_PSAnaFill),      &m_psFill      },
         { g_Converter_PSAnaSmooth,    sizeof(g_Converter_PSAnaSmooth),    &m_psSmooth    },
+        { g_Converter_PSAnaPair,      sizeof(g_Converter_PSAnaPair),      &m_psPair      },
+        { g_Converter_PSAnaCompose,   sizeof(g_Converter_PSAnaCompose),   &m_psAnaCompose },
+        { g_Converter_PSFmtAnaglyph, sizeof(g_Converter_PSFmtAnaglyph), &m_psFmt[7] },
+        { g_Converter_PSFmtFramePack, sizeof(g_Converter_PSFmtFramePack), &m_psFmt[6] },
+        { g_Converter_PSFmtChecker, sizeof(g_Converter_PSFmtChecker), &m_psFmt[5] },
+        { g_Converter_PSFmtColumn, sizeof(g_Converter_PSFmtColumn), &m_psFmt[4] },
+        { g_Converter_PSFmtRow, sizeof(g_Converter_PSFmtRow), &m_psFmt[3] },
+        { g_Converter_PSFmtTAB, sizeof(g_Converter_PSFmtTAB), &m_psFmt[2] },
+        { g_Converter_PSFmtFullSBS, sizeof(g_Converter_PSFmtFullSBS), &m_psFmt[1] },
+        { g_Converter_PSFmtHalfSBS, sizeof(g_Converter_PSFmtHalfSBS), &m_psFmt[0] },
         { g_Converter_PSAnaBoxCheck,  sizeof(g_Converter_PSAnaBoxCheck),  &m_psBoxCheck  },
         { g_Converter_PSAnaBoxRows,   sizeof(g_Converter_PSAnaBoxRows),   &m_psBoxRows   },
         { g_Converter_PSAnaBoxMap,    sizeof(g_Converter_PSAnaBoxMap),    &m_psBoxMap    },
@@ -375,13 +396,14 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             eh = 1080;
         }
     }
-    // Each eye at most half the source's width: the SR display interleaves the
-    // two eyes, so an eye never shows more than half the panel's columns --
-    // decoding more is GPU time spent on pixels no eye sees (the anaglyph's
-    // full-width eyes were the single biggest cost of a frame). An output
-    // pixel's centre then falls between two source pixels and the linear
-    // sampler averages them. (Quilt / VR are sized to the panel's pane above.)
-    if (m_halfWidthEyes && m_fmt != StereoFormat::Quilt && !IsVRFormat(m_fmt) && ew > (srcWidth + 1) / 2)
+    // Recovered Colour only: each eye at most half the source's width. Its
+    // disparity search and decode scale with the eye's size (full-width eyes
+    // were the single biggest cost of a frame). Everything else keeps every
+    // column it has: the SR display's slanted lens gives each eye more than
+    // half the panel's columns, so a full-width TAB / row / anaglyph eye shows
+    // more detail than a halved one -- and converting it costs little.
+    const bool recoveredColour = (m_fmt == StereoFormat::Anaglyph && m_anaMode == 4);
+    if (m_halfWidthEyes && recoveredColour && ew > (srcWidth + 1) / 2)
         ew = (srcWidth + 1) / 2;
     if (ew < 1) ew = 1;
     if (eh < 1) eh = 1;
@@ -447,6 +469,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     // UNORM (SetSourceEncoded). The recovery's own levels are linear already.
     const float srcDecode = m_srcEncoded ? 1.0f : 0.0f;
     float decode = 0.0f;
+    float pairRefine = 0.0f;   // (1 while the compose reads the per-pair refine: m_pair, PSAnaPair)
     auto uploadCB = [&](float coarseW, float coarseH, float prop = 0.0f)
     {
         CB cb{ FormatCode(m_fmt), m_swap ? 1 : 0, (float)srcWidth, (float)srcHeight,
@@ -460,7 +483,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                IsVR360(m_fmt) ? 1 : 0, IsVRSBS(m_fmt) ? 1 : 0,
                m_dispPrevValid ? 1.0f : 0.0f,
                anaRecover ? 16.0f * w16 / srcWidth : 1.0f,
-               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, changeSkip, decode, 0 };
+               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, changeSkip, decode, pairRefine };
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
 
@@ -619,12 +642,64 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     if (tSlot >= 0) TimeMark(tSlot, 5);
     // Compose: convert source (delayed frame for Pulfrich, filled disparity map for
     // anaglyph recovery) into the SBS output.
+    // Recovered Colour at full-width eyes: first the refine (where to borrow
+    // from, how far to trust it) once per horizontal pixel pair -- it was the
+    // costliest part of the compose, and it barely changes from one pixel to
+    // the next. The compose then reads it (g_pairRefine); every colour it
+    // takes is still read at full resolution.
     decode = srcDecode;   // (t0 is the source again)
+    if (anaRecover && m_psPair && m_pairRefineOn && ew > (srcWidth + 1) / 2)
+    {
+        const int pairs = (ew + 1) / 2;
+        EnsureDispTarget(m_pair, pairs, eh, DXGI_FORMAT_R32G32B32A32_FLOAT);   // (per pair: both eyes' dRef / conf)
+        if (m_pair.rtv)
+        {
+            uploadCB((float)w4, (float)h4);
+            D3D11_VIEWPORT vp{};
+            vp.Width = (FLOAT)pairs; vp.Height = (FLOAT)eh; vp.MaxDepth = 1.0f;
+            m_context->PSSetShader(m_psPair, nullptr, 0);
+            m_context->OMSetRenderTargets(1, &m_pair.rtv, nullptr);
+            m_context->RSSetViewports(1, &vp);
+            ID3D11ShaderResourceView* srvs[3] = { source, nullptr, m_dispF.srv };
+            m_context->PSSetShaderResources(0, 3, srvs);
+            ID3D11ShaderResourceView* src4 = m_src4.srv;
+            m_context->PSSetShaderResources(9, 1, &src4);
+            ID3D11ShaderResourceView* grow = changeSkip > 0.5f ? m_changeGrow.srv : nullptr;
+            m_context->PSSetShaderResources(15, 1, &grow);
+            m_context->Draw(3, 0);
+            ID3D11ShaderResourceView* nulls[3] = {};
+            m_context->PSSetShaderResources(0, 3, nulls);
+            m_context->PSSetShaderResources(9, 1, nulls);
+            m_context->PSSetShaderResources(15, 1, nulls);
+            m_context->OMSetRenderTargets(0, nullptr, nullptr);
+            pairRefine = 1.0f;
+        }
+    }
+    else ReleaseDispTarget(m_pair);
     uploadCB((float)w4, (float)h4);
     {
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)m_outWidth; vp.Height = (FLOAT)m_outHeight; vp.MaxDepth = 1.0f;
-        m_context->PSSetShader(m_ps, nullptr, 0);
+        // The smallest shader for the job: after PSAnaPair the Recovered-only
+        // compose, else the format's own (PSFmt*), else PSMain (all formats).
+        int fi = -1;
+        switch (m_fmt)
+        {
+        case StereoFormat::HalfSBS: case StereoFormat::Katanga: fi = 0; break;
+        case StereoFormat::FullSBS:                             fi = 1; break;
+        case StereoFormat::FullTAB: case StereoFormat::HalfTAB: fi = 2; break;
+        case StereoFormat::RowInterleaved:                      fi = 3; break;
+        case StereoFormat::ColumnInterleaved:                   fi = 4; break;
+        case StereoFormat::Checkerboard:                        fi = 5; break;
+        case StereoFormat::FramePacking:                        fi = 6; break;
+        case StereoFormat::Anaglyph:                            fi = anaRecover ? -1 : 7; break;
+        default: break;
+        }
+        ID3D11PixelShader* ps = (pairRefine > 0.5f && m_psAnaCompose) ? m_psAnaCompose
+                              : (fi >= 0 && m_psFmt[fi]) ? m_psFmt[fi] : m_ps;
+        m_context->PSSetShader(ps, nullptr, 0);
+        ID3D11ShaderResourceView* pairSrv = pairRefine > 0.5f ? m_pair.srv : nullptr;   // (PSAnaPair's result)
+        m_context->PSSetShaderResources(18, 1, &pairSrv);
         m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
         m_context->RSSetViewports(1, &vp);
         ID3D11ShaderResourceView* srvs[3] = { source, delayedSRV, anaRecover ? m_dispF.srv : nullptr };
@@ -642,7 +717,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(0, 3, nulls);
         ID3D11ShaderResourceView* nulls7[7] = {};
         m_context->PSSetShaderResources(9, 7, nulls7);
-        m_context->PSSetShaderResources(16, 2, nulls7);   // (the boxes' snapshot and shift)
+        m_context->PSSetShaderResources(16, 3, nulls7);   // (the boxes' snapshot and shift, the pair refine)
         m_context->OMSetRenderTargets(0, nullptr, nullptr);
     }
     if (anaRecover)
@@ -735,9 +810,9 @@ void Converter::ReleaseOutput()
     m_outWidth = m_outHeight = 0;
 }
 
-bool Converter::EnsureDispTarget(DispTarget& t, int width, int height)
+bool Converter::EnsureDispTarget(DispTarget& t, int width, int height, DXGI_FORMAT format)
 {
-    if (t.tex && width == t.w && height == t.h)
+    if (t.tex && width == t.w && height == t.h && format == t.fmt)
         return false;
 
     ReleaseDispTarget(t);
@@ -745,13 +820,13 @@ bool Converter::EnsureDispTarget(DispTarget& t, int width, int height)
     D3D11_TEXTURE2D_DESC td{};
     td.Width = (UINT)width; td.Height = (UINT)height;
     td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;   // dLR, dRL (UV), confidence
+    td.Format = format;   // (default RGBA16F: dLR, dRL (UV), confidence)
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(m_device->CreateTexture2D(&td, nullptr, &t.tex))) { ReleaseDispTarget(t); return false; }
     if (FAILED(m_device->CreateRenderTargetView(t.tex, nullptr, &t.rtv))) { ReleaseDispTarget(t); return false; }
     if (FAILED(m_device->CreateShaderResourceView(t.tex, nullptr, &t.srv))) { ReleaseDispTarget(t); return false; }
-    t.w = width; t.h = height;
+    t.w = width; t.h = height; t.fmt = format;
     return true;
 }
 
@@ -865,6 +940,7 @@ void Converter::ReleaseDisparity()
     ReleaseDispTarget(m_disp1);
     ReleaseDispTarget(m_disp2);
     ReleaseDispTarget(m_dispF);
+    ReleaseDispTarget(m_pair);
     ReleaseDescTargets();
     ReleaseDispTarget(m_src4);
     ReleaseDispTarget(m_src16);
@@ -893,6 +969,9 @@ void Converter::Shutdown()
     SAFE_RELEASE(m_psDesc);
     SAFE_RELEASE(m_psDown);
     SAFE_RELEASE(m_psSmooth);
+    SAFE_RELEASE(m_psPair);
+    SAFE_RELEASE(m_psAnaCompose);
+    for (auto*& p : m_psFmt) SAFE_RELEASE(p);
     SAFE_RELEASE(m_tintSRV);
     SAFE_RELEASE(m_tintTex);
     SAFE_RELEASE(m_boxSRV);

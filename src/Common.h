@@ -27,7 +27,7 @@ namespace srw
     // Current SR Loom version. Compared (after stripping any leading 'v') to
     // the GitHub Releases latest-tag by the update checker. Bump in lockstep
     // with the git tag for new releases.
-    constexpr const char* kAppVersion = "3.0";
+    constexpr const char* kAppVersion = "3.1";
 
     // GitHub repo path for the update checker + "About" links.
     constexpr const char* kRepoSlug = "effcol/SR-Loom";

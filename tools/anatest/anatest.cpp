@@ -591,6 +591,7 @@ int wmain(int argc, wchar_t** argv)
             {
                 Converter cv; cv.Initialize(dev, ctx);
                 cv.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
+                cv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);
                 cv.SetChangeSkip(m.skip);
                 bool r2 = false; cv.Convert(v2, (int)w, (int)h, r2); cv.Convert(v2, (int)w, (int)h, r2);
                 D3D11_QUERY_DESC dq{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, tq{ D3D11_QUERY_TIMESTAMP, 0 };
@@ -617,6 +618,8 @@ int wmain(int argc, wchar_t** argv)
 #endif
     conv.SetFormat(StereoFormat::Anaglyph, false, combo, mode);
     conv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);   // (full-width eyes: the measurements below assume them)
+    if (getenv("ANATEST_NOSKIP")) conv.SetChangeSkip(false);   // (every frame redrawn whole: worst-case timing)
+    if (getenv("ANATEST_NOPAIR")) conv.SetPairRefine(false);   // (full-width Recovered Colour: refine per pixel, not per pair)
 #ifndef ANATEST_HEAD
     // Mode 3 or 5: what the app's check (AnalyseAnaPicture) makes of the whole
     // image; 5 decodes with its tint tables.
