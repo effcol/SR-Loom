@@ -52,6 +52,10 @@ namespace srw::Settings
     // frame itself instead of a copy of it (no UI; for comparing).
     // HKCU\Software\SRLoom\ZeroCopyCapture.
     bool ReadZeroCopyCapture();
+    // The render loop on its own thread, apart from the windows' (default ON;
+    // no UI). 0: one thread for both, as before v3.1 -- for comparing, or if
+    // something misbehaves. HKCU\Software\SRLoom\RenderThread. Read at start-up.
+    bool ReadRenderThread();
     // Which SR weaver (default 0): 0 the modern one; 1-3 the legacy one with
     // anti-crosstalk Off / Static / Dynamic (only it has those). Applies when
     // the SR session is next made. HKCUSoftwareSRLoomWeaverChoice.

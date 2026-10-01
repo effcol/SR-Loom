@@ -21,6 +21,8 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <functional>
+#include <type_traits>
 #include "Detector.h"
 #include "Gui.h"
 #include "Settings.h"
@@ -121,6 +123,153 @@ namespace
     constexpr int   kHotkeyAutoRegionDbg = 8; // Ctrl+Alt+Shift+A : same, and save what the finder saw (debug)
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
+    // ---- Render thread / UI thread ---------------------------------------
+    // The UI thread (WinMain's) owns every window and pumps their messages; the
+    // render thread runs the loop body (logic + RenderFrame) and owns none. A
+    // thread that owns windows runs other programs' hooks inside PeekMessage,
+    // and one of those now and then blocks it for 16-30 ms: with the render
+    // loop on that thread, a frame or two was lost every 10-20 s in every mode.
+    //
+    // The two never run SR Loom's code at the same time: one lock (g_appLock)
+    // is held by whichever is running it. The render thread lets go of it
+    // while it waits for the next refresh (most of every frame); a window
+    // procedure takes it for as long as it handles a message. The system's
+    // waits inside PeekMessage happen outside it, so they hold up no frame.
+    //
+    // Windows are only ever changed from the UI thread: the Win32 calls that
+    // do so are replaced below by wrappers of the same name, which run the call
+    // on the UI thread (UiCall) when the render thread makes it.
+    // Settings RenderThread = 0: everything on one thread, as before.
+    std::recursive_timed_mutex g_appLock;
+    std::atomic<bool>    g_threaded{ false };       // the render thread is running
+    DWORD                g_uiThreadId = 0;
+    DWORD                g_renderThreadId = 0;
+    HWND                 g_uiCallWnd = nullptr;     // (message-only; UiCall's target)
+    constexpr UINT       kUiCallMsg = WM_USER + 1;
+    thread_local int     t_appLockDepth = 0;        // this thread's holds of g_appLock
+
+    // (Only the render thread hands its window calls over: the UI thread makes
+    // them itself, and so do helper threads with windows of their own -- the
+    // tray menu's.)
+    inline bool OnRenderThread() { return g_threaded.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_renderThreadId; }
+
+    // Hold the lock for a scope (window procedures, the loop body).
+    struct AppLock
+    {
+        bool held = false;
+        AppLock()
+        {
+            if (!g_threaded.load(std::memory_order_relaxed)) return;
+            if (g_appLock.try_lock()) { held = true; ++t_appLockDepth; return; }
+            // A message SENT by another thread: the sender may be the render
+            // thread itself, blocked inside a window call until this returns
+            // while it holds the lock. Waited for a while; then the message is
+            // handled without it (the render thread, blocked, runs nothing).
+            const bool sent = InSendMessage() != FALSE;
+            const ULONGLONG t0 = GetTickCount64();
+            for (;;)
+            {
+                if (g_appLock.try_lock()) { held = true; ++t_appLockDepth; return; }
+                if (sent && GetTickCount64() - t0 > 250)
+                {
+                    static std::atomic<int> s_logged{ 0 };
+                    if (s_logged.fetch_add(1) < 5)
+                        Log("AppLock: a sent window message waited 250 ms for the render thread -- handled without the lock (is a window call of its not going through UiCall?)");
+                    return;
+                }
+                // (Posted message: let messages sent to this thread in meanwhile --
+                // the render thread's own, if it is waiting on one.)
+                if (!sent) { MSG m; PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE); }
+                if (g_appLock.try_lock_for(std::chrono::milliseconds(2))) { held = true; ++t_appLockDepth; return; }
+            }
+        }
+        ~AppLock() { if (held) { --t_appLockDepth; g_appLock.unlock(); } }
+        AppLock(const AppLock&) = delete;
+        AppLock& operator=(const AppLock&) = delete;
+    };
+
+    // Let go of the lock for a scope: the render loop's waits, and while the
+    // UI thread does something for it. (Only this thread's own outermost hold.)
+    struct AppUnlock
+    {
+        bool did = false;
+        AppUnlock() { if (g_threaded.load(std::memory_order_relaxed) && t_appLockDepth == 1) { did = true; --t_appLockDepth; g_appLock.unlock(); } }
+        ~AppUnlock() { if (did) { g_appLock.lock(); ++t_appLockDepth; } }
+        AppUnlock(const AppUnlock&) = delete;
+        AppUnlock& operator=(const AppUnlock&) = delete;
+    };
+
+    LRESULT CALLBACK UiCallWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+    {
+        if (m == kUiCallMsg)
+        {
+            AppLock lock;
+            (*reinterpret_cast<std::function<void()>*>(l))();
+            return 0;
+        }
+        return DefWindowProcW(h, m, w, l);
+    }
+
+    // Run f on the UI thread and return what it returns. On the UI thread (or
+    // with no render thread) that's a plain call; from the render thread the
+    // lock is let go while the UI thread runs it.
+    template <typename F>
+    auto UiCall(F&& f) -> decltype(f())
+    {
+        if (!OnRenderThread() || !g_uiCallWnd) return f();
+        if constexpr (std::is_void_v<decltype(f())>)
+        {
+            std::function<void()> thunk = [&] { f(); };
+            AppUnlock unlock;
+            SendMessageW(g_uiCallWnd, kUiCallMsg, 0, reinterpret_cast<LPARAM>(&thunk));
+        }
+        else
+        {
+            decltype(f()) result{};
+            std::function<void()> thunk = [&] { result = f(); };
+            { AppUnlock unlock; SendMessageW(g_uiCallWnd, kUiCallMsg, 0, reinterpret_cast<LPARAM>(&thunk)); }
+            return result;
+        }
+    }
+
+    // The window-changing Win32 calls, by way of the UI thread. (Each real one
+    // sends messages to the window's own thread and waits for it; made from
+    // the render thread while it holds the lock, that thread could not answer.)
+    inline BOOL Ui_SetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy, UINT fl)
+    { return UiCall([&] { return ::SetWindowPos(h, after, x, y, cx, cy, fl); }); }
+    inline BOOL Ui_ShowWindow(HWND h, int cmd) { return UiCall([&] { return ::ShowWindow(h, cmd); }); }
+    inline LONG_PTR Ui_SetWindowLongPtrA(HWND h, int idx, LONG_PTR v) { return UiCall([&] { return ::SetWindowLongPtrA(h, idx, v); }); }
+    inline LONG_PTR Ui_SetWindowLongPtrW(HWND h, int idx, LONG_PTR v) { return UiCall([&] { return ::SetWindowLongPtrW(h, idx, v); }); }
+    inline int  Ui_SetWindowRgn(HWND h, HRGN r, BOOL redraw) { return UiCall([&] { return ::SetWindowRgn(h, r, redraw); }); }
+    inline BOOL Ui_DestroyWindow(HWND h) { return UiCall([&] { return ::DestroyWindow(h); }); }
+    inline HWND Ui_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR name, DWORD style, int x, int y, int w, int hgt,
+                                   HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
+    { return UiCall([&] { return ::CreateWindowExA(ex, cls, name, style, x, y, w, hgt, parent, menu, inst, param); }); }
+    inline HWND Ui_CreateWindowExW(DWORD ex, LPCWSTR cls, LPCWSTR name, DWORD style, int x, int y, int w, int hgt,
+                                   HWND parent, HMENU menu, HINSTANCE inst, LPVOID param)
+    { return UiCall([&] { return ::CreateWindowExW(ex, cls, name, style, x, y, w, hgt, parent, menu, inst, param); }); }
+    inline UINT_PTR Ui_SetTimer(HWND h, UINT_PTR id, UINT ms, TIMERPROC proc) { return UiCall([&] { return ::SetTimer(h, id, ms, proc); }); }
+    inline BOOL Ui_KillTimer(HWND h, UINT_PTR id) { return UiCall([&] { return ::KillTimer(h, id); }); }
+    inline BOOL Ui_SetForegroundWindow(HWND h) { return UiCall([&] { return ::SetForegroundWindow(h); }); }
+    // (Mouse capture belongs to a thread: the windows' one.)
+    inline HWND Ui_GetCapture() { return UiCall([] { return ::GetCapture(); }); }
+    inline HWND Ui_SetCapture(HWND h) { return UiCall([&] { return ::SetCapture(h); }); }
+    inline BOOL Ui_ReleaseCapture() { return UiCall([] { return ::ReleaseCapture(); }); }
+#define SetWindowPos        Ui_SetWindowPos
+#define ShowWindow          Ui_ShowWindow
+#define SetWindowLongPtrA   Ui_SetWindowLongPtrA
+#define SetWindowLongPtrW   Ui_SetWindowLongPtrW
+#define SetWindowRgn        Ui_SetWindowRgn
+#define DestroyWindow       Ui_DestroyWindow
+#define CreateWindowExA     Ui_CreateWindowExA
+#define CreateWindowExW     Ui_CreateWindowExW
+#define SetTimer            Ui_SetTimer
+#define KillTimer           Ui_KillTimer
+#define SetForegroundWindow Ui_SetForegroundWindow
+#define GetCapture          Ui_GetCapture
+#define SetCapture          Ui_SetCapture
+#define ReleaseCapture      Ui_ReleaseCapture
+
     // Walk a suspended thread's stack from its context (x64 unwind data).
     // Plain function: __try can't share a frame with C++ objects to unwind.
     // A bad stack (mid-prologue, JIT code) just ends the walk early.
@@ -173,6 +322,8 @@ namespace
         // `what` must be a string literal (or otherwise live forever).
         void Mark(const char* what)
         {
+            // (Only the watched thread's marks: the UI thread has work of its own.)
+            if (m_tid && GetCurrentThreadId() != m_tid) return;
             LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
             m_what = what;
             m_since = q.QuadPart;
@@ -978,6 +1129,7 @@ namespace
 
     LRESULT CALLBACK FsCtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
+        AppLock appLock;   // (see g_appLock)
         switch (msg)
         {
         case WM_PAINT:
@@ -1262,6 +1414,7 @@ namespace
 
     LRESULT CALLBACK FsSetProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
+        AppLock appLock;   // (see g_appLock)
         switch (msg)
         {
         case WM_PAINT:
@@ -1571,6 +1724,7 @@ namespace
 
     LRESULT CALLBACK FsVidProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
+        AppLock appLock;   // (see g_appLock)
         switch (msg)
         {
         case WM_PAINT:
@@ -2798,8 +2952,11 @@ namespace
         auto addCut = [&](const RECT& r, int rad) { cuts.push_back(r); cutRad.push_back(rad); };
         RECT cut{};
 
-        // Taskbar.
-        HWND tb = SrTaskbar(mon);
+        // Taskbar. (Not over the media viewer in Fullscreen: a picture or video
+        // of SR Loom's own fills the screen, as any player's does -- there is
+        // no desktop under it for the taskbar to belong to.)
+        const bool ownMediaFullscreen = app.source == SourceKind::TestImage && app.mode == OutputMode::Fullscreen;
+        HWND tb = ownMediaFullscreen ? nullptr : SrTaskbar(mon);
         RECT tr{};
         if (tb && GetWindowRect(tb, &tr))
         {
@@ -6358,13 +6515,13 @@ namespace
     {
         if (!app.weavingEnabled || !app.renderer.IsValid())
         {
-            Sleep(10);
+            { AppUnlock unlock; Sleep(10); }
             return;
         }
 
         if (IsIconic(app.hwnd))
         {
-            Sleep(10);
+            { AppUnlock unlock; Sleep(10); }
             return;
         }
 
@@ -6399,7 +6556,7 @@ namespace
                 // any drag-induced transient.
                 if (occludedFrames >= 10)
                 {
-                    Sleep(10);
+                    { AppUnlock unlock; Sleep(10); }
                     return;
                 }
             }
@@ -6418,7 +6575,7 @@ namespace
         if (app.prof.lastEnd.time_since_epoch().count() != 0)
             app.prof.outside += std::chrono::duration<double, std::milli>(app.prof.t0 - app.prof.lastEnd).count();
         g_stall.Mark("pace wait (frame latency)");
-        app.renderer.WaitForFrame();
+        { AppUnlock unlock; app.renderer.WaitForFrame(); }   // (the lock is free while the loop waits: see g_appLock)
         // Weaving live capture into a bit-blt window: pace on the capture
         // itself -- wake the moment a new frame lands (it's produced by the
         // composition we'd otherwise be sleeping through in DwmFlush); if
@@ -6441,7 +6598,7 @@ namespace
             const auto tc0 = std::chrono::steady_clock::now();
             const double toBlank = app.renderer.MsToNextVBlank();
             const double budget = toBlank >= 0.0 ? toBlank - 3.0 : 1000.0 / SrRefreshHz(app) - 3.0;
-            if (app.paceOnCapture && (budget < 1.0 || !app.capture.WaitForNewFrame((DWORD)budget)))
+            if (app.paceOnCapture && (budget < 1.0 || ![&] { AppUnlock unlock; return app.capture.WaitForNewFrame((DWORD)budget); }()))
                 app.paceOnCapture = false;   // still screen (or no time): sync to the compositor as usual this loop
             app.prof.lastCaptureWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
         }
@@ -7162,7 +7319,7 @@ namespace
                 }
                 app.converter.SetAnaBoxes(boxes, nb);
             }
-            app.converter.SetConvergence(app.convergence * 0.03f);   // slider -1..1 -> ±3% width per eye
+            app.converter.SetConvergence(app.convergence * 0.03f);   // slider -2..2 -> up to ±6% of the width per eye
             {
                 int ndN = 0; const NdLevel* nd = PulfrichNdLevels(ndN);
                 const float trans = nd[(app.pulfrichNd >= 0 && app.pulfrichNd < ndN) ? app.pulfrichNd : 0].transmission;
@@ -7454,6 +7611,7 @@ namespace
     // who sent it (see LogSlowMessage).
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
+        AppLock appLock;   // (never while the render thread runs the loop body: see g_appLock)
         const auto t0 = std::chrono::steady_clock::now();
         const DWORD sent = InSendMessageEx(nullptr);
         const LRESULT r = WndProcImpl(hwnd, msg, wParam, lParam);
@@ -8320,6 +8478,498 @@ namespace
     }
 }
 
+// One pass of the main loop's work, in two parts so each thread runs its own
+// (see g_appLock): `frame` is the logic and RenderFrame (the render thread's),
+// `panel` the control panel (the UI thread's -- its window is that thread's).
+// With no render thread (Settings RenderThread = 0) one thread runs both.
+// The caller holds the lock; the waits inside let go of it.
+static void LoopBody(AppState& app, bool frame, bool panel)
+{
+    if (frame)
+    {
+        g_stall.Mark("render loop");
+        UpdateInputChoice(app);      // Stereo 3D Input "Automatic Detection"
+        UpdateManualEyeOrder(app);   // (a whole picture's eye order: layouts picked by hand)
+        UpdateManualAnaColour(app);  // (Anaglyph picked by hand: a black-and-white picture under it?)
+        UpdateLastForeground(app);   // remember the user's active window for "make 3D"
+        RenderFrame(app);
+
+    }
+    if (panel)
+    {
+        // Panel just opened -> re-check GitHub for a new release (the
+        // checker's 1-hour throttle keeps this from hammering the API).
+        {
+            static bool s_guiWasVisible = false;
+            const bool guiVisible = app.gui.IsVisible();
+            if (guiVisible && !s_guiWasVisible)
+                UpdateChecker::StartAsync(app.hwnd, WM_APP_UPDATE_RESULT, false);
+            s_guiWasVisible = guiVisible;
+        }
+
+        // Render the control panel when it's open, and pick up its convergence slider.
+        if (app.gui.IsVisible())
+        {
+            GuiState gs;
+            if (!app.pendingUpdateUrl.empty()) gs.updateTag = app.pendingUpdateTag;
+            gs.weaving       = app.weavingEnabled;
+            gs.mode          = app.mode;
+            gs.source        = app.source;
+            gs.format        = app.format;
+            gs.swapEyes      = app.swapEyes;
+            gs.anaglyphCombo = app.anaglyphCombo;
+            gs.anaglyphMode  = app.anaglyphMode;
+            gs.convergence   = app.convergence;
+            gs.pulfrichMode  = (int)app.pulfrichMode;
+            gs.pulfrichDelay = app.pulfrichDelay;
+            gs.pulfrichNd    = app.pulfrichNd;
+            gs.framePackMode = app.framePackMode;
+            gs.srMonitor     = SrMonitor(app);        // "this display" (excluded from the picker)
+            gs.autoStereo    = app.autoDetect;
+            gs.autoInput     = app.autoInput;
+            gs.defaultInput  = app.defaultInput;
+            if (app.autoInput && app.weavingEnabled)
+            {
+                auto addFmt = [&](StereoFormat f) {
+                    for (int i = 0; i < gs.autoFmtCount; ++i) if (gs.autoFmts[i] == f) return;
+                    if (gs.autoFmtCount < 4) gs.autoFmts[gs.autoFmtCount++] = f;
+                };
+                if (app.autoStereo)
+                    for (const WeaveRegion& r : app.regionWeaver.Regions()) addFmt(r.format);
+                else
+                    addFmt(app.format);   // (the whole picture's layout)
+            }
+            gs.captureMonitor = app.sourceMonitor;    // currently-captured display
+            gs.foreignDisplay = app.foreignDisplay;   // a picked display (vs this one) is active
+            gs.quiltCols     = app.quiltCols;
+            gs.quiltRows     = app.quiltRows;
+            gs.hasTestImage  = !app.lastTestImagePath.empty();
+            gs.vrHeadLook        = app.vrHeadLook;
+            gs.vrZoom            = app.vrZoom;
+            gs.vrResetView       = false;
+            gs.vrResetZoom       = false;
+            gs.vrHeadLookChanged = false;
+            // SR Platform runtime version (e.g. "1.34.10.17449") for
+            // the About popup. Static helper; pull it fresh each frame
+            // so a runtime hot-swap (rare) updates the GUI display.
+            static const std::string s_srVersion = [] { const char* v = SRWeaver::GetSRPlatformVersion(); return std::string(v ? v : ""); }();
+            const char* sr = s_srVersion.c_str();
+            strncpy_s(gs.srPlatformVersion, sr ? sr : "", _TRUNCATE);
+            // Light-field parallax-scale state for the GUI slider.
+            gs.lfpHeadLeanMm      = app.lfpHeadLeanMm;
+            gs.lfpApertureMm      = (float)(app.lfpRenderer.ApertureDiameterMetres() * 1e3);
+            gs.lfpHeadLeanChanged = false;
+            // OpenTrack snapshot. Mirror live config + counters into
+            // the GuiState; GUI mutates + sets openTrackChanged on
+            // edit, which we apply below.
+            {
+                auto ot = app.openTrack.GetConfig();
+                gs.openTrackEnabled      = app.openTrack.IsOpenTrackEnabled();
+                gs.freeTrackEnabled      = app.openTrack.IsFreeTrackEnabled();
+                gs.trackIREnabled        = app.openTrack.IsTrackIREnabled();
+                gs.trackIRAvailable      = !app.npClientDir.empty();
+                gs.openTrackSensYaw      = ot.sensYaw;
+                gs.openTrackSensPitch    = ot.sensPitch;
+                gs.openTrackSensRoll     = ot.sensRoll;
+                gs.openTrackMode         = ot.outputMode;
+                gs.openTrackInvertX      = ot.invertX;
+                gs.openTrackInvertY      = ot.invertY;
+                gs.openTrackInvertZ      = ot.invertZ;
+                gs.openTrackInvertYaw    = ot.invertYaw;
+                gs.openTrackInvertPitch  = ot.invertPitch;
+                gs.openTrackInvertRoll   = ot.invertRoll;
+                gs.openTrackChanged      = false;
+                gs.openTrackCalibrate    = false;
+                gs.openTrackSentPackets  = app.openTrack.SentPackets();
+                strncpy_s(gs.openTrackExePath, app.openTrackExePath.c_str(), _TRUNCATE);
+            }
+            // Profiles snapshot: name + includeHT per entry, plus
+            // master toggle. Click flags (save / apply / delete /
+            // toggle-HT / open-ini / autoApply-changed) are RESET
+            // here and READ after Render below -- one-shot events
+            // triggered by user clicks during the frame.
+            {
+                gs.profileEntries.clear();
+                gs.profileEntries.reserve(app.profiles.size());
+                for (const auto& p : app.profiles)
+                {
+                    GuiState::ProfileEntry e;
+                    e.name = p.name;
+                    e.includeHT      = p.includeHeadTracking;
+                    e.fullscreenOnly = p.fullscreenOnly;
+                    e.useAutoFormat  = p.useAutoFormat;
+                    gs.profileEntries.push_back(std::move(e));
+                }
+                gs.profilesAutoApply        = app.profilesAutoApply;
+                gs.profilesAutoApplyChanged = false;
+                gs.profileSaveCurrent       = false;
+                gs.profileApplyIndex        = -1;
+                gs.profileUpdateIndex       = -1;
+                gs.profileDeleteIndex       = -1;
+                gs.profileToggleHTIndex     = -1;
+                gs.profileToggleFullscreenIndex = -1;
+                gs.profileToggleAutoFormatIndex = -1;
+                gs.profilesOpenIni          = false;
+            }
+            // What's being weaved, for the GUI's collapsed summary line.
+            if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
+            {
+                if (GetWindowTextA(app.sourceWindow, gs.sourceName, (int)sizeof(gs.sourceName)) <= 0)
+                    strncpy_s(gs.sourceName, "Window", _TRUNCATE);
+            }
+            else if (app.autoScopeWindow && app.autoStereo && IsWindow(app.autoScopeWindow))
+            {
+                gs.windowScoped = true;   // (Automatic: the chosen window's 3D pictures)
+                if (GetWindowTextA(app.autoScopeWindow, gs.sourceName, (int)sizeof(gs.sourceName)) <= 0)
+                    strncpy_s(gs.sourceName, "Window", _TRUNCATE);
+            }
+            else
+                strncpy_s(gs.sourceName, app.foreignDisplay ? "Display" : "Monitor", _TRUNCATE);
+            const auto tGui0 = std::chrono::steady_clock::now();
+            bool guiChanged = false;
+            // (Drawn with the lock let go: the panel has its own device and reads
+            // only gs; the render thread carries on meanwhile.)
+            { HitchWatch hw("panel"); AppUnlock unlock; guiChanged = app.gui.Render(gs); }
+            app.prof.gui += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tGui0).count();
+            if (guiChanged)
+            {
+                app.convergence   = gs.convergence;
+                app.captureRebind = true;   // re-run the conversion with the new convergence
+            }
+            // VR controls.
+            if (gs.vrHeadLookChanged)
+            {
+                app.vrHeadLook = gs.vrHeadLook;
+                app.captureRebind = true;
+            }
+            if (gs.lfpHeadLeanChanged)
+            {
+                app.lfpHeadLeanMm = gs.lfpHeadLeanMm;
+            }
+            if (gs.vrResetView)
+            {
+                app.vrYaw   = 0.0f;
+                app.vrPitch = 0.0f;
+                app.captureRebind = true;
+            }
+            if (gs.vrResetZoom)
+            {
+                app.vrZoom = 1.0f;
+                app.captureRebind = true;
+            }
+            // OpenTrack/FreeTrack state apply-back.
+            if (gs.openTrackChanged)
+            {
+                // Manual toggle is a user override against the auto-on
+                // policy: if ALL outputs are off, remember that the
+                // user explicitly turned tracking off this session so
+                // we don't auto-re-enable on the next render tick.
+                // TrackIR only counts if its prerequisites are met --
+                // a ticked-but-unavailable TrackIR doesn't keep the
+                // bridge alive.
+                const bool tirEffective = gs.trackIREnabled && gs.trackIRAvailable;
+                app.openTrackUserDisabled =
+                    !(gs.openTrackEnabled || gs.freeTrackEnabled || tirEffective);
+                // Push the new output set to the bridge. SetOutputs is
+                // idempotent and only does work on the delta; failure
+                // (e.g. SR Platform service offline) flips the GuiState
+                // back so the UI doesn't lie about what's running.
+                if (!app.openTrack.SetOutputs(gs.openTrackEnabled,
+                                              gs.freeTrackEnabled,
+                                              tirEffective))
+                {
+                    gs.openTrackEnabled = app.openTrack.IsOpenTrackEnabled();
+                    gs.freeTrackEnabled = app.openTrack.IsFreeTrackEnabled();
+                    gs.trackIREnabled   = app.openTrack.IsTrackIREnabled();
+                }
+                // Config edits (sliders / mode / inverts).
+                if (app.openTrack.IsEnabled())
+                {
+                    auto cfg = app.openTrack.GetConfig();
+                    cfg.sensYaw     = gs.openTrackSensYaw;
+                    cfg.sensPitch   = gs.openTrackSensPitch;
+                    cfg.sensRoll    = gs.openTrackSensRoll;
+                    cfg.outputMode  = gs.openTrackMode;
+                    cfg.invertX     = gs.openTrackInvertX;
+                    cfg.invertY     = gs.openTrackInvertY;
+                    cfg.invertZ     = gs.openTrackInvertZ;
+                    cfg.invertYaw   = gs.openTrackInvertYaw;
+                    cfg.invertPitch = gs.openTrackInvertPitch;
+                    cfg.invertRoll  = gs.openTrackInvertRoll;
+                    app.openTrack.SetConfig(cfg);
+                }
+            }
+            if (gs.openTrackCalibrate)
+                app.openTrack.CalibrateNeutral();
+            // Profiles apply-back: consume click flags from the GUI.
+            if (gs.profilesAutoApplyChanged)
+            {
+                app.profilesAutoApply = gs.profilesAutoApply;
+                Settings::WriteAutoApplyProfiles(app.profilesAutoApply);
+                RefreshForegroundHook(app);
+            }
+            if (gs.profileSaveCurrent)
+                SaveCurrentAsProfile(app);
+            if (gs.profileApplyIndex >= 0 &&
+                (size_t)gs.profileApplyIndex < app.profiles.size())
+            {
+                // Manual apply (tray menu path) -- no captureHwnd,
+                // format-only re-bind. Pass the last external foreground
+                // window's title so auto-format profiles get a useful
+                // hint.
+                const std::string title = WindowTitle(app.lastExternalForeground);
+                ApplyProfile(app, app.profiles[(size_t)gs.profileApplyIndex],
+                             nullptr, title);
+            }
+            if (gs.profileUpdateIndex >= 0 &&
+                (size_t)gs.profileUpdateIndex < app.profiles.size())
+            {
+                // Update: overwrite the selected profile's settings
+                // with the current state. Keeps name + exe + title +
+                // includeHeadTracking; refreshes everything else.
+                // Lets the user "I tweaked the format/swap mid-game,
+                // save those tweaks back to the profile."
+                Profile& p = app.profiles[(size_t)gs.profileUpdateIndex];
+                p.format       = app.format;
+                // Auto-format profiles persist only defaultformat, so
+                // that's where the current format has to go for Update
+                // to stick (it becomes the no-token fallback).
+                if (p.useAutoFormat) p.defaultFormat = app.format;
+                p.swapEyes     = app.swapEyes;
+                p.convergence  = app.convergence;
+                p.anaglyphCombo  = app.anaglyphCombo;
+                p.anaglyphMode   = app.anaglyphMode;
+                p.pulfrichMode   = (int)app.pulfrichMode;
+                p.pulfrichDelay  = app.pulfrichDelay;
+                p.pulfrichNd     = app.pulfrichNd;
+                p.framePackMode  = app.framePackMode;
+                p.quiltCols      = app.quiltCols;
+                p.quiltRows      = app.quiltRows;
+                p.quiltLeftIdx   = app.quiltLeftIdx;
+                p.quiltRightIdx  = app.quiltRightIdx;
+                // Refresh the HT snapshot too if the profile is
+                // currently flagged to carry HT settings -- same
+                // "you're updating the profile, capture everything"
+                // semantic as the per-row HT-on toggle.
+                if (p.includeHeadTracking)
+                {
+                    p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
+                    p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
+                    p.htTrackIR     = app.openTrack.IsTrackIREnabled();
+                    const auto cfg  = app.openTrack.GetConfig();
+                    p.htOutputMode  = cfg.outputMode;
+                    p.htInvertX     = cfg.invertX;
+                    p.htInvertY     = cfg.invertY;
+                    p.htInvertZ     = cfg.invertZ;
+                    p.htInvertYaw   = cfg.invertYaw;
+                    p.htInvertPitch = cfg.invertPitch;
+                    p.htInvertRoll  = cfg.invertRoll;
+                }
+                Profiles::Save(app.profiles);
+                Log("Profiles: updated '%s' from current state", p.name.c_str());
+            }
+            if (gs.profileDeleteIndex >= 0 &&
+                (size_t)gs.profileDeleteIndex < app.profiles.size())
+            {
+                const std::string name = app.profiles[(size_t)gs.profileDeleteIndex].name;
+                Log("Profiles: deleted '%s'", name.c_str());
+                app.profiles.erase(app.profiles.begin() + gs.profileDeleteIndex);
+                Profiles::Save(app.profiles);
+                if (app.lastAppliedProfile == name)
+                    app.lastAppliedProfile.clear();
+                if (app.lastAutoAppliedProfile == name)
+                    app.lastAutoAppliedProfile.clear();
+            }
+            if (gs.profileToggleHTIndex >= 0 &&
+                (size_t)gs.profileToggleHTIndex < app.profiles.size())
+            {
+                Profile& p = app.profiles[(size_t)gs.profileToggleHTIndex];
+                p.includeHeadTracking = !p.includeHeadTracking;
+                // When the user flips includeHT ON, snapshot the
+                // current HT state -- they're saying "remember the
+                // HT setup I have RIGHT NOW for this game". Otherwise
+                // the saved ht_* fields are whatever was there at
+                // save-time, which may be stale.
+                if (p.includeHeadTracking)
+                {
+                    p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
+                    p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
+                    p.htTrackIR     = app.openTrack.IsTrackIREnabled();
+                    const auto cfg  = app.openTrack.GetConfig();
+                    p.htOutputMode  = cfg.outputMode;
+                    p.htInvertX     = cfg.invertX;
+                    p.htInvertY     = cfg.invertY;
+                    p.htInvertZ     = cfg.invertZ;
+                    p.htInvertYaw   = cfg.invertYaw;
+                    p.htInvertPitch = cfg.invertPitch;
+                    p.htInvertRoll  = cfg.invertRoll;
+                }
+                Profiles::Save(app.profiles);
+            }
+            if (gs.profileToggleFullscreenIndex >= 0 &&
+                (size_t)gs.profileToggleFullscreenIndex < app.profiles.size())
+            {
+                Profile& p = app.profiles[(size_t)gs.profileToggleFullscreenIndex];
+                p.fullscreenOnly = !p.fullscreenOnly;
+                Profiles::Save(app.profiles);
+                // If this profile is the one currently auto-applied,
+                // bring the live state in line with the new setting
+                // right away instead of waiting for the next focus change.
+                HWND h = app.lastAppliedHwnd;
+                if (p.name == app.lastAutoAppliedProfile && h)
+                {
+                    if (!p.fullscreenOnly)
+                    {
+                        // Turned OFF: stop the "leave fullscreen -> weave
+                        // off" tracking. Keep the debounce so the poll
+                        // doesn't re-apply over the user's live tweaks.
+                        app.activeFullscreenProfileHwnd = nullptr;
+                    }
+                    else if (IsWindowFullscreen(h))
+                    {
+                        // Turned ON while fullscreen: start tracking, so
+                        // leaving fullscreen turns the weave off.
+                        app.activeFullscreenProfileHwnd = h;
+                    }
+                    else
+                    {
+                        // Turned ON while windowed: the profile no longer
+                        // applies here. Stop weaving that window and reset
+                        // the debounce so going fullscreen re-applies it.
+                        if (app.weavingEnabled &&
+                            app.source == SourceKind::CaptureWindow &&
+                            app.sourceWindow == h)
+                            SetWeaving(app, false);
+                        app.activeFullscreenProfileHwnd = nullptr;
+                        app.lastAppliedHwnd = nullptr;
+                        app.lastAutoAppliedProfile.clear();
+                    }
+                }
+            }
+            if (gs.profileToggleAutoFormatIndex >= 0 &&
+                (size_t)gs.profileToggleAutoFormatIndex < app.profiles.size())
+            {
+                Profile& p = app.profiles[(size_t)gs.profileToggleAutoFormatIndex];
+                p.useAutoFormat = !p.useAutoFormat;
+                // When flipping auto-format ON, seed defaultFormat with
+                // the current saved format so "detection fails" still
+                // yields something sensible (rather than the enum's
+                // default HalfSBS regardless of what the user had set).
+                // Flipping it OFF restores the fixed format from that
+                // fallback (which is what the file actually persists
+                // while Auto is on).
+                if (p.useAutoFormat) p.defaultFormat = p.format;
+                else                 p.format = p.defaultFormat;
+                Profiles::Save(app.profiles);
+            }
+            if (gs.profilesOpenIni)
+            {
+                Profiles::Save(app.profiles);
+                PWSTR base = nullptr;
+                if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) && base)
+                {
+                    std::wstring p = base; CoTaskMemFree(base);
+                    p += L"\\SRLoom\\profiles.ini";
+                    ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
+            }
+        }
+    }
+    if (frame)
+    {
+        // After all GUI / WM_COMMAND state changes have settled,
+        // check if the currently-loaded image / video has had its
+        // stereo settings tweaked -- if so, save the new state back
+        // to its media profile. Throttled internally to avoid INI
+        // hammering on slider drags.
+        AutoSaveMediaProfileIfDirty(app);
+        // Fullscreen-condition profile state tick (throttled to
+        // 250ms internally). Handles enter/exit fullscreen when the
+        // foreground didn't change -- WinEventHook doesn't cover
+        // that case.
+        PollProfileFullscreenState(app);
+        PollKatangaAutoReceive(app);   // throttled to 500ms internally
+        // Late Latching switch (panel): apply to the running weaver.
+        {
+            static DWORD s_last = 0;
+            if (GetTickCount() - s_last > 500)
+            {
+                s_last = GetTickCount();
+                const int want = Settings::ReadLateLatching() ? 1 : 0;
+                if (app.weavingEnabled && want != app.lateLatchingApplied)
+                {
+                    app.weaver.SetLateLatching(want != 0);
+                    app.lateLatchingApplied = want;   // (once, even if the runtime ignores it)
+                }
+                if (!app.weavingEnabled) app.lateLatchingApplied = -1;   // re-apply when it restarts
+                // The SR display's refresh (current mode), and display
+                // settings changes once they've settled (Windows sends a few).
+                PaceForSrRefresh(app);
+                if (app.displayChangedAtMs && GetTickCount64() - app.displayChangedAtMs > 1000)
+                {
+                    app.displayChangedAtMs = 0;
+                    HandleDisplayChange(app);
+                }
+                // Weaving has been off for a while: let the SR session go
+                // (camera off). Kept until now so switching back is instant.
+                if (app.weavingEnabled) app.srStopAtMs = 0;
+                else if (app.srStopAtMs && GetTickCount64() >= app.srStopAtMs)
+                {
+                    app.srStopAtMs = 0;
+                    app.weaver.StopSR();
+                    Log("SR session released (weaving off for %llu s)", kSrKeepAliveMs / 1000);
+                }
+                // Weaver choice (panel): a different weaver needs a new SR session.
+                const int wantWeaver = Settings::ReadWeaverChoice();
+                if (app.weaverChoiceSeen < 0) app.weaverChoiceSeen = wantWeaver;
+                else if (wantWeaver != app.weaverChoiceSeen)
+                {
+                    app.weaverChoiceSeen = wantWeaver;
+                    if (app.weaver.HasWeaver())
+                    {
+                        Log("Weaver choice changed to %d: restarting the SR session", wantWeaver);
+                        app.weaver.StopSR();
+                        app.srStopAtMs = 0;
+                        if (app.weavingEnabled)
+                        {
+                            app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                            const bool katangaArmed = (app.format == StereoFormat::Katanga && !app.katanga.IsReceiving());
+                            if (katangaArmed) app.weaver.LensDisable(); else app.weaver.LensEnable();
+                            app.lateLatchingApplied = -1;
+                            app.captureRebind = true;   // (the new weaver needs its input)
+                        }
+                    }
+                }
+                app.perfLog = Settings::ReadPerfLog();
+                app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
+                const bool skip = Settings::ReadDiagSkipWeave();
+                if (skip != app.diagSkipWeave)
+                {
+                    app.diagSkipWeave = skip;
+                    Log("DIAG: SR weave call %s", skip ? "SKIPPED (diagnostic)" : "restored");
+                }
+            }
+        }
+        // Taskbar cut-out, every frame: when a window goes borderless-
+        // fullscreen (F11) the taskbar vanishes behind it, and a stale
+        // hole would show that window mid-resize (a white/grey box) for
+        // up to a poll interval. Cheap when nothing changed (a few
+        // window-rect reads; SetWindowRgn only on change).
+        UpdateTaskbarCutout(app, false);
+        // Fullscreen apps popping above the weave (throttled to 250ms --
+        // walks the z-order above us).
+        {
+            static DWORD s_lastWeaveZCheckMs = 0;
+            const DWORD nowMs = GetTickCount();
+            if (nowMs - s_lastWeaveZCheckMs >= 250)
+            {
+                s_lastWeaveZCheckMs = nowMs;
+                KeepWeaveAboveFullscreenApps(app);
+            }
+        }
+    }
+}
+
 // Top-level structured-exception handler: writes the exception code and the
 // faulting module name + offset to srweaver.log before the process dies.
 // The offset (RVA = addr - module base) is what matters: ASLR moves the exe
@@ -8883,13 +9533,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     Log("WinMain: StopSR done");
     Log("WinMain: ready — idle in tray, entering main loop");
     g_winWatch.Start();   // background window list for the cut-outs (idle until needed)
-    // The render loop runs on this thread: ahead of normal-priority work (and
-    // well ahead of the Auto Stereo scanner) so it isn't made to skip frames.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-    // ... and registered with the Multimedia Class Scheduler as a game's
-    // render thread: Windows then schedules it promptly even while a video
-    // decodes or a browser scrolls -- a late wake-up is a missed refresh.
-    {
+    // 1 ms timer resolution for this process: waits with short timeouts
+    // (the capture wait, frame pacing) otherwise round up to Windows' 15.6 ms
+    // default tick -- which held the weave to ~64 frames/s on any display.
+    // (Windows 10 2004+ applies this to SR Loom only, not system-wide.)
+    timeBeginPeriod(1);
+
+    // The thread that runs the render loop: ahead of normal-priority work (and
+    // well ahead of the Auto Stereo scanner) so it isn't made to skip frames,
+    // and registered with the Multimedia Class Scheduler as a game's render
+    // thread: Windows then schedules it promptly even while a video decodes or
+    // a browser scrolls -- a late wake-up is a missed refresh.
+    auto setUpRenderThread = [] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
         DWORD taskIndex = 0;
         if (HANDLE mm = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex))
         {
@@ -8897,20 +9553,54 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             Log("WinMain: render thread registered with MMCSS (Games, high)");
         }
         else Log("WinMain: MMCSS registration failed (%lu)", GetLastError());
+        g_stall.Start();   // (logs what the render thread is blocked in when it stalls)
+    };
+
+    // The render loop on a thread of its own, this one keeping the windows
+    // (see g_appLock) -- unless switched off (Settings RenderThread = 0).
+    g_uiThreadId = GetCurrentThreadId();
+    {
+        WNDCLASSW uc{};
+        uc.lpfnWndProc = UiCallWndProc; uc.hInstance = hInstance; uc.lpszClassName = L"SRLoomUiCall";
+        RegisterClassW(&uc);
+        g_uiCallWnd = CreateWindowExW(0, uc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);
     }
-    // 1 ms timer resolution for this process: waits with short timeouts
-    // (the capture wait, frame pacing) otherwise round up to Windows' 15.6 ms
-    // default tick -- which held the weave to ~64 frames/s on any display.
-    // (Windows 10 2004+ applies this to SR Loom only, not system-wide.)
-    timeBeginPeriod(1);
-    g_stall.Start();   // (logs what the render thread is blocked in when it stalls)
+    const bool useRenderThread = Settings::ReadRenderThread() && g_uiCallWnd;
+    Log("WinMain: render loop on %s", useRenderThread ? "its own thread" : "the window thread (RenderThread = 0)");
+    std::atomic<bool> renderRun{ true };
+    std::thread renderThread;
+    if (useRenderThread)
+    {
+        g_threaded = true;
+        renderThread = std::thread([&] {
+            g_renderThreadId = GetCurrentThreadId();   // (before anything that could make a window call)
+            setUpRenderThread();
+            while (renderRun.load())
+            {
+                g_stall.Arm(app.weavingEnabled);
+                g_appLock.lock(); ++t_appLockDepth;
+                LoopBody(app, true, false);            // (lets go of the lock while it waits)
+                --t_appLockDepth; g_appLock.unlock();
+            }
+        });
+    }
+    else setUpRenderThread();
 
     bool running = true;
     while (running)
     {
         MSG msg{};
-        g_stall.Arm(app.weavingEnabled);
-        g_stall.Mark("message pump");
+        if (g_threaded)
+        {
+            // This thread only has the windows' messages and the panel to do:
+            // sleep until a message arrives, or the open panel is due a redraw.
+            MsgWaitForMultipleObjectsEx(0, nullptr, app.gui.IsVisible() ? 4 : 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        else
+        {
+            g_stall.Arm(app.weavingEnabled);
+            g_stall.Mark("message pump");
+        }
         {
             // (Each message is timed on its own: a slow one is logged with
             // its id and which window it was for -- see HitchWatch.)
@@ -8939,7 +9629,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
             // Time not in any dispatched message: messages SENT to our windows
             // (by Windows or other programs), handled inside PeekMessage.
             const double pump = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPump0).count();
-            if (pump - dispatched > 20.0)
+            if (!g_threaded && pump - dispatched > 20.0)   // (with a render thread, this thread's waits hold up no frame)
             {
                 Log("Hitch: messages sent to SR Loom's windows took %.1f ms (running %.1f ms of it)",
                     pump - dispatched, ThreadCpuMs() - cpuPump0 - dispatchedCpu);
@@ -8963,479 +9653,24 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         }
         if (running)
         {
-            g_stall.Mark("render loop");
-            UpdateInputChoice(app);      // Stereo 3D Input "Automatic Detection"
-            UpdateManualEyeOrder(app);   // (a whole picture's eye order: layouts picked by hand)
-            UpdateManualAnaColour(app);  // (Anaglyph picked by hand: a black-and-white picture under it?)
-            UpdateLastForeground(app);   // remember the user's active window for "make 3D"
-            RenderFrame(app);
-
-            // Panel just opened -> re-check GitHub for a new release (the
-            // checker's 1-hour throttle keeps this from hammering the API).
-            {
-                static bool s_guiWasVisible = false;
-                const bool guiVisible = app.gui.IsVisible();
-                if (guiVisible && !s_guiWasVisible)
-                    UpdateChecker::StartAsync(app.hwnd, WM_APP_UPDATE_RESULT, false);
-                s_guiWasVisible = guiVisible;
-            }
-
-            // Render the control panel when it's open, and pick up its convergence slider.
-            if (app.gui.IsVisible())
-            {
-                GuiState gs;
-                if (!app.pendingUpdateUrl.empty()) gs.updateTag = app.pendingUpdateTag;
-                gs.weaving       = app.weavingEnabled;
-                gs.mode          = app.mode;
-                gs.source        = app.source;
-                gs.format        = app.format;
-                gs.swapEyes      = app.swapEyes;
-                gs.anaglyphCombo = app.anaglyphCombo;
-                gs.anaglyphMode  = app.anaglyphMode;
-                gs.convergence   = app.convergence;
-                gs.pulfrichMode  = (int)app.pulfrichMode;
-                gs.pulfrichDelay = app.pulfrichDelay;
-                gs.pulfrichNd    = app.pulfrichNd;
-                gs.framePackMode = app.framePackMode;
-                gs.srMonitor     = SrMonitor(app);        // "this display" (excluded from the picker)
-                gs.autoStereo    = app.autoDetect;
-                gs.autoInput     = app.autoInput;
-                gs.defaultInput  = app.defaultInput;
-                if (app.autoInput && app.weavingEnabled)
-                {
-                    auto addFmt = [&](StereoFormat f) {
-                        for (int i = 0; i < gs.autoFmtCount; ++i) if (gs.autoFmts[i] == f) return;
-                        if (gs.autoFmtCount < 4) gs.autoFmts[gs.autoFmtCount++] = f;
-                    };
-                    if (app.autoStereo)
-                        for (const WeaveRegion& r : app.regionWeaver.Regions()) addFmt(r.format);
-                    else
-                        addFmt(app.format);   // (the whole picture's layout)
-                }
-                gs.captureMonitor = app.sourceMonitor;    // currently-captured display
-                gs.foreignDisplay = app.foreignDisplay;   // a picked display (vs this one) is active
-                gs.quiltCols     = app.quiltCols;
-                gs.quiltRows     = app.quiltRows;
-                gs.hasTestImage  = !app.lastTestImagePath.empty();
-                gs.vrHeadLook        = app.vrHeadLook;
-                gs.vrZoom            = app.vrZoom;
-                gs.vrResetView       = false;
-                gs.vrResetZoom       = false;
-                gs.vrHeadLookChanged = false;
-                // SR Platform runtime version (e.g. "1.34.10.17449") for
-                // the About popup. Static helper; pull it fresh each frame
-                // so a runtime hot-swap (rare) updates the GUI display.
-                static const std::string s_srVersion = [] { const char* v = SRWeaver::GetSRPlatformVersion(); return std::string(v ? v : ""); }();
-                const char* sr = s_srVersion.c_str();
-                strncpy_s(gs.srPlatformVersion, sr ? sr : "", _TRUNCATE);
-                // Light-field parallax-scale state for the GUI slider.
-                gs.lfpHeadLeanMm      = app.lfpHeadLeanMm;
-                gs.lfpApertureMm      = (float)(app.lfpRenderer.ApertureDiameterMetres() * 1e3);
-                gs.lfpHeadLeanChanged = false;
-                // OpenTrack snapshot. Mirror live config + counters into
-                // the GuiState; GUI mutates + sets openTrackChanged on
-                // edit, which we apply below.
-                {
-                    auto ot = app.openTrack.GetConfig();
-                    gs.openTrackEnabled      = app.openTrack.IsOpenTrackEnabled();
-                    gs.freeTrackEnabled      = app.openTrack.IsFreeTrackEnabled();
-                    gs.trackIREnabled        = app.openTrack.IsTrackIREnabled();
-                    gs.trackIRAvailable      = !app.npClientDir.empty();
-                    gs.openTrackSensYaw      = ot.sensYaw;
-                    gs.openTrackSensPitch    = ot.sensPitch;
-                    gs.openTrackSensRoll     = ot.sensRoll;
-                    gs.openTrackMode         = ot.outputMode;
-                    gs.openTrackInvertX      = ot.invertX;
-                    gs.openTrackInvertY      = ot.invertY;
-                    gs.openTrackInvertZ      = ot.invertZ;
-                    gs.openTrackInvertYaw    = ot.invertYaw;
-                    gs.openTrackInvertPitch  = ot.invertPitch;
-                    gs.openTrackInvertRoll   = ot.invertRoll;
-                    gs.openTrackChanged      = false;
-                    gs.openTrackCalibrate    = false;
-                    gs.openTrackSentPackets  = app.openTrack.SentPackets();
-                    strncpy_s(gs.openTrackExePath, app.openTrackExePath.c_str(), _TRUNCATE);
-                }
-                // Profiles snapshot: name + includeHT per entry, plus
-                // master toggle. Click flags (save / apply / delete /
-                // toggle-HT / open-ini / autoApply-changed) are RESET
-                // here and READ after Render below -- one-shot events
-                // triggered by user clicks during the frame.
-                {
-                    gs.profileEntries.clear();
-                    gs.profileEntries.reserve(app.profiles.size());
-                    for (const auto& p : app.profiles)
-                    {
-                        GuiState::ProfileEntry e;
-                        e.name = p.name;
-                        e.includeHT      = p.includeHeadTracking;
-                        e.fullscreenOnly = p.fullscreenOnly;
-                        e.useAutoFormat  = p.useAutoFormat;
-                        gs.profileEntries.push_back(std::move(e));
-                    }
-                    gs.profilesAutoApply        = app.profilesAutoApply;
-                    gs.profilesAutoApplyChanged = false;
-                    gs.profileSaveCurrent       = false;
-                    gs.profileApplyIndex        = -1;
-                    gs.profileUpdateIndex       = -1;
-                    gs.profileDeleteIndex       = -1;
-                    gs.profileToggleHTIndex     = -1;
-                    gs.profileToggleFullscreenIndex = -1;
-                    gs.profileToggleAutoFormatIndex = -1;
-                    gs.profilesOpenIni          = false;
-                }
-                // What's being weaved, for the GUI's collapsed summary line.
-                if (app.source == SourceKind::CaptureWindow && app.sourceWindow && IsWindow(app.sourceWindow))
-                {
-                    if (GetWindowTextA(app.sourceWindow, gs.sourceName, (int)sizeof(gs.sourceName)) <= 0)
-                        strncpy_s(gs.sourceName, "Window", _TRUNCATE);
-                }
-                else if (app.autoScopeWindow && app.autoStereo && IsWindow(app.autoScopeWindow))
-                {
-                    gs.windowScoped = true;   // (Automatic: the chosen window's 3D pictures)
-                    if (GetWindowTextA(app.autoScopeWindow, gs.sourceName, (int)sizeof(gs.sourceName)) <= 0)
-                        strncpy_s(gs.sourceName, "Window", _TRUNCATE);
-                }
-                else
-                    strncpy_s(gs.sourceName, app.foreignDisplay ? "Display" : "Monitor", _TRUNCATE);
-                const auto tGui0 = std::chrono::steady_clock::now();
-                bool guiChanged = false;
-                { HitchWatch hw("panel"); guiChanged = app.gui.Render(gs); }
-                app.prof.gui += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tGui0).count();
-                if (guiChanged)
-                {
-                    app.convergence   = gs.convergence;
-                    app.captureRebind = true;   // re-run the conversion with the new convergence
-                }
-                // VR controls.
-                if (gs.vrHeadLookChanged)
-                {
-                    app.vrHeadLook = gs.vrHeadLook;
-                    app.captureRebind = true;
-                }
-                if (gs.lfpHeadLeanChanged)
-                {
-                    app.lfpHeadLeanMm = gs.lfpHeadLeanMm;
-                }
-                if (gs.vrResetView)
-                {
-                    app.vrYaw   = 0.0f;
-                    app.vrPitch = 0.0f;
-                    app.captureRebind = true;
-                }
-                if (gs.vrResetZoom)
-                {
-                    app.vrZoom = 1.0f;
-                    app.captureRebind = true;
-                }
-                // OpenTrack/FreeTrack state apply-back.
-                if (gs.openTrackChanged)
-                {
-                    // Manual toggle is a user override against the auto-on
-                    // policy: if ALL outputs are off, remember that the
-                    // user explicitly turned tracking off this session so
-                    // we don't auto-re-enable on the next render tick.
-                    // TrackIR only counts if its prerequisites are met --
-                    // a ticked-but-unavailable TrackIR doesn't keep the
-                    // bridge alive.
-                    const bool tirEffective = gs.trackIREnabled && gs.trackIRAvailable;
-                    app.openTrackUserDisabled =
-                        !(gs.openTrackEnabled || gs.freeTrackEnabled || tirEffective);
-                    // Push the new output set to the bridge. SetOutputs is
-                    // idempotent and only does work on the delta; failure
-                    // (e.g. SR Platform service offline) flips the GuiState
-                    // back so the UI doesn't lie about what's running.
-                    if (!app.openTrack.SetOutputs(gs.openTrackEnabled,
-                                                  gs.freeTrackEnabled,
-                                                  tirEffective))
-                    {
-                        gs.openTrackEnabled = app.openTrack.IsOpenTrackEnabled();
-                        gs.freeTrackEnabled = app.openTrack.IsFreeTrackEnabled();
-                        gs.trackIREnabled   = app.openTrack.IsTrackIREnabled();
-                    }
-                    // Config edits (sliders / mode / inverts).
-                    if (app.openTrack.IsEnabled())
-                    {
-                        auto cfg = app.openTrack.GetConfig();
-                        cfg.sensYaw     = gs.openTrackSensYaw;
-                        cfg.sensPitch   = gs.openTrackSensPitch;
-                        cfg.sensRoll    = gs.openTrackSensRoll;
-                        cfg.outputMode  = gs.openTrackMode;
-                        cfg.invertX     = gs.openTrackInvertX;
-                        cfg.invertY     = gs.openTrackInvertY;
-                        cfg.invertZ     = gs.openTrackInvertZ;
-                        cfg.invertYaw   = gs.openTrackInvertYaw;
-                        cfg.invertPitch = gs.openTrackInvertPitch;
-                        cfg.invertRoll  = gs.openTrackInvertRoll;
-                        app.openTrack.SetConfig(cfg);
-                    }
-                }
-                if (gs.openTrackCalibrate)
-                    app.openTrack.CalibrateNeutral();
-                // Profiles apply-back: consume click flags from the GUI.
-                if (gs.profilesAutoApplyChanged)
-                {
-                    app.profilesAutoApply = gs.profilesAutoApply;
-                    Settings::WriteAutoApplyProfiles(app.profilesAutoApply);
-                    RefreshForegroundHook(app);
-                }
-                if (gs.profileSaveCurrent)
-                    SaveCurrentAsProfile(app);
-                if (gs.profileApplyIndex >= 0 &&
-                    (size_t)gs.profileApplyIndex < app.profiles.size())
-                {
-                    // Manual apply (tray menu path) -- no captureHwnd,
-                    // format-only re-bind. Pass the last external foreground
-                    // window's title so auto-format profiles get a useful
-                    // hint.
-                    const std::string title = WindowTitle(app.lastExternalForeground);
-                    ApplyProfile(app, app.profiles[(size_t)gs.profileApplyIndex],
-                                 nullptr, title);
-                }
-                if (gs.profileUpdateIndex >= 0 &&
-                    (size_t)gs.profileUpdateIndex < app.profiles.size())
-                {
-                    // Update: overwrite the selected profile's settings
-                    // with the current state. Keeps name + exe + title +
-                    // includeHeadTracking; refreshes everything else.
-                    // Lets the user "I tweaked the format/swap mid-game,
-                    // save those tweaks back to the profile."
-                    Profile& p = app.profiles[(size_t)gs.profileUpdateIndex];
-                    p.format       = app.format;
-                    // Auto-format profiles persist only defaultformat, so
-                    // that's where the current format has to go for Update
-                    // to stick (it becomes the no-token fallback).
-                    if (p.useAutoFormat) p.defaultFormat = app.format;
-                    p.swapEyes     = app.swapEyes;
-                    p.convergence  = app.convergence;
-                    p.anaglyphCombo  = app.anaglyphCombo;
-                    p.anaglyphMode   = app.anaglyphMode;
-                    p.pulfrichMode   = (int)app.pulfrichMode;
-                    p.pulfrichDelay  = app.pulfrichDelay;
-                    p.pulfrichNd     = app.pulfrichNd;
-                    p.framePackMode  = app.framePackMode;
-                    p.quiltCols      = app.quiltCols;
-                    p.quiltRows      = app.quiltRows;
-                    p.quiltLeftIdx   = app.quiltLeftIdx;
-                    p.quiltRightIdx  = app.quiltRightIdx;
-                    // Refresh the HT snapshot too if the profile is
-                    // currently flagged to carry HT settings -- same
-                    // "you're updating the profile, capture everything"
-                    // semantic as the per-row HT-on toggle.
-                    if (p.includeHeadTracking)
-                    {
-                        p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
-                        p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
-                        p.htTrackIR     = app.openTrack.IsTrackIREnabled();
-                        const auto cfg  = app.openTrack.GetConfig();
-                        p.htOutputMode  = cfg.outputMode;
-                        p.htInvertX     = cfg.invertX;
-                        p.htInvertY     = cfg.invertY;
-                        p.htInvertZ     = cfg.invertZ;
-                        p.htInvertYaw   = cfg.invertYaw;
-                        p.htInvertPitch = cfg.invertPitch;
-                        p.htInvertRoll  = cfg.invertRoll;
-                    }
-                    Profiles::Save(app.profiles);
-                    Log("Profiles: updated '%s' from current state", p.name.c_str());
-                }
-                if (gs.profileDeleteIndex >= 0 &&
-                    (size_t)gs.profileDeleteIndex < app.profiles.size())
-                {
-                    const std::string name = app.profiles[(size_t)gs.profileDeleteIndex].name;
-                    Log("Profiles: deleted '%s'", name.c_str());
-                    app.profiles.erase(app.profiles.begin() + gs.profileDeleteIndex);
-                    Profiles::Save(app.profiles);
-                    if (app.lastAppliedProfile == name)
-                        app.lastAppliedProfile.clear();
-                    if (app.lastAutoAppliedProfile == name)
-                        app.lastAutoAppliedProfile.clear();
-                }
-                if (gs.profileToggleHTIndex >= 0 &&
-                    (size_t)gs.profileToggleHTIndex < app.profiles.size())
-                {
-                    Profile& p = app.profiles[(size_t)gs.profileToggleHTIndex];
-                    p.includeHeadTracking = !p.includeHeadTracking;
-                    // When the user flips includeHT ON, snapshot the
-                    // current HT state -- they're saying "remember the
-                    // HT setup I have RIGHT NOW for this game". Otherwise
-                    // the saved ht_* fields are whatever was there at
-                    // save-time, which may be stale.
-                    if (p.includeHeadTracking)
-                    {
-                        p.htOpenTrack   = app.openTrack.IsOpenTrackEnabled();
-                        p.htFreeTrack   = app.openTrack.IsFreeTrackEnabled();
-                        p.htTrackIR     = app.openTrack.IsTrackIREnabled();
-                        const auto cfg  = app.openTrack.GetConfig();
-                        p.htOutputMode  = cfg.outputMode;
-                        p.htInvertX     = cfg.invertX;
-                        p.htInvertY     = cfg.invertY;
-                        p.htInvertZ     = cfg.invertZ;
-                        p.htInvertYaw   = cfg.invertYaw;
-                        p.htInvertPitch = cfg.invertPitch;
-                        p.htInvertRoll  = cfg.invertRoll;
-                    }
-                    Profiles::Save(app.profiles);
-                }
-                if (gs.profileToggleFullscreenIndex >= 0 &&
-                    (size_t)gs.profileToggleFullscreenIndex < app.profiles.size())
-                {
-                    Profile& p = app.profiles[(size_t)gs.profileToggleFullscreenIndex];
-                    p.fullscreenOnly = !p.fullscreenOnly;
-                    Profiles::Save(app.profiles);
-                    // If this profile is the one currently auto-applied,
-                    // bring the live state in line with the new setting
-                    // right away instead of waiting for the next focus change.
-                    HWND h = app.lastAppliedHwnd;
-                    if (p.name == app.lastAutoAppliedProfile && h)
-                    {
-                        if (!p.fullscreenOnly)
-                        {
-                            // Turned OFF: stop the "leave fullscreen -> weave
-                            // off" tracking. Keep the debounce so the poll
-                            // doesn't re-apply over the user's live tweaks.
-                            app.activeFullscreenProfileHwnd = nullptr;
-                        }
-                        else if (IsWindowFullscreen(h))
-                        {
-                            // Turned ON while fullscreen: start tracking, so
-                            // leaving fullscreen turns the weave off.
-                            app.activeFullscreenProfileHwnd = h;
-                        }
-                        else
-                        {
-                            // Turned ON while windowed: the profile no longer
-                            // applies here. Stop weaving that window and reset
-                            // the debounce so going fullscreen re-applies it.
-                            if (app.weavingEnabled &&
-                                app.source == SourceKind::CaptureWindow &&
-                                app.sourceWindow == h)
-                                SetWeaving(app, false);
-                            app.activeFullscreenProfileHwnd = nullptr;
-                            app.lastAppliedHwnd = nullptr;
-                            app.lastAutoAppliedProfile.clear();
-                        }
-                    }
-                }
-                if (gs.profileToggleAutoFormatIndex >= 0 &&
-                    (size_t)gs.profileToggleAutoFormatIndex < app.profiles.size())
-                {
-                    Profile& p = app.profiles[(size_t)gs.profileToggleAutoFormatIndex];
-                    p.useAutoFormat = !p.useAutoFormat;
-                    // When flipping auto-format ON, seed defaultFormat with
-                    // the current saved format so "detection fails" still
-                    // yields something sensible (rather than the enum's
-                    // default HalfSBS regardless of what the user had set).
-                    // Flipping it OFF restores the fixed format from that
-                    // fallback (which is what the file actually persists
-                    // while Auto is on).
-                    if (p.useAutoFormat) p.defaultFormat = p.format;
-                    else                 p.format = p.defaultFormat;
-                    Profiles::Save(app.profiles);
-                }
-                if (gs.profilesOpenIni)
-                {
-                    Profiles::Save(app.profiles);
-                    PWSTR base = nullptr;
-                    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)) && base)
-                    {
-                        std::wstring p = base; CoTaskMemFree(base);
-                        p += L"\\SRLoom\\profiles.ini";
-                        ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                    }
-                }
-            }
-            // After all GUI / WM_COMMAND state changes have settled,
-            // check if the currently-loaded image / video has had its
-            // stereo settings tweaked -- if so, save the new state back
-            // to its media profile. Throttled internally to avoid INI
-            // hammering on slider drags.
-            AutoSaveMediaProfileIfDirty(app);
-            // Fullscreen-condition profile state tick (throttled to
-            // 250ms internally). Handles enter/exit fullscreen when the
-            // foreground didn't change -- WinEventHook doesn't cover
-            // that case.
-            PollProfileFullscreenState(app);
-            PollKatangaAutoReceive(app);   // throttled to 500ms internally
-            // Late Latching switch (panel): apply to the running weaver.
-            {
-                static DWORD s_last = 0;
-                if (GetTickCount() - s_last > 500)
-                {
-                    s_last = GetTickCount();
-                    const int want = Settings::ReadLateLatching() ? 1 : 0;
-                    if (app.weavingEnabled && want != app.lateLatchingApplied)
-                    {
-                        app.weaver.SetLateLatching(want != 0);
-                        app.lateLatchingApplied = want;   // (once, even if the runtime ignores it)
-                    }
-                    if (!app.weavingEnabled) app.lateLatchingApplied = -1;   // re-apply when it restarts
-                    // The SR display's refresh (current mode), and display
-                    // settings changes once they've settled (Windows sends a few).
-                    PaceForSrRefresh(app);
-                    if (app.displayChangedAtMs && GetTickCount64() - app.displayChangedAtMs > 1000)
-                    {
-                        app.displayChangedAtMs = 0;
-                        HandleDisplayChange(app);
-                    }
-                    // Weaving has been off for a while: let the SR session go
-                    // (camera off). Kept until now so switching back is instant.
-                    if (app.weavingEnabled) app.srStopAtMs = 0;
-                    else if (app.srStopAtMs && GetTickCount64() >= app.srStopAtMs)
-                    {
-                        app.srStopAtMs = 0;
-                        app.weaver.StopSR();
-                        Log("SR session released (weaving off for %llu s)", kSrKeepAliveMs / 1000);
-                    }
-                    // Weaver choice (panel): a different weaver needs a new SR session.
-                    const int wantWeaver = Settings::ReadWeaverChoice();
-                    if (app.weaverChoiceSeen < 0) app.weaverChoiceSeen = wantWeaver;
-                    else if (wantWeaver != app.weaverChoiceSeen)
-                    {
-                        app.weaverChoiceSeen = wantWeaver;
-                        if (app.weaver.HasWeaver())
-                        {
-                            Log("Weaver choice changed to %d: restarting the SR session", wantWeaver);
-                            app.weaver.StopSR();
-                            app.srStopAtMs = 0;
-                            if (app.weavingEnabled)
-                            {
-                                app.weaver.StartSR(app.renderer.Context(), app.hwnd);
-                                const bool katangaArmed = (app.format == StereoFormat::Katanga && !app.katanga.IsReceiving());
-                                if (katangaArmed) app.weaver.LensDisable(); else app.weaver.LensEnable();
-                                app.lateLatchingApplied = -1;
-                                app.captureRebind = true;   // (the new weaver needs its input)
-                            }
-                        }
-                    }
-                    app.perfLog = Settings::ReadPerfLog();
-                    app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
-                    const bool skip = Settings::ReadDiagSkipWeave();
-                    if (skip != app.diagSkipWeave)
-                    {
-                        app.diagSkipWeave = skip;
-                        Log("DIAG: SR weave call %s", skip ? "SKIPPED (diagnostic)" : "restored");
-                    }
-                }
-            }
-            // Taskbar cut-out, every frame: when a window goes borderless-
-            // fullscreen (F11) the taskbar vanishes behind it, and a stale
-            // hole would show that window mid-resize (a white/grey box) for
-            // up to a poll interval. Cheap when nothing changed (a few
-            // window-rect reads; SetWindowRgn only on change).
-            UpdateTaskbarCutout(app, false);
-            // Fullscreen apps popping above the weave (throttled to 250ms --
-            // walks the z-order above us).
-            {
-                static DWORD s_lastWeaveZCheckMs = 0;
-                const DWORD nowMs = GetTickCount();
-                if (nowMs - s_lastWeaveZCheckMs >= 250)
-                {
-                    s_lastWeaveZCheckMs = nowMs;
-                    KeepWeaveAboveFullscreenApps(app);
-                }
-            }
+            if (g_threaded) { AppLock lock; LoopBody(app, false, true); }   // (the panel; the render thread does the rest)
+            else LoopBody(app, true, true);
         }
+    }
+
+    // The render thread ends first: everything below is one thread's again.
+    // (It may be waiting on this thread for a window call: those are still
+    // answered while it winds down.)
+    if (renderThread.joinable())
+    {
+        renderRun = false;
+        while (WaitForSingleObject(renderThread.native_handle(), 5) == WAIT_TIMEOUT)
+        {
+            MSG m;
+            PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+        }
+        renderThread.join();
+        g_threaded = false;
     }
 
     // Shutdown flush: write any pending media-profile changes before the

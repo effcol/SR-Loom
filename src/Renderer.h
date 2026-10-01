@@ -7,6 +7,7 @@
 #include <dxgi1_2.h>   // IDXGISwapChain1, IDXGIFactory2
 #include <chrono>
 #include <vector>
+#include <mutex>
 
 struct IDCompositionDevice;
 struct IDCompositionTarget;
@@ -166,5 +167,6 @@ namespace srw
         // The SR display's output: frames start on its vertical blank (see
         // WaitForFrame), locking the loop to its refresh rate.
         IDXGIOutput*                         m_vblankOutput = nullptr;
+        std::mutex                           m_vblankMutex;   // (the pointer above: WaitForFrame vs SetVBlankMonitor on another thread)
     };
 }

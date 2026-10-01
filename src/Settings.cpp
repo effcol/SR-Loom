@@ -138,6 +138,11 @@ namespace srw::Settings
         return ReadDword(kSettingsKey, L"ZeroCopyCapture", 1) != 0;   // default ON
     }
 
+    bool ReadRenderThread()
+    {
+        return ReadDword(kSettingsKey, L"RenderThread", 1) != 0;   // default ON
+    }
+
     int ReadWeaverChoice()
     {
         const DWORD v = ReadDword(kSettingsKey, L"WeaverChoice", 0);

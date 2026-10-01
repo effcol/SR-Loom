@@ -1266,11 +1266,14 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
     return SrcSample(samp, s);
 }
 
+float4 Opaque(float4 c) { c.a = 1.0; return c; }
+
 float4 PSMain(VSOut i) : SV_Target
 {
-    float4 r = ConvertCoreImpl(i, false);
-    // (Anaglyph recovery carries its confidence in alpha; the output is opaque.)
-    if (g_format == 2 && g_anaMode == 4) r.a = 1.0;
+    // (What the weaver is given is a picture: opaque. A capture can carry
+    // other alpha, and Recovered Colour its confidence; passed on, the weave
+    // came out part see-through and the renderer had to mask every frame.)
+    float4 r = Opaque(ConvertCoreImpl(i, false));
     return r;
 }
 
@@ -1286,11 +1289,11 @@ float4 PSAnaCompose(VSOut i) : SV_Target
 // The common formats each compiled on their own (see ConvertCoreImpl): smaller
 // shaders than PSMain, which holds every format. Converter::Convert picks one;
 // the rest (Pulfrich, frame-sequential, Quilt, VR, the history copy) use PSMain.
-float4 PSFmtHalfSBS(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 0); }    // (and Katanga)
-float4 PSFmtFullSBS(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 11); }
-float4 PSFmtTAB(VSOut i)     : SV_Target { return ConvertCoreImpl(i, false, 1); }
-float4 PSFmtRow(VSOut i)     : SV_Target { return ConvertCoreImpl(i, false, 3); }
-float4 PSFmtColumn(VSOut i)  : SV_Target { return ConvertCoreImpl(i, false, 4); }
-float4 PSFmtChecker(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 5); }
-float4 PSFmtFramePack(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 7); }
-float4 PSFmtAnaglyph(VSOut i) : SV_Target { return ConvertCoreImpl(i, false, 2, true); }   // (not Recovered Colour)
+float4 PSFmtHalfSBS(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 0)); }    // (and Katanga)
+float4 PSFmtFullSBS(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 11)); }
+float4 PSFmtTAB(VSOut i)     : SV_Target { return Opaque(ConvertCoreImpl(i, false, 1)); }
+float4 PSFmtRow(VSOut i)     : SV_Target { return Opaque(ConvertCoreImpl(i, false, 3)); }
+float4 PSFmtColumn(VSOut i)  : SV_Target { return Opaque(ConvertCoreImpl(i, false, 4)); }
+float4 PSFmtChecker(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 5)); }
+float4 PSFmtFramePack(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 7)); }
+float4 PSFmtAnaglyph(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 2, true)); }   // (not Recovered Colour)

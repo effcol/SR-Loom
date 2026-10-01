@@ -1722,7 +1722,7 @@ bool Gui::Render(GuiState& state)
                 ImGui::SetCursorPosX(startX + labelCol);   // line the sliders up in one column
                 const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
-                bool ch = ImGui::SliderFloat(id, v, -1.0f, 1.0f, "%.2f");
+                bool ch = ImGui::SliderFloat(id, v, -2.0f, 2.0f, "%.2f");   // (x 3% of the width per eye: main.cpp SetConvergence)
                 ImGui::SameLine();
                 ImGui::PushID(id);
                 if (ImGui::Button("Reset", ImVec2(resetW, 0))) { *v = 0.0f; ch = true; }
@@ -2389,8 +2389,8 @@ bool Gui::Render(GuiState& state)
             // First row: which SR weaver. The legacy one is the only one with
             // anti-crosstalk; changing it restarts the SR session (a moment).
             {
-                static const char* kWeavers[4] = { "Standard (default)", "Legacy, no anti-crosstalk",
-                                                   "Legacy, static anti-crosstalk", "Legacy, dynamic anti-crosstalk" };
+                static const char* kWeavers[4] = { "DX11 Standard (default)", "DX11 Legacy, no anti-crosstalk",
+                                                   "DX11 Legacy, static anti-crosstalk", "DX11 Legacy, dynamic anti-crosstalk" };
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted("Weaver");
                 tip("Which Leia SR weaver draws the 3D. Standard is the SDK's current weaver (IDX11Weaver1). Legacy is "

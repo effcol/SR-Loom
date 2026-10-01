@@ -711,7 +711,7 @@ void Renderer::WaitForFrame()
         m_compositorOtherClock = other;
     }
     if (m_waitable && !m_compositorOtherClock)
-        WaitForSingleObjectEx(m_waitable, 1000, TRUE);
+        WaitForSingleObjectEx(m_waitable, 100, TRUE);   // (short: the swap chain -- and this handle -- may be remade from another thread meanwhile)
     m_lastCompositorWaitMs = std::chrono::duration<double, std::milli>(wclk::now() - w0).count();
     m_lastVBlankWaitMs = 0.0;
 
@@ -783,7 +783,11 @@ void Renderer::WaitForFrame()
         if (since < period && !justPast)
         {
             const auto v0 = wclk::now();
-            m_vblankOutput->WaitForVBlank();
+            // (A reference of its own for the wait: another thread may switch the
+            // output meanwhile -- SetVBlankMonitor -- while this one waits on it.)
+            IDXGIOutput* out = nullptr;
+            { std::lock_guard<std::mutex> g(m_vblankMutex); out = m_vblankOutput; if (out) out->AddRef(); }
+            if (out) { out->WaitForVBlank(); out->Release(); }
             m_lastVBlank = wclk::now();
             m_lastVBlankWaitMs = std::chrono::duration<double, std::milli>(m_lastVBlank - v0).count();
         }
@@ -833,7 +837,7 @@ void Renderer::Shutdown()
     SAFE_RELEASE(m_scissorRS); SAFE_RELEASE(m_alphaProbeTex); m_alphaProbe = 0;
     SAFE_RELEASE(m_maskCB); SAFE_RELEASE(m_maskBlend); SAFE_RELEASE(m_maskPS); SAFE_RELEASE(m_maskVS);
     SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
-    SAFE_RELEASE(m_vblankOutput);
+    { std::lock_guard<std::mutex> g(m_vblankMutex); SAFE_RELEASE(m_vblankOutput); }
     SAFE_RELEASE(m_factory);
     SAFE_RELEASE(m_context);
     SAFE_RELEASE(m_device);
@@ -880,8 +884,11 @@ void Renderer::SetVBlankMonitor(HMONITOR target)
     }
     SAFE_RELEASE(a);
     SAFE_RELEASE(dd);
-    SAFE_RELEASE(m_vblankOutput);
-    m_vblankOutput = found;   // (none: another adapter -- paced by the cap and the compositor)
+    {
+        std::lock_guard<std::mutex> g(m_vblankMutex);   // (WaitForFrame may be about to wait on it)
+        SAFE_RELEASE(m_vblankOutput);
+        m_vblankOutput = found;   // (none: another adapter -- paced by the cap and the compositor)
+    }
     m_lastVBlank = {};        // (the old display's phase means nothing now)
     m_clockCheckMs = 0;       // (compare the clocks again straight away)
     Log("Renderer: waiting for refreshes on %s", found ? "the SR display's new output" : "nothing (the SR display isn't on this adapter)");
