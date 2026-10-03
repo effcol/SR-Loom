@@ -66,6 +66,10 @@ namespace srw
         std::vector<WeaveRegion>&       Regions()       { return m_regions; }
         const std::vector<WeaveRegion>& Regions() const { return m_regions; }
         bool Empty() const { return m_regions.empty(); }
+        // The textures the weaver reads made shareable with another Direct3D device
+        // (the DX12 presenter then weaves from them without a copy). Remade on the
+        // next use.
+        void SetShareable(bool on) { if (on != m_share) { m_share = on; m_lgW = m_lgH = 0; m_compW = m_compH = 0; } }
 
         // Build the composite from the current full-frame capture texture.
         // captureTex: the capture's texture (typeless BGRA), captureSrvFormat
@@ -124,6 +128,7 @@ namespace srw
         ID3D11Buffer*             m_regionCB = nullptr;  // Region cbuffer (b1)
         ID3D11ShaderResourceView* m_gpuRes  = nullptr;   // GpuTracker results (not owned)
         int                       m_gpuScale = 2;
+        bool                      m_share = false;       // (SetShareable)
         ID3D11SamplerState*       m_sampler = nullptr;
         ID3D11Buffer*             m_cb      = nullptr;
         ID3D11RasterizerState*    m_rs      = nullptr;   // scissor on: each eye stays in its half

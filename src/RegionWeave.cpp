@@ -275,6 +275,7 @@ bool RegionWeaver::CropComposite(const RECT& rIn, bool& resized)
         td.Width = (UINT)(2 * w); td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = kCompFormat; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (m_share) td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;   // (SetShareable)
         if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_lgTex))) { m_lgW = m_lgH = 0; return false; }
         m_device->CreateShaderResourceView(m_lgTex, nullptr, &m_lgSRV);
         m_lgW = w; m_lgH = h;
@@ -296,6 +297,7 @@ bool RegionWeaver::EnsureComposite(int w, int h)
     td.Width = (UINT)w; td.Height = (UINT)h; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = kCompFormat; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    if (m_share) td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;   // (SetShareable)
     if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_comp))) { m_compW = m_compH = 0; return false; }
     m_device->CreateRenderTargetView(m_comp, nullptr, &m_compRTV);
     m_device->CreateShaderResourceView(m_comp, nullptr, &m_compSRV);

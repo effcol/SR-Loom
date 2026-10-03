@@ -73,3 +73,7 @@ tools/**/*.pfm
 # dumps, wherever they land.
 anadebug/
 *.dmp
+
+# dx12bench: shaders compiled by dxc for a run (see tools/dx12bench/dx12bench.cpp)
+tools/dx12bench/*.dxil
+tools/dx12bench/search/

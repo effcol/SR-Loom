@@ -443,6 +443,21 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     // launch would look broken).
     Settings::WriteDiagSkipWeave(false);
     m_weaverChoice          = Settings::ReadWeaverChoice();
+    m_actMode               = Settings::ReadWeaverAct();
+    m_rgbdStrength          = (float)Settings::ReadRgbd(0);
+    m_rgbdFocus             = (float)Settings::ReadRgbd(1);
+    { const int f = Settings::ReadRgbd(2); m_rgbdLeft = (f & 1) != 0; m_rgbdInvert = (f & 2) != 0; m_rgbdAuto = (f & 4) != 0; }
+    m_rgbdLook              = Settings::ReadRgbd(3) != 0;
+    m_lfOn                  = Settings::ReadLightField();
+    m_lfPitch               = Settings::ReadLfPitch(); if (m_lfPitch <= 0.0f) m_lfPitch = 1.8f;   // (this display's lens, as the runtime reports it)
+    if (!Settings::ReadLfSlant(m_lfSlant)) m_lfSlant = 0.3f;
+    m_lfOffset              = Settings::ReadLfOffset();
+    { const int f = Settings::ReadLfFollow(); m_lfFollow = f != 0; m_lfFollowReverse = f == 2; }
+    m_lfDistance            = Settings::ReadLfDistance();
+    m_lfPattern             = Settings::ReadLfPattern();
+    m_lfCentre              = Settings::ReadLfCentre();
+    m_lfSpread              = (float)Settings::ReadLfSpread();
+    m_actStrength           = Settings::ReadWeaverActStrength();
     // Start in Windows' own light/dark app mode. The header's theme button
     // still flips it for the session; a Windows theme change re-syncs it
     // (WM_SETTINGCHANGE below).
@@ -1342,11 +1357,11 @@ bool Gui::Render(GuiState& state)
             // VR180 / VR360 expose a second "variant" combo for the layout.
             // Katanga = actively listen for a Katanga sender (game / bridge);
             // the STARTUP "Katanga Receiver" toggle does the same passively.
-            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_VR180, C_VR360, C_LFP, C_KATANGA, C_N };
+            enum Cat { C_SBS, C_TAB, C_IL, C_CHECK, C_ANA, C_FSEQ, C_PULF, C_FP, C_QUILT, C_VR180, C_VR360, C_LFP, C_RGBD, C_KATANGA, C_N };
             static const char* const kCat[C_N] = {
                 "Side-by-Side", "Top-and-Bottom", "Interleaved", "Checkerboard",
                 "Anaglyph", "Frame Sequential", "Pulfrich Effect", "Frame Packing",
-                "Quilt", "VR180", "VR360", "Lytro Light Field", "Katanga" };
+                "Quilt", "VR180", "360\xC2\xB0", "Lytro Light Field", "RGB + Depth", "Katanga" };
             auto catOf = [](StereoFormat f) -> int {
                 switch (f) {
                 case StereoFormat::FullSBS: case StereoFormat::HalfSBS:        return C_SBS;
@@ -1358,9 +1373,10 @@ bool Gui::Render(GuiState& state)
                 case StereoFormat::Pulfrich:        return C_PULF;
                 case StereoFormat::FramePacking:    return C_FP;
                 case StereoFormat::Quilt:           return C_QUILT;
-                case StereoFormat::VR180TAB: case StereoFormat::VR180SBS:    return C_VR180;
+                case StereoFormat::VR180TAB: case StereoFormat::VR180SBS:    return C_VR360;   // (one entry for both: 360, with a 180 / 360 choice)
                 case StereoFormat::VR360TAB: case StereoFormat::VR360SBS:    return C_VR360;
                 case StereoFormat::LightField:      return C_LFP;
+                case StereoFormat::RGBD:            return C_RGBD;
                 case StereoFormat::Katanga:         return C_KATANGA;
                 default:                            return C_SBS;
                 }
@@ -1396,6 +1412,7 @@ bool Gui::Render(GuiState& state)
                 case C_VR180: return StereoFormat::VR180TAB;
                 case C_VR360: return StereoFormat::VR360TAB;
                 case C_LFP:   return StereoFormat::LightField;
+                case C_RGBD:  return StereoFormat::RGBD;
                 default:      return StereoFormat::Katanga;
                 }
             };
@@ -1482,6 +1499,7 @@ bool Gui::Render(GuiState& state)
                 for (int c = 0; c < C_N; ++c)
                 {
                     if (!vrAvailable && (c == C_VR180 || c == C_VR360)) continue;
+                    if (c == C_VR180) continue;   // (folded into the 360 entry)
                     if (!lfpAvailable && c == C_LFP) continue;
                     ImGui::PushID(c);
                     const bool picked = ImGui::Selectable(kCat[c], !state.autoInput && c == curCat, 0, ImVec2(itemW, 0));
@@ -1502,6 +1520,7 @@ bool Gui::Render(GuiState& state)
                         case C_VR180: postFmt(StereoFormat::VR180TAB); break;   // default TAB (YouTube convention)
                         case C_VR360: postFmt(StereoFormat::VR360TAB); break;
                         case C_LFP:   postFmt(StereoFormat::LightField); break;
+                        case C_RGBD:  postFmt(StereoFormat::RGBD); break;
                         case C_KATANGA: postFmt(StereoFormat::Katanga); break;
                         }
                     }
@@ -1530,8 +1549,16 @@ bool Gui::Render(GuiState& state)
             else if (curCat == C_SBS) variant("##sbsv", "Full", "Half", StereoFormat::FullSBS, StereoFormat::HalfSBS);
             else if (curCat == C_TAB) variant("##tabv", "Full", "Half", StereoFormat::FullTAB, StereoFormat::HalfTAB);
             else if (curCat == C_IL)  variant("##ilv",  "Row",  "Column", StereoFormat::RowInterleaved, StereoFormat::ColumnInterleaved);
-            else if (curCat == C_VR180) variant("##vr180v", "Top-and-Bottom", "Side-by-Side", StereoFormat::VR180TAB, StereoFormat::VR180SBS);
-            else if (curCat == C_VR360) variant("##vr360v", "Top-and-Bottom", "Side-by-Side", StereoFormat::VR360TAB, StereoFormat::VR360SBS);
+            else if (curCat == C_VR360)
+            {
+                // (What the picture covers, then how the two eyes are packed.)
+                const bool is180 = state.format == StereoFormat::VR180TAB || state.format == StereoFormat::VR180SBS;
+                const bool isTab = state.format == StereoFormat::VR180TAB || state.format == StereoFormat::VR360TAB;
+                variant("##vrCover", "180\xC2\xB0", "360\xC2\xB0", isTab ? StereoFormat::VR180TAB : StereoFormat::VR180SBS,
+                                                       isTab ? StereoFormat::VR360TAB : StereoFormat::VR360SBS);
+                variant("##vrPack", "Top-and-Bottom", "Side-by-Side", is180 ? StereoFormat::VR180TAB : StereoFormat::VR360TAB,
+                                                                  is180 ? StereoFormat::VR180SBS : StereoFormat::VR360SBS);
+            }
             else if (curCat == C_ANA)
             {
                 int modeN = 0; const AnaglyphModeEntry* modes = AnaglyphModeList(modeN);
@@ -1647,8 +1674,64 @@ bool Gui::Render(GuiState& state)
             // Frame Packing has no second dropdown -- the 720p and 1080p HDMI 1.4 modes
             // share the same proportions, so a single preset covers both.
 
-            else if (curCat == C_QUILT)
+            else if (curCat == C_QUILT || curCat == C_RGBD)
             {
+                if (curCat == C_RGBD)
+                {
+                    // RGB + depth: how strong the depth is, which depth sits on the
+                    // screen, how the picture is laid out, and looking around.
+                    // (Label, slider, Reset on the right: as Convergence.)
+                    auto lrow = [&](const char* label, const char* id, float* v, float lo, float hi, const char* fmt, float def) -> bool {
+                        const float startX = ImGui::GetCursorPosX();
+                        const float labelCol = ImGui::CalcTextSize("Anti-Crosstalk").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(label);
+                        ImGui::SameLine();
+                        ImGui::SetCursorPosX(startX + labelCol);
+                        const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
+                        bool ch = ImGui::SliderFloat(id, v, lo, hi, fmt);
+                        ImGui::SameLine();
+                        ImGui::PushID(id);
+                        if (ImGui::Button("Reset", ImVec2(resetW, 0))) { *v = def; ch = true; }
+                        ImGui::PopID();
+                        return ch;
+                    };
+                    if (lrow("Depth", "##rgbdDepth", &m_rgbdStrength, 0.0f, 100.0f, "%.0f", 50.0f)) Settings::WriteRgbd(0, (int)(m_rgbdStrength + 0.5f));
+                    if (lrow("Focus", "##rgbdFocus", &m_rgbdFocus, 0.0f, 100.0f, "%.0f", 50.0f)) Settings::WriteRgbd(1, (int)(m_rgbdFocus + 0.5f));
+                    // Where the depth map is, and which way round it is drawn. (Stored as
+                    // bits: 1 on the left, 2 black near, 4 found automatically.)
+                    auto lcombo = [&](const char* label, const char* id, const char* const* items, int count, int cur) -> int {
+                        const float startX = ImGui::GetCursorPosX();
+                        const float labelCol = ImGui::CalcTextSize("Anti-Crosstalk").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                        ImGui::AlignTextToFramePadding();
+                        ImGui::TextUnformatted(label);
+                        ImGui::SameLine();
+                        ImGui::SetCursorPosX(startX + labelCol);
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                        int pick = cur;
+                        if (ImGui::BeginCombo(id, items[cur]))
+                        {
+                            for (int k = 0; k < count; ++k) if (ImGui::Selectable(items[k], k == cur)) pick = k;
+                            ImGui::EndCombo();
+                        }
+                        return pick;
+                    };
+                    static const char* const kSide[3] = { "Find automatically", "Right half of the image", "Left half of the image" };
+                    static const char* const kNear[2] = { "White (lighter is closer)", "Black (darker is closer)" };
+                    const int side = m_rgbdAuto ? 0 : (m_rgbdLeft ? 2 : 1);
+                    const int side2 = lcombo("Depth map", "##rgbdSide", kSide, 3, side);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The depth map is the grey picture beside the colour one: it says how far away each part is.");
+                    const int near2 = lcombo("Near is", "##rgbdNear", kNear, 2, m_rgbdInvert ? 1 : 0);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which shade of the depth map means close to you. If the 3D looks inside-out, pick the other.");
+                    if (side2 != side || near2 != (m_rgbdInvert ? 1 : 0))
+                    {
+                        m_rgbdAuto = side2 == 0; m_rgbdLeft = side2 == 2; m_rgbdInvert = near2 == 1;
+                        Settings::WriteRgbd(2, (m_rgbdLeft ? 1 : 0) | (m_rgbdInvert ? 2 : 0) | (m_rgbdAuto ? 4 : 0));
+                    }
+                }
+                else
+                {
                 // Quilt cols / rows pickers (max 12 / 9 per LG docs) + an
                 // image-content auto-detect for files that lack the LG "_qsCxR"
                 // filename token. Cols and Rows post WM_APP_QUILT_GRID; auto
@@ -1686,6 +1769,67 @@ bool Gui::Render(GuiState& state)
                 if (ImGui::Button("Auto-detect grid", ImVec2(-FLT_MIN, 0)))
                     PostMessageA(m_mainHwnd, WM_APP_QUILT_AUTODETECT, 0, 0);
                 ImGui::EndDisabled();
+                }
+                // (A tooltip for the item just drawn, wrapped.)
+                auto tip = [&](const char* text) {
+                    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) return;
+                    const float maxW = 320.0f * m_dpiScale;
+                    ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+                    ImGui::BeginTooltip();
+                    ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
+                    ImGui::TextUnformatted(text);
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                };
+                // Light field (an experiment): see Settings.h.
+                {
+                    if (ImGui::Checkbox("Light field (experimental)", &m_lfOn)) Settings::WriteLightField(m_lfOn);
+                    tip("Shows the views of a Quilt at once, spread across the lens: move your head from side to side to "
+                        "look around, with no eye tracking. Softer than tracked 3D. The views are aimed at a point straight "
+                        "in front of the screen at the Viewing Distance; there the picture is right, and for some way to "
+                        "either side. Further to the side the views start again from the first: that is the lens, and "
+                        "the same for every picture.");
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!m_lfOn);
+                    if (ImGui::Checkbox("Camera Sweet Spot", &m_lfFollow)) Settings::WriteLfFollow(m_lfFollow ? 1 : 0);
+                    ImGui::EndDisabled();
+                    tip("Uses the eye-tracking camera to read how far away you are, and aims the views to meet there: the "
+                        "sweet spot follows your distance. Off, the Viewing Distance below is used and the camera stays off.");
+                    if (m_lfOn)
+                    {
+                        const float w = ImGui::GetContentRegionAvail().x;
+                        // (Label, slider, Reset on the right: as Convergence.)
+                        auto row = [&](const char* label, const char* id, float* v, float lo, float hi, const char* fmt, float def) -> bool {
+                            const float startX = ImGui::GetCursorPosX();
+                            const float labelCol = ImGui::CalcTextSize("Viewing distance").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextUnformatted(label);
+                            ImGui::SameLine();
+                            ImGui::SetCursorPosX(startX + labelCol);
+                            const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
+                            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
+                            ImGui::PushID(id);
+                            bool changed = ImGui::SliderFloat("##v", v, lo, hi, fmt);
+                            ImGui::SameLine();
+                            if (ImGui::Button("Reset", ImVec2(resetW, 0))) { *v = def; changed = true; }
+                            ImGui::PopID();
+                            return changed;
+                        };
+                        if (!m_lfFollow)
+                        {
+                            if (row("Viewing distance", "lfDist", &m_lfDistance, 30.0f, 250.0f, "%.0f cm", 60.0f)) Settings::WriteLfDistance(m_lfDistance);
+                            tip("How far you sit from the screen. The views from every part of the screen are aimed to meet there. "
+                                "Further away, the area you can move around in is wider.");
+                        }
+                        if (row("View spread", "lfSpread", &m_lfSpread, 5.0f, 100.0f, "%.0f%%", 30.0f)) Settings::WriteLfSpread(m_lfSpread);
+                        tip("How much of the Quilt's range of views is shown. Quilts are made for displays with a much wider "
+                            "view than this lens: all of it at once gives far too much depth, and the picture only comes "
+                            "together from across the room. Lower it until the picture is comfortable where you sit; raise "
+                            "it for more depth and more to look around.");
+                        if (row("Offset", "lfOff", &m_lfOffset, 0.0f, 1.0f, "%.3f", 0.0f)) Settings::WriteLfOffset(m_lfOffset);
+                        tip("Turns the fan of views to the left or right. 0 points its middle straight ahead.");
+                    }
+                }
             }
         }
 
@@ -1770,7 +1914,7 @@ bool Gui::Render(GuiState& state)
             // Two depth controls: convergence (zero-plane shift) + separation (depth scale).
             auto adjSlider = [&](const char* label, const char* id, float* v) -> bool {
                 const float startX  = ImGui::GetCursorPosX();
-                const float labelCol = ImGui::CalcTextSize("Convergence").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                const float labelCol = ImGui::CalcTextSize("Anti-Crosstalk").x + ImGui::GetStyle().ItemSpacing.x * 2;
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted(label);
                 ImGui::SameLine();
@@ -1785,6 +1929,29 @@ bool Gui::Render(GuiState& state)
                 return ch;
             };
             if (adjSlider("Convergence", "##conv", &state.convergence)) convChanged = true;
+            // Anti-crosstalk strength (the weaver's own correction, scaled: Settings
+            // WeaverActStrength; the method is in Settings > Advanced).
+            {
+                const float startX  = ImGui::GetCursorPosX();
+                const float labelCol = ImGui::CalcTextSize("Anti-Crosstalk").x + ImGui::GetStyle().ItemSpacing.x * 2;
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Anti-Crosstalk");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(startX + labelCol);
+                const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
+                float pct = (float)m_actStrength;
+                ImGui::BeginDisabled(m_actMode == 1);
+                if (ImGui::SliderFloat("##actStrengthMain", &pct, 0.0f, 300.0f, "%.0f%%"))
+                {
+                    m_actStrength = (int)(pct + 0.5f);
+                    Settings::WriteWeaverActStrength(m_actStrength);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reduces ghosting between the eyes. 100%% is the display's own amount.");
+                ImGui::SameLine();
+                if (ImGui::Button("Reset##actMain", ImVec2(resetW, 0))) { m_actStrength = 100; Settings::WriteWeaverActStrength(100); }
+                ImGui::EndDisabled();
+            }
         }
 
         // HEADTRACKING section -- now collapsible (default expanded).
@@ -2444,28 +2611,57 @@ bool Gui::Render(GuiState& state)
             // First row: which SR weaver. The legacy one is the only one with
             // anti-crosstalk; changing it restarts the SR session (a moment).
             {
-                static const char* kWeavers[4] = { "DX11 Standard (default)", "DX11 Legacy, no anti-crosstalk",
-                                                   "DX11 Legacy, static anti-crosstalk", "DX11 Legacy, dynamic anti-crosstalk" };
+                // (Two entries: the standard weaver on Direct3D 11 or 12 -- stored
+                // as 0 and 4. The legacy weavers went when anti-crosstalk turned
+                // out to be settable on the standard ones: below.)
+                static const char* kWeavers[2] = { "DX11 Standard (default)", "DX12 Standard (experimental)" };
+                static const int   kWeaverValue[2] = { 0, 4 };
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted("Weaver");
-                tip("Which Leia SR weaver draws the 3D. Standard is the SDK's current weaver (IDX11Weaver1). Legacy is "
-                    "its older one (PredictingDX11Weaver), the only one with anti-crosstalk: it pre-filters the "
-                    "picture to reduce ghosting between the eyes. Try static or dynamic if you see double edges. "
+                tip("Which Leia SR weaver draws the 3D: the SDK's current weaver on Direct3D 11, or on Direct3D 12. "
+                    "With DX12 a slow conversion no longer holds the 3D back. "
                     "Changing it restarts the 3D for a moment.");
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-                const int cur = (m_weaverChoice >= 0 && m_weaverChoice < 4) ? m_weaverChoice : 0;
+                const int cur = m_weaverChoice >= 4 ? 1 : 0;
                 if (ImGui::BeginCombo("##weaver", kWeavers[cur]))
                 {
-                    for (int k = 0; k < 4; ++k)
+                    for (int k = 0; k < 2; ++k)
                         if (ImGui::Selectable(kWeavers[k], k == cur))
                         {
-                            m_weaverChoice = k;
-                            Settings::WriteWeaverChoice(k);
+                            m_weaverChoice = kWeaverValue[k];
+                            Settings::WriteWeaverChoice(kWeaverValue[k]);
                         }
                     ImGui::EndCombo();
                 }
             }
+            // Anti-crosstalk: the runtime's own weaver settings (every weaver has
+            // them; the standard ones run dynamic anti-crosstalk by default).
+            {
+                // (What the display's own mode is: written by the weaver when it is
+                // made -- Settings WeaverActDefault; looked up now and then.)
+                static int s_defMode = -1, s_defAge = 0;
+                if (s_defAge-- <= 0) { s_defMode = Settings::ReadWeaverActDefault(); s_defAge = 120; }
+                static const char* kDefName[4] = { "Display's default", "Display's default (Off)", "Display's default (Static)", "Display's default (Dynamic)" };
+                const char* kAct[4] = { kDefName[(s_defMode >= 0 && s_defMode <= 2) ? s_defMode + 1 : 0], "Off", "Static", "Dynamic" };
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Crosstalk method");
+                tip("How ghosting between the eyes is corrected. Dynamic follows your position; Static is a fixed "
+                    "correction; Off none. The Anti-Crosstalk slider under Convergence sets how strong it is.");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                const int cur = (m_actMode >= 0 && m_actMode < 4) ? m_actMode : 0;
+                if (ImGui::BeginCombo("##act", kAct[cur]))
+                {
+                    for (int k = 0; k < 4; ++k)
+                        if (ImGui::Selectable(kAct[k], k == cur)) { m_actMode = k; Settings::WriteWeaverAct(k); }
+                    ImGui::EndCombo();
+                }
+            }
+            // The light field's alignment pattern (a check of the lens geometry).
+            if (ImGui::Checkbox("Light field alignment pattern", &m_lfPattern)) Settings::WriteLfPattern(m_lfPattern);
+            tip("With Light Field on: shows red and blue in place of the picture. Sitting centred at the viewing "
+                "distance, one eye should see the whole screen red and the other blue.");
             // Second row: the presenter. Restart needed (the weave window is
             // created for one presenter or the other).
             if (pairToggle2("Fast Presenter", m_directComposition, halfW))

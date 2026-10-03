@@ -57,7 +57,9 @@ namespace srw::Settings
     // something misbehaves. HKCU\Software\SRLoom\RenderThread. Read at start-up.
     bool ReadRenderThread();
     // Recovered Colour while a page scrolls: what only moved keeps last frame's
-    // result, moved, instead of being recovered again (default ON; no UI). 0:
+    // result, moved, instead of being recovered again (default OFF; no UI: on
+    // ordinary pages its search and copies cost more than they save; it wins
+    // only when a screen-filling photograph scrolls). 0:
     // every moved part recovered again -- for comparing.
     // HKCU\Software\SRLoom\ScrollReuse. Read at start-up.
     bool ReadScrollReuse();
@@ -66,11 +68,44 @@ namespace srw::Settings
     // the picture is a refresh late -- felt as lag. 0: converted first, as
     // always before. HKCU\Software\SRLoom\DeferRecovered. Read at start-up.
     bool ReadDeferRecovered();
+    // DX12 weaver, Recovered Colour: the conversion apart from the weave (default
+    // ON; no UI). The weave reads the newest finished picture, so it goes out
+    // every refresh; a conversion too slow for the refresh shows one refresh
+    // later instead of holding the weave back. 0: the weave waits for the
+    // conversion, as with DX11. HKCU\Software\SRLoom\AsyncConvert. Read at start-up.
+    bool ReadAsyncConvert();
+    // The weaver's pipeline latency (how far ahead it predicts the eyes): 0 the
+    // SDK's own figure (default), 1 what SR Loom measures from the weave call to
+    // the picture reaching the display (needs the Perf Log on: it is measured
+    // there). HKCU\Software\SRLoom\WeaverLatency. Read at start-up.
+    int  ReadWeaverLatency();
+    // ... and how long the weave waits for a conversion under way before going out
+    // with the picture it has, in microseconds (default 1200). AsyncWaitUs.
+
+    int  ReadAsyncWaitUs();
+    // ... and in how many pieces a long conversion is sent to the GPU, so the weave
+    // can run between them (default 4; 0: in one go). AsyncBands.
+    int  ReadAsyncBands();
+    // ... and how long a conversion has to take (GPU time, microseconds; three in a
+    // row) for it to be run apart from the weave (default 3500). AsyncEnterUs.
+    int  ReadAsyncEnterUs();
     // Experiment (default OFF; no UI): the weave's swap chain opaque and allowed to
     // tear, so Windows may give it a display plane of its own -- not composited,
     // and not making the screen capture see a change every refresh. No cut-outs
     // (taskbar, pop-ups) while on. HKCU\Software\SRLoom\WeavePlane. Read at start-up.
     bool ReadWeavePlane();
+    // The weave straight to the display (opaque swap chain, not composed by
+    // Windows) whenever nothing has to show through it -- no taskbar, pointer or
+    // window cut-outs -- and see-through again the moment something does (default
+    // ON). About 5 ms less from the weave to the display, and the screen capture
+    // then only reports what really changed. HKCUSoftwareSRLoomAutoPlane.
+    bool ReadAutoPlane();
+    // HDR (no UI yet): capture, conversion and the weave's swap chain 16-bit float
+    // (scRGB) instead of 8-bit, so brighter-than-white picture is kept, with
+    // either weaver. 1 (default): when Windows has HDR switched on for the SR
+    // display; 2 always; 0 never. Only for the layouts that pass the picture
+    // through (see HdrWanted in main.cpp). HKCU\Software\SRLoom\HdrOutput.
+    int  ReadHdrOutput();
     // The Custom anaglyph pair's two picked colours (0-1 red, green, blue each;
     // default red / cyan). HKCU\Software\SRLoom\AnaCustomLeft, AnaCustomRight.
     void ReadAnaCustom(float left[3], float right[3]);
@@ -84,6 +119,58 @@ namespace srw::Settings
     // the SR session is next made. HKCU\Software\SRLoom\WeaverChoice.
     int  ReadWeaverChoice();
     void WriteWeaverChoice(int choice);
+    // Anti-crosstalk through the runtime's weaver settings: 0 the display's default,
+    // 1 off, 2 static, 3 dynamic; and its strength, % of the display's own amount
+    // (0-300). HKCUSoftwareSRLoomWeaverAct / WeaverActStrength.
+    // Light field (an experiment; Quilt sources): the Quilt's views interlaced
+    // across the lens by SR Loom, all at once, with no eye tracking -- move the
+    // head to look around. The lens pitch (pixels) and slant come from the SR
+    // runtime unless set here, and the offset slides the views under the lens.
+    // HKCU\Software\SRLoom\LightField, LfPitch, LfSlant, LfOffset.
+    bool  ReadLightField();
+    void  WriteLightField(bool on);
+    float ReadLfPitch();
+    void  WriteLfPitch(float v);
+    bool  ReadLfSlant(float& v);
+    void  WriteLfSlant(float v);
+    float ReadLfOffset();
+    void  WriteLfOffset(float v);
+    void  ClearLfSlant();
+    // ... the distance the views are aimed at (cm, default 60): every lens' fan
+    // of views meets there, so the whole screen lines up from that distance; and
+    // the alignment pattern (half the fan red, half blue) in place of the picture.
+    float ReadLfDistance();
+    void  WriteLfDistance(float cm);
+    bool  ReadLfPattern();
+    void  WriteLfPattern(bool on);
+    // ... the views kept aimed at the tracked viewer sideways as well. LfCentre.
+    bool  ReadLfCentre();
+    void  WriteLfCentre(bool on);
+    // RGB + depth pictures (the RGB + Depth input): 0 strength, 1 focus plane (both
+    // 0-100), 2 layout bits (1 depth on the left, 2 black near), 3 look around with
+    // the head. RgbdStrength, RgbdFocus, RgbdFlags, RgbdLook.
+    int   ReadRgbd(int i);
+    void  WriteRgbd(int i, int v);
+    // ... and how much of the Quilt's range of views the lens' fan shows, about the
+    // middle one (%, default 30): see the shader. LfSpread.
+    int   ReadLfSpread();
+    void  WriteLfSpread(float pct);
+    // ... and a request from the panel to measure the lens (main.cpp MeasureLens),
+    // cleared when taken up.
+    bool  ReadLfMeasure();
+    void  WriteLfMeasure(bool on);
+    // ... following the viewer: the fan of views kept centred on the tracked head
+    // (0 off, 1 on, 2 on with the direction reversed). LfFollow.
+    int   ReadLfFollow();
+    void  WriteLfFollow(int v);
+    // The display's own anti-crosstalk mode (0 off, 1 static, 2 dynamic; -1 not
+    // known), noted by the weaver for the panel to show. WeaverActDefault.
+    int   ReadWeaverActDefault();
+    void  WriteWeaverActDefault(int mode);
+    int  ReadWeaverAct();
+    void WriteWeaverAct(int mode);
+    int  ReadWeaverActStrength();
+    void WriteWeaverActStrength(int pct);
 
     // Diagnostics only (no UI): skip the SR weaver's weave call, to see
     // whether it paces the loop. HKCU\Software\SRLoom\DiagSkipWeave = 1.
@@ -95,7 +182,7 @@ namespace srw::Settings
     void WritePerfLog(bool enable);
 
     // Automatic Detection works out which half of an SBS / TAB picture is the
-    // left eye (and swaps it when it's the other way round). Default on. (The
+    // left eye (and swaps it when it's the other way round). Default off. (The
     // US patents Leia US9325964 / US9729852 claim this, to 2032 / 2031.)
     bool ReadEyeOrderDetect();
     void WriteEyeOrderDetect(bool enable);

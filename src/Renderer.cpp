@@ -1,7 +1,10 @@
 #include "Renderer.h"
+#include "Present12.h"
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>   // IDXGISwapChain2, FRAME_LATENCY_WAITABLE_OBJECT
 #include <dxgi1_5.h>   // IDXGIFactory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING
+#include <dxgi1_6.h>   // IDXGIOutput6 (HDR state)
+#include <climits>
 #include <dwmapi.h>    // DwmFlush (pace layered/bit-blt presents to the compositor)
 #include <thread>      // std::this_thread::sleep_for / yield for the render-rate cap
 #include <dcomp.h>     // DirectComposition presenter
@@ -213,7 +216,8 @@ bool Renderer::CreateDCompSwapChain()
     SAFE_RELEASE(m_swapChain);
     m_waitable = nullptr;
     m_flip       = true;
-    m_swapFormat = DXGI_FORMAT_R8G8B8A8_UNORM;   // + an _SRGB view, as for flip
+    m_swapFormat = m_hdrOut ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;   // + an _SRGB view, as for flip
+    m_rtvFormat  = m_hdrOut ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width            = m_width;
@@ -263,6 +267,14 @@ bool Renderer::CreateDCompSwapChain()
             sc2->Release();
         }
     }
+    if (m_hdrOut)
+    {
+        IDXGISwapChain3* sc3 = nullptr;
+        HRESULT hc = m_swapChain->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&sc3);
+        if (SUCCEEDED(hc)) hc = sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+        SAFE_RELEASE(sc3);
+        Log("Renderer: 16-bit float output (scRGB) %s (0x%08X)", SUCCEEDED(hc) ? "set" : "REFUSED", (unsigned)hc);
+    }
     if (FAILED(m_dcVisual->SetContent(m_swapChain)) || FAILED(m_dcomp->Commit()))
         return false;
     return CreateBackBufferView();
@@ -285,7 +297,14 @@ cbuffer M : register(b0)
     float4 exRad[16];     //   ... their corner radii (4 per float4)
     float4 exOwner[16];   //   ... whose they are: the trRect index, or -1 = everyone's (4 per float4)
 };
+// (The Direct3D 12 presenter is handed them as a small texture: GPU_TEX.)
+#ifdef GPU_TEX
+Texture2D<int4> gpuResT : register(t0);
+#define GPURES(s) gpuResT.Load(int3(s, 0, 0))
+#else
 StructuredBuffer<int4> gpuRes : register(t0);
+#define GPURES(s) gpuRes[s]
+#endif
 float4 VSMain(uint id : SV_VertexID) : SV_Position
 {
     float2 t = float2((id << 1) & 2, id & 2);
@@ -326,7 +345,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
         i = firstbitlow(trBits); trBits &= trBits - 1;
         float dx = 0, dy = 0;
         const int slot = (int)trInfo[i].x;
-        if (slot >= 0) { const int4 g = gpuRes[slot]; if (g.y) dy = g.x * trInfo[i].y; if (g.w) dx = g.z * trInfo[i].y; }
+        if (slot >= 0) { const int4 g = GPURES(slot); if (g.y) dy = g.x * trInfo[i].y; if (g.w) dx = g.z * trInfo[i].y; }
         if (!Inside(pos.xy, trRect[i] + float4(dx, dy, dx, dy)) || !Inside(pos.xy, trClip[i])) continue;
         // ... unless one of THIS picture's own holes (a window in front of
         // it) covers the spot. Another picture's holes don't: a window in
@@ -353,6 +372,7 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
 }
 )";
     ID3DBlob* vsb = nullptr; ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
+    m_maskHLSL = kMaskHLSL;   // (the Direct3D 12 presenter compiles the same source: SetDX12)
     const size_t len = strlen(kMaskHLSL);
     if (FAILED(D3DCompile(kMaskHLSL, len, "Mask", nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsb, &err)) ||
         FAILED(D3DCompile(kMaskHLSL, len, "Mask", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err)))
@@ -378,14 +398,14 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target
     m_device->CreateBlendState(&bd, &m_maskBlend);
 
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth      = 16 + 16 * (64 + 16 * 3 + 64 + 16 + 16);   // (... + exOwner)
+    cb.ByteWidth      = kMaskCBBytes;
     cb.Usage          = D3D11_USAGE_DYNAMIC;
     cb.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     m_device->CreateBuffer(&cb, nullptr, &m_maskCB);
     // The tile lists (PSMain's tiles): [0] header + two uint4 per tile.
     D3D11_BUFFER_DESC tb{};
-    tb.ByteWidth           = 16 * (1 + 2 * kMaskTilesX * kMaskTilesY);
+    tb.ByteWidth           = kMaskTilesBytes;
     tb.Usage               = D3D11_USAGE_DYNAMIC;
     tb.BindFlags           = D3D11_BIND_SHADER_RESOURCE;
     tb.CPUAccessFlags      = D3D11_CPU_ACCESS_WRITE;
@@ -428,10 +448,320 @@ void Renderer::SetVisibleTracked(const std::vector<MaskTracked>& tracked, const 
     m_maskGpu = gpuResults;
 }
 
+// The mask shader's constants (cbuffer M) and tile lists, written to head / t
+// (kMaskCBBytes / kMaskTilesBytes). gpuSlots false: tracked pictures without
+// the GPU tracker's offsets (the Direct3D 12 presenter doesn't have them).
+void Renderer::FillMaskConstants(uint32_t* head, bool gpuSlots) const
+{
+    head[0] = (uint32_t)m_maskRects.size();
+    head[1] = m_maskAll ? 1u : 0u;
+    head[2] = (uint32_t)m_maskTracked.size();
+    head[3] = (uint32_t)m_maskExcl.size();
+    float* f = reinterpret_cast<float*>(head + 4);
+    auto put = [&](float* at, const RECT& r) { at[0] = (float)r.left; at[1] = (float)r.top; at[2] = (float)r.right; at[3] = (float)r.bottom; };
+    float* rects  = f;               // 64
+    float* trRect = rects  + 64 * 4; // 16
+    float* trClip = trRect + 16 * 4; // 16
+    float* trInfo = trClip + 16 * 4; // 16
+    float* excl   = trInfo + 16 * 4; // 64
+    float* exRad  = excl + 64 * 4;   // 64 (16 float4s)
+    float* exOwn  = exRad + 64;      // 64 (16 float4s)
+    for (int i = 0; i < 64; ++i) { exRad[i] = 0.0f; exOwn[i] = -1.0f; }
+    for (size_t i = 0; i < m_maskRects.size(); ++i) put(rects + i * 4, m_maskRects[i]);
+    for (size_t i = 0; i < m_maskTracked.size(); ++i)
+    {
+        put(trRect + i * 4, m_maskTracked[i].rect);
+        put(trClip + i * 4, m_maskTracked[i].clip);
+        trInfo[i * 4 + 0] = gpuSlots ? (float)m_maskTracked[i].slot : -1.0f;
+        trInfo[i * 4 + 1] = m_maskTracked[i].scale;
+        trInfo[i * 4 + 2] = trInfo[i * 4 + 3] = 0.0f;
+    }
+    for (size_t i = 0; i < m_maskExcl.size(); ++i)
+    {
+        put(excl + i * 4, m_maskExcl[i].rect);
+        exRad[i] = (float)m_maskExcl[i].radius;
+        exOwn[i] = (float)m_maskExcl[i].owner;
+    }
+}
+
+// Which rects can touch each tile (PSMain's tiles). A tracked picture may
+// move by up to the GPU tracker's search this frame: its tiles cover that
+// (within its viewport).
+void Renderer::FillMaskTiles(uint32_t* t) const
+{
+    memset(t, 0, kMaskTilesBytes);
+    const int tw = (m_width + kMaskTilesX - 1) / kMaskTilesX, th = (m_height + kMaskTilesY - 1) / kMaskTilesY;
+    t[0] = kMaskTilesX; t[1] = kMaskTilesY; t[2] = (uint32_t)(std::max)(tw, 1); t[3] = (uint32_t)(std::max)(th, 1);
+    // word: 0/1 static rects (lo/hi), 2/3 holes (lo/hi), 4 tracked.
+    auto mark = [&](RECT r, int word, int bit) {
+        if (r.right <= r.left || r.bottom <= r.top || tw <= 0 || th <= 0) return;
+        const int x0 = (std::max)(0, (int)r.left / tw), x1 = (std::min)(kMaskTilesX - 1, (int)(r.right - 1) / tw);
+        const int y0 = (std::max)(0, (int)r.top / th),  y1 = (std::min)(kMaskTilesY - 1, (int)(r.bottom - 1) / th);
+        const int w = word + (bit >= 32 ? 1 : 0);
+        const uint32_t b = 1u << (bit & 31);
+        for (int y = y0; y <= y1; ++y)
+            for (int x = x0; x <= x1; ++x)
+                t[4 + (y * kMaskTilesX + x) * 8 + w] |= b;
+    };
+    for (size_t i = 0; i < m_maskRects.size() && i < 64; ++i) mark(m_maskRects[i], 0, (int)i);
+    for (size_t i = 0; i < m_maskExcl.size() && i < 64; ++i) mark(m_maskExcl[i].rect, 2, (int)i);
+    for (size_t i = 0; i < m_maskTracked.size() && i < 16; ++i)
+    {
+        const MaskTracked& k = m_maskTracked[i];
+        RECT r = k.rect;
+        if (k.slot >= 0)
+        {
+            const int gx = (int)std::ceil(48 * k.scale) + 1, gy = (int)std::ceil(96 * k.scale) + 1;   // (GpuTracker::kSearchX / kSearch)
+            InflateRect(&r, gx, gy);
+        }
+        RECT c{};
+        if (IntersectRect(&c, &r, &k.clip)) mark(c, 4, (int)i);
+    }
+}
+
+// The GPU tracker's results (a Direct3D 11 buffer: not shareable) drawn into a
+// 16x1 texture that is, and handed to the Direct3D 12 presenter's mask.
+bool Renderer::UpdateGpuShare()
+{
+    if (!m_p12) return false;
+    if (!m_gpuShareTex)
+    {
+        if (m_gpuShareFailed) return false;
+        static const char* kPS = "StructuredBuffer<int4> r : register(t0); int4 PSMain(float4 p : SV_Position) : SV_Target { return r[(int)p.x]; }";
+        ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = 16; td.Height = 1; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R32G32B32A32_SINT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+        if (FAILED(D3DCompile(kPS, strlen(kPS), "GpuShare", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err)) ||
+            FAILED(m_device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &m_gpuSharePS)) ||
+            FAILED(m_device->CreateTexture2D(&td, nullptr, &m_gpuShareTex)) ||
+            FAILED(m_device->CreateRenderTargetView(m_gpuShareTex, nullptr, &m_gpuShareRTV)))
+        {
+            Log("Renderer: the tracker offsets could not be shared with the Direct3D 12 presenter");
+            SAFE_RELEASE(m_gpuShareRTV); SAFE_RELEASE(m_gpuShareTex); SAFE_RELEASE(m_gpuSharePS);
+            m_gpuShareFailed = true;
+        }
+        SAFE_RELEASE(psb); SAFE_RELEASE(err);
+        if (!m_gpuShareTex) return false;
+    }
+    const D3D11_VIEWPORT vp{ 0, 0, 16, 1, 0, 1 };
+    m_context->OMSetRenderTargets(1, &m_gpuShareRTV, nullptr);
+    m_context->RSSetViewports(1, &vp);
+    m_context->RSSetState(nullptr);
+    m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_context->IASetInputLayout(nullptr);
+    m_context->VSSetShader(m_maskVS, nullptr, 0);
+    m_context->PSSetShader(m_gpuSharePS, nullptr, 0);
+    m_context->PSSetShaderResources(0, 1, &m_maskGpu);
+    m_context->Draw(3, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    m_context->PSSetShaderResources(0, 1, &none);
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    return m_p12->SetGpuResults(m_gpuShareTex);
+}
+
+// A band of the woven back buffer (rows y0 .. y0 + rows, the whole width, 4
+// bytes a pixel in memory order R G B A), read back now: after the weave of the
+// frame being drawn, before its present. Blocks; for a measurement, not a frame
+// in, frame out thing. False: not available (16-bit float output).
+bool Renderer::ReadBackRows(UINT y0, UINT rows, std::vector<uint8_t>& out)
+{
+    if (rows == 0 || y0 + rows > m_height) return false;
+    if (m_p12)
+    {
+        if (!m_p12->CopyRows(y0, rows)) return false;
+        m_p12->EndFrame();
+        m_p12->WaitIdle();
+        return m_p12->FetchRows(out);
+    }
+    if (!m_rtv || m_swapFormat != DXGI_FORMAT_R8G8B8A8_UNORM) return false;
+    D3D11_TEXTURE2D_DESC sd{};
+    sd.Width = m_width; sd.Height = rows; sd.MipLevels = 1; sd.ArraySize = 1; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* st = nullptr; ID3D11Resource* bb = nullptr;
+    bool ok = false;
+    m_rtv->GetResource(&bb);
+    if (bb && SUCCEEDED(m_device->CreateTexture2D(&sd, nullptr, &st)))
+    {
+        const D3D11_BOX box{ 0, y0, 0, m_width, y0 + rows, 1 };
+        m_context->CopySubresourceRegion(st, 0, 0, 0, 0, bb, 0, &box);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(m_context->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+        {
+            out.resize((size_t)m_width * rows * 4);
+            for (UINT y = 0; y < rows; ++y)
+                memcpy(&out[(size_t)y * m_width * 4], (const uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)m_width * 4);
+            m_context->Unmap(st, 0);
+            ok = true;
+        }
+    }
+    SAFE_RELEASE(st); SAFE_RELEASE(bb);
+    return ok;
+}
+
+// The picture drawn as it is (the light field: already interlaced for the lens
+// by the converter), in place of an SR weave: the left half of src -- one whole
+// picture, the size of the panel -- copied into the back buffer. Direct3D 11
+// presenter only.
+bool Renderer::BlitPicture(ID3D11Texture2D* src)
+{
+    if (!src || m_p12 || !m_rtv) return false;
+    ID3D11Resource* bb = nullptr;
+    m_rtv->GetResource(&bb);
+    if (!bb) return false;
+    D3D11_TEXTURE2D_DESC sd{};
+    src->GetDesc(&sd);
+    const D3D11_BOX box{ 0, 0, 0, (std::min)(m_width, sd.Width / 2), (std::min)(m_height, sd.Height), 1 };
+    m_context->CopySubresourceRegion(bb, 0, 0, 0, 0, src, 0, &box);
+    bb->Release();
+    return true;
+}
+
+// The bounds of what the mask leaves visible (client pixels), when that is
+// less than everything: false = all of the window. An empty rect: nothing.
+bool Renderer::WeaveBounds(RECT& out) const
+{
+    if (m_maskAll || m_planeMode) return false;
+    RECT b{ LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN };
+    auto add = [&](const RECT& r) {
+        if (r.right <= r.left || r.bottom <= r.top) return;
+        b.left = (std::min)(b.left, r.left); b.top = (std::min)(b.top, r.top);
+        b.right = (std::max)(b.right, r.right); b.bottom = (std::max)(b.bottom, r.bottom);
+    };
+    for (const RECT& r : m_maskRects) add(r);
+    for (const MaskTracked& k : m_maskTracked)
+    {
+        RECT r = k.rect;
+        // (It may move by up to the GPU tracker's search this frame: as FillMaskTiles.)
+        if (k.slot >= 0) InflateRect(&r, (int)std::ceil(48 * k.scale) + 1, (int)std::ceil(96 * k.scale) + 1);
+        RECT c{};
+        if (IntersectRect(&c, &r, &k.clip)) add(c);
+    }
+    const RECT all{ 0, 0, (LONG)m_width, (LONG)m_height };
+    if (b.right <= b.left || !IntersectRect(&out, &b, &all)) out = RECT{};
+    return true;
+}
+
+// Is the SR display in HDR mode (Windows' HDR switched on for it)? maxNits:
+// its peak brightness as it reports it.
+bool Renderer::DisplayIsHdr(float* maxNits)
+{
+    // (A factory of its own: an output's description is as it was when its
+    // factory was made, and HDR may have been switched since ours was.)
+    bool hdr = false;
+    const HMONITOR target = MonitorFromWindow(m_hwnd, MONITOR_DEFAULTTONEAREST);
+    IDXGIFactory1* f = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f))) return false;
+    IDXGIAdapter1* a = nullptr;
+    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; ++i)
+    {
+        IDXGIOutput* o = nullptr;
+        for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; ++j)
+        {
+            IDXGIOutput6* o6 = nullptr; DXGI_OUTPUT_DESC1 d{};
+            if (SUCCEEDED(o->QueryInterface(__uuidof(IDXGIOutput6), (void**)&o6)) && SUCCEEDED(o6->GetDesc1(&d)) && d.Monitor == target)
+            {
+                hdr = d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                if (maxNits) *maxNits = d.MaxLuminance;
+            }
+            SAFE_RELEASE(o6);
+            o->Release();
+        }
+        a->Release();
+    }
+    f->Release();
+    return hdr;
+}
+
+// The Direct3D 11 presenter's swap chain 16-bit float scRGB (HDR output)
+// instead of 8-bit sRGB: the weaver draws into whatever is bound.
+void Renderer::SetHdrOutput(bool on)
+{
+    if (on == m_hdrOut) return;
+    m_hdrOut = on;
+    if (!m_dcomp || m_p12) return;   // (the Direct3D 12 presenter has its own: SetDX12)
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    CreateDCompSwapChain();
+}
+
+bool Renderer::SetDX12(bool on, bool hdr)
+{
+    if (!m_dcomp || !m_dcVisual) return false;
+    if (on == (m_p12 != nullptr) && (!on || m_p12->IsHdr() == hdr)) return true;
+    if (on && m_p12) SetDX12(false, false);   // (the other output format: made anew)
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (on)
+    {
+        m_p12 = new Present12();
+        m_p12->SetHdr(hdr);
+        if (!m_p12->Initialize(m_device, m_context, m_factory, m_width, m_height, m_maskHLSL))
+        {
+            delete m_p12; m_p12 = nullptr;
+            return false;
+        }
+        SAFE_RELEASE(m_rtv);
+        SAFE_RELEASE(m_swapChain);
+        m_context->Flush();
+        m_swapChain = m_p12->SwapChain(); m_swapChain->AddRef();
+        m_swapFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        m_waitable = nullptr;
+        IDXGISwapChain2* sc2 = nullptr;
+        if (SUCCEEDED(m_swapChain->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2)))
+        {
+            m_waitable = sc2->GetFrameLatencyWaitableObject();
+            sc2->Release();
+        }
+        if (FAILED(m_dcVisual->SetContent(m_swapChain)) || FAILED(m_dcomp->Commit()))
+        {
+            Log("Renderer: the Direct3D 12 swap chain could not be shown -- back to Direct3D 11");
+            SAFE_RELEASE(m_swapChain); m_waitable = nullptr;
+            delete m_p12; m_p12 = nullptr;
+            CreateDCompSwapChain();
+            return false;
+        }
+        return true;
+    }
+    SAFE_RELEASE(m_swapChain); m_waitable = nullptr;
+    delete m_p12; m_p12 = nullptr;
+    return CreateDCompSwapChain();
+}
+
 void Renderer::ApplyMask()
 {
     if (m_planeMode) { m_maskDone = true; return; }   // (opaque: nothing to cut out)
+    if (m_p12)
+    {
+        // The same mask, drawn by the Direct3D 12 presenter after its weave.
+        m_p12->Mark(1);
+        m_maskDone = true;
+        const bool opaque = m_p12->AlphaState() == 2;
+        const bool holes = opaque && m_maskAll && m_maskRects.empty() && m_maskTracked.empty();
+        if (holes && m_maskExcl.empty()) return;
+        static std::vector<uint32_t> cb(kMaskCBBytes / 4), tiles(kMaskTilesBytes / 4);
+        // (The GPU tracker's offsets, for pictures that follow the page: copied
+        // into a small texture the presenter shares.)
+        const bool gpu = !m_maskTracked.empty() && m_maskGpu && UpdateGpuShare();
+        FillMaskConstants(cb.data(), gpu);
+        FillMaskTiles(tiles.data());
+        std::vector<D3D12_RECT> sc;
+        if (holes)
+        {
+            for (const MaskCut& c : m_maskExcl)
+            {
+                const D3D12_RECT r{ (std::max)(c.rect.left, 0L), (std::max)(c.rect.top, 0L),
+                                    (std::min)(c.rect.right, (LONG)m_width), (std::min)(c.rect.bottom, (LONG)m_height) };
+                if (r.right > r.left && r.bottom > r.top) sc.push_back(r);
+            }
+        }
+        else
+            sc.push_back(m_p12->Scissor());
+        if (!sc.empty()) m_p12->DrawMask(cb.data(), kMaskCBBytes, tiles.data(), kMaskTilesBytes, sc.data(), (int)sc.size());
+        return;
+    }
     if (!m_rtv || !m_maskPS || !m_dcomp) return;
+    m_context->RSSetState(nullptr);   // (the weave's scissor, if BindAndClearBackBuffer set one)
     m_maskDone = true;
     // Does the SR weave leave the picture opaque (alpha 1, as cleared)? Then
     // when everything is shown -- Fullscreen, a game -- the full-screen mask
@@ -465,72 +795,11 @@ void Renderer::ApplyMask()
     const bool holesOnly = m_alphaProbe == 2 && m_maskAll && m_maskRects.empty() && m_maskTracked.empty();
     if (holesOnly && m_maskExcl.empty()) return;   // (nothing hidden: nothing to do)
     if (FAILED(m_context->Map(m_maskCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
-    uint32_t* head = static_cast<uint32_t*>(m.pData);
-    head[0] = (uint32_t)m_maskRects.size();
-    head[1] = m_maskAll ? 1u : 0u;
-    head[2] = (uint32_t)m_maskTracked.size();
-    head[3] = (uint32_t)m_maskExcl.size();
-    float* f = reinterpret_cast<float*>(head + 4);
-    auto put = [&](float* at, const RECT& r) { at[0] = (float)r.left; at[1] = (float)r.top; at[2] = (float)r.right; at[3] = (float)r.bottom; };
-    float* rects  = f;               // 64
-    float* trRect = rects  + 64 * 4; // 16
-    float* trClip = trRect + 16 * 4; // 16
-    float* trInfo = trClip + 16 * 4; // 16
-    float* excl   = trInfo + 16 * 4; // 64
-    float* exRad  = excl + 64 * 4;   // 64 (16 float4s)
-    float* exOwn  = exRad + 64;      // 64 (16 float4s)
-    for (int i = 0; i < 64; ++i) { exRad[i] = 0.0f; exOwn[i] = -1.0f; }
-    for (size_t i = 0; i < m_maskRects.size(); ++i) put(rects + i * 4, m_maskRects[i]);
-    for (size_t i = 0; i < m_maskTracked.size(); ++i)
-    {
-        put(trRect + i * 4, m_maskTracked[i].rect);
-        put(trClip + i * 4, m_maskTracked[i].clip);
-        trInfo[i * 4 + 0] = (float)m_maskTracked[i].slot;
-        trInfo[i * 4 + 1] = m_maskTracked[i].scale;
-        trInfo[i * 4 + 2] = trInfo[i * 4 + 3] = 0.0f;
-    }
-    for (size_t i = 0; i < m_maskExcl.size(); ++i)
-    {
-        put(excl + i * 4, m_maskExcl[i].rect);
-        exRad[i] = (float)m_maskExcl[i].radius;
-        exOwn[i] = (float)m_maskExcl[i].owner;
-    }
+    FillMaskConstants(static_cast<uint32_t*>(m.pData), true);
     m_context->Unmap(m_maskCB, 0);
-
-    // Which rects can touch each tile (PSMain's tiles). A tracked picture may
-    // move by up to the GPU tracker's search this frame: its tiles cover that
-    // (within its viewport).
     if (m_maskTiles && SUCCEEDED(m_context->Map(m_maskTiles, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
     {
-        uint32_t* t = static_cast<uint32_t*>(m.pData);
-        memset(t, 0, 16 * (1 + 2 * kMaskTilesX * kMaskTilesY));
-        const int tw = (m_width + kMaskTilesX - 1) / kMaskTilesX, th = (m_height + kMaskTilesY - 1) / kMaskTilesY;
-        t[0] = kMaskTilesX; t[1] = kMaskTilesY; t[2] = (uint32_t)(std::max)(tw, 1); t[3] = (uint32_t)(std::max)(th, 1);
-        // word: 0/1 static rects (lo/hi), 2/3 holes (lo/hi), 4 tracked.
-        auto mark = [&](RECT r, int word, int bit) {
-            if (r.right <= r.left || r.bottom <= r.top || tw <= 0 || th <= 0) return;
-            const int x0 = (std::max)(0, (int)r.left / tw), x1 = (std::min)(kMaskTilesX - 1, (int)(r.right - 1) / tw);
-            const int y0 = (std::max)(0, (int)r.top / th),  y1 = (std::min)(kMaskTilesY - 1, (int)(r.bottom - 1) / th);
-            const int w = word + (bit >= 32 ? 1 : 0);
-            const uint32_t b = 1u << (bit & 31);
-            for (int y = y0; y <= y1; ++y)
-                for (int x = x0; x <= x1; ++x)
-                    t[4 + (y * kMaskTilesX + x) * 8 + w] |= b;
-        };
-        for (size_t i = 0; i < m_maskRects.size() && i < 64; ++i) mark(m_maskRects[i], 0, (int)i);
-        for (size_t i = 0; i < m_maskExcl.size() && i < 64; ++i) mark(m_maskExcl[i].rect, 2, (int)i);
-        for (size_t i = 0; i < m_maskTracked.size() && i < 16; ++i)
-        {
-            const MaskTracked& k = m_maskTracked[i];
-            RECT r = k.rect;
-            if (k.slot >= 0)
-            {
-                const int gx = (int)std::ceil(48 * k.scale) + 1, gy = (int)std::ceil(96 * k.scale) + 1;   // (GpuTracker::kSearchX / kSearch)
-                InflateRect(&r, gx, gy);
-            }
-            RECT c{};
-            if (IntersectRect(&c, &r, &k.clip)) mark(c, 4, (int)i);
-        }
+        FillMaskTiles(static_cast<uint32_t*>(m.pData));
         m_context->Unmap(m_maskTiles, 0);
     }
 
@@ -679,6 +948,12 @@ bool Renderer::Resize(UINT width, UINT height)
     if (width == m_width && height == m_height)
         return true;
 
+    if (m_p12)
+    {
+        if (!m_p12->Resize(width, height)) return false;
+        m_width = width; m_height = height;
+        return true;
+    }
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
     SAFE_RELEASE(m_rtv);
 
@@ -694,12 +969,72 @@ bool Renderer::Resize(UINT width, UINT height)
     return CreateBackBufferView();
 }
 
+// Straight to the display when nothing has to show through. A see-through
+// swap chain is composed with the desktop by Windows: a step that costs about
+// 5 ms from the weave to the display (measured 6.5 ms against 1.1), and makes
+// the screen capture see the whole screen as changed every refresh. An opaque
+// one, allowed to tear, Windows puts on the display directly. So: after a
+// second with the whole window shown and no cut-outs (a video or a game
+// filling the screen), the swap chain is made opaque; the moment anything has
+// to show through again (the taskbar, a window in front), see-through.
+void Renderer::UpdateAutoPlane()
+{
+    if (!m_autoPlane || !m_dcomp) return;
+    const bool clear = m_maskAll && m_maskRects.empty() && m_maskTracked.empty() && m_maskExcl.empty();
+    m_clearRun = clear ? m_clearRun + 1 : 0;
+    const bool want = clear && m_clearRun > 160;
+    if (want == m_planeMode) return;
+    m_planeMode = want;
+    m_context->OMSetRenderTargets(0, nullptr, nullptr);
+    bool ok = false;
+    if (m_p12)
+    {
+        SAFE_RELEASE(m_swapChain); m_waitable = nullptr;
+        ok = m_p12->RecreateSwapChain(m_factory, want, m_allowTearing);
+        if (ok)
+        {
+            m_swapChain = m_p12->SwapChain(); m_swapChain->AddRef();
+            m_swapFlags = m_p12->SwapFlags();
+            IDXGISwapChain2* sc2 = nullptr;
+            if (SUCCEEDED(m_swapChain->QueryInterface(__uuidof(IDXGISwapChain2), (void**)&sc2))) { m_waitable = sc2->GetFrameLatencyWaitableObject(); sc2->Release(); }
+            ok = SUCCEEDED(m_dcVisual->SetContent(m_swapChain)) && SUCCEEDED(m_dcomp->Commit());
+        }
+    }
+    else
+        ok = CreateDCompSwapChain();
+    Log("Renderer: the weave now goes %s%s", want ? "straight to the display (opaque: nothing to show through)" : "through Windows' compositor (see-through for cut-outs)",
+        ok ? "" : " -- FAILED");
+}
+
 void Renderer::BindAndClearBackBuffer()
 {
+    UpdateAutoPlane();
+    { LARGE_INTEGER q{}; QueryPerformanceCounter(&q); m_weaveQpc = q.QuadPart; }   // (the weave is called next: NotePresent)
+    if (m_p12)
+    {
+        // (Cleared and bound on its own command list. The weave is wanted only
+        // within the visible areas' bounds.)
+        RECT wb{};
+        if (WeaveBounds(wb)) m_p12->SetWeaveScissor(D3D12_RECT{ wb.left, wb.top, wb.right, wb.bottom });
+        else                 m_p12->ClearWeaveScissor();
+        m_p12->BeginFrame();
+        return;
+    }
     if (!m_rtv) return;
 
     const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     m_context->ClearRenderTargetView(m_rtv, black);
+    // (The weave only within the visible areas' bounds, when that is less than
+    // the window: a scissor rectangle, if the weaver keeps the state it finds.)
+    RECT wb{};
+    if (m_scissorRS && WeaveBounds(wb))
+    {
+        const D3D11_RECT sc{ wb.left, wb.top, wb.right, wb.bottom };
+        m_context->RSSetScissorRects(1, &sc);
+        m_context->RSSetState(m_scissorRS);
+    }
+    else
+        m_context->RSSetState(nullptr);
     m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
 
     D3D11_VIEWPORT vp{};
@@ -846,7 +1181,9 @@ void Renderer::Present(bool vsync, bool flushDwm)
         // waitable object (WaitForFrame) paces the loop.
         if (!m_maskDone) ApplyMask();
         m_maskDone = false;
+        if (m_p12) m_p12->EndFrame();   // (sent to its queue, behind Direct3D 11's drawing)
         m_swapChain->Present(0, (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        if (m_latencyStats) NotePresent();
         m_lastPresentEnd = std::chrono::steady_clock::now();
         return;
     }
@@ -867,15 +1204,43 @@ void Renderer::Present(bool vsync, bool flushDwm)
     UINT flags = (!vsync && (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))
                ? DXGI_PRESENT_ALLOW_TEARING : 0;
     m_swapChain->Present(vsync ? 1 : 0, flags);
+    if (m_latencyStats) NotePresent();
     m_lastPresentEnd = std::chrono::steady_clock::now();
+}
+
+// From the weave call to the picture being on the display, measured: each
+// present is remembered with when its weave was called; the swap chain's frame
+// statistics later say which present reached the display at which refresh.
+void Renderer::NotePresent()
+{
+    UINT count = 0;
+    if (FAILED(m_swapChain->GetLastPresentCount(&count))) return;
+    m_presRing[count % kPresRing] = { count, m_weaveQpc };
+    DXGI_FRAME_STATISTICS st{};
+    if (FAILED(m_swapChain->GetFrameStatistics(&st)) || st.PresentCount == m_statCount) return;
+    m_statCount = st.PresentCount;
+    const PresNote& r = m_presRing[st.PresentCount % kPresRing];
+    if (r.count != st.PresentCount || r.qpc == 0) return;
+    static LARGE_INTEGER f = [] { LARGE_INTEGER q{}; QueryPerformanceFrequency(&q); return q; }();
+    const double ms = (double)(st.SyncQPCTime.QuadPart - r.qpc) * 1000.0 / (double)f.QuadPart;
+    if (ms > 0.0 && ms < 200.0) { m_latSum += ms; if (ms > m_latMax) m_latMax = ms; if (ms < m_latMin) m_latMin = ms; ++m_latN; }
+}
+
+bool Renderer::TakeDisplayLatency(double& avgMs, double& minMs, double& maxMs, int& n)
+{
+    n = m_latN; avgMs = n ? m_latSum / n : 0.0; minMs = n ? m_latMin : 0.0; maxMs = m_latMax;
+    m_latSum = 0.0; m_latMax = 0.0; m_latMin = 1e9; m_latN = 0;
+    return n > 0;
 }
 
 void Renderer::Shutdown()
 {
     SAFE_RELEASE(m_rtv);
+    if (m_p12) { SAFE_RELEASE(m_swapChain); delete m_p12; m_p12 = nullptr; }
     SAFE_RELEASE(m_swapChain);
     SAFE_RELEASE(m_maskTilesSRV); SAFE_RELEASE(m_maskTiles);
     SAFE_RELEASE(m_scissorRS); SAFE_RELEASE(m_alphaProbeTex); m_alphaProbe = 0;
+    SAFE_RELEASE(m_gpuShareRTV); SAFE_RELEASE(m_gpuShareTex); SAFE_RELEASE(m_gpuSharePS);
     SAFE_RELEASE(m_maskCB); SAFE_RELEASE(m_maskBlend); SAFE_RELEASE(m_maskPS); SAFE_RELEASE(m_maskVS);
     SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
     { std::lock_guard<std::mutex> g(m_vblankMutex); SAFE_RELEASE(m_vblankOutput); }

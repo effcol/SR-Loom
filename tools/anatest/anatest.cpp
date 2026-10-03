@@ -446,6 +446,66 @@ int wmain(int argc, wchar_t** argv)
     Converter conv;
     if (!conv.Initialize(dev, ctx)) { fwprintf(stderr, L"converter init failed\n"); return 1; }
 #ifndef ANATEST_HEAD
+    // ANATEST_RGBDTEST=strength,look: the picture taken as colour | depth and
+    // each eye's view drawn from the depth. Reports how much the two eyes differ
+    // (none = no depth being applied) and the GPU time.
+    if (const char* rt = getenv("ANATEST_RGBDTEST"))
+    {
+        float strength = 50.0f, look = 0.0f; sscanf_s(rt, "%f,%f", &strength, &look);
+        Converter q; q.Initialize(dev, ctx);
+        q.SetFormat(StereoFormat::RGBD, false, 0, 0);
+        q.SetQuilt(4, 1, 0, 0, 0.0f, 0.0f);
+        q.SetTargetPaneSize(3840, 2160);
+        q.SetVRView(look, 0.0f, strength * 0.0008f);
+        q.SetFramePacking(0.5f, 1.0f, 0.0f);
+        const double ms = TimeConversions(dev, ctx, q, srv, (int)w, (int)h);
+        const auto o = ReadOutputBytes(dev, ctx, q);
+        const int ow = q.OutputPerEyeWidth() * 2, oh = q.OutputHeight();
+        long long differ = 0, n = 0; double sum = 0.0;
+        if ((int)o.size() >= ow * oh * 4)
+            for (int y = 0; y < oh; y += 5)
+                for (int x = 0; x < ow / 2; ++x)
+                {
+                    const int a = o[((size_t)y * ow + x) * 4 + 1], b = o[((size_t)y * ow + x + ow / 2) * 4 + 1];
+                    if (abs(a - b) > 2) ++differ;
+                    sum += a; ++n;
+                }
+        wprintf(L"RGB + depth, strength %.0f, look %.2f: output %dx%d, %.2f ms | the eyes differ at %.1f%% of pixels | mean green %.1f\n",
+                strength, look, ow, oh, ms, n ? 100.0 * differ / n : 0.0, n ? sum / n : 0.0);
+        q.Shutdown();
+        return 0;
+    }
+    // ANATEST_LFTEST=cols,rows,pitch,slant: the picture taken as a quilt and
+    // interlaced as a light field for a 3840x2160 panel. Checks that both
+    // halves of the output are the same picture (the SR weave of two equal eyes
+    // leaves it as it is), and how much neighbouring pixels differ (views
+    // alternating under the lens); the GPU time.
+    if (const char* lt = getenv("ANATEST_LFTEST"))
+    {
+        int qc = 8, qr = 6; float pitch = 1.8f, slant = 0.3f; sscanf_s(lt, "%d,%d,%f,%f", &qc, &qr, &pitch, &slant);
+        Converter q; q.Initialize(dev, ctx);
+        q.SetFormat(StereoFormat::Quilt, false, 0, 0);
+        q.SetQuilt(qc, qr, 0, 0, 0.0f, 0.0f);
+        q.SetTargetPaneSize(3840, 2160);
+        q.SetLightField(pitch, slant, 3840, 2160);
+        const double ms = TimeConversions(dev, ctx, q, srv, (int)w, (int)h);
+        const auto o = ReadOutputBytes(dev, ctx, q);
+        const int ow = q.OutputPerEyeWidth() * 2, oh = q.OutputHeight();
+        long long differ = 0, step = 0, n = 0;
+        if ((int)o.size() >= ow * oh * 4)
+            for (int y = 0; y < oh; y += 7)
+                for (int x = 0; x + 1 < ow / 2; ++x)
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        const int a = o[((size_t)y * ow + x) * 4 + c], b = o[((size_t)y * ow + x + ow / 2) * 4 + c], r = o[((size_t)y * ow + x + 1) * 4 + c];
+                        if (a != b) ++differ;
+                        step += abs(a - r); ++n;
+                    }
+        wprintf(L"light field %dx%d views, pitch %.4f px, slant %.4f: output %dx%d, %.2f ms | halves differ in %lld of %lld samples | mean step between neighbouring pixels %.2f\n",
+                qc, qr, pitch, slant, ow, oh, ms, differ, n, n ? (double)step / n : 0.0);
+        q.Shutdown();
+        return 0;
+    }
     // ANATEST_QUILTTEST=cols,rows: the picture taken as a quilt, converted for a
     // 3840x2160 pane, cross-fading between views: the two-pass resampling against
     // the one-pass (must match), and both GPU times.

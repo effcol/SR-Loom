@@ -76,6 +76,7 @@ namespace
         case StereoFormat::VR360TAB:
         case StereoFormat::VR360SBS:          return 10;  // VR equirect (sub-mode via cbuffer)
         case StereoFormat::FullSBS:           return 11;  // SBS + crop source to centre vertical 50%
+        case StereoFormat::RGBD:              return 13;  // colour | depth (12: Full TAB on a wide source, set in Convert)
         default:                              return 0;   // HalfSBS / unimplemented (sample source as-is)
         }
     }
@@ -102,6 +103,7 @@ namespace
         case StereoFormat::HalfTAB:
         case StereoFormat::RowInterleaved:    ew = w;     eh = h / 2; break;
         case StereoFormat::ColumnInterleaved: ew = w / 2; eh = h;     break;
+        case StereoFormat::RGBD:              ew = w / 2; eh = h;     break;   // (the picture is the colour half)
         case StereoFormat::VR180TAB:
         case StereoFormat::VR180SBS:
         case StereoFormat::VR360TAB:
@@ -355,7 +357,7 @@ void Converter::SetQuilt(int cols, int rows, int leftIdx, int rightIdx,
 
 bool Converter::EnsureOutput(int width, int height)
 {
-    if (m_outTex && width == m_outWidth && height == m_outHeight)
+    if (m_outTex && width == m_outWidth && height == m_outHeight && m_outShared == m_outShare && m_outHdr == m_hdr)
         return false;
 
     ReleaseOutput();
@@ -368,10 +370,14 @@ bool Converter::EnsureOutput(int width, int height)
     // (Typeless: the render target and shader views are the sRGB format; the
     // both-eyes compute shaders write through a plain UNORM view, encoding
     // themselves -- a UAV can't be sRGB.)
-    td.Format           = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    td.Format           = m_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_TYPELESS;
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DEFAULT;
     td.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    // (Shareable for the Direct3D 12 presenter, which weaves straight from it.)
+    if (m_outShare) td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    m_outShared = m_outShare;
+    m_outHdr = m_hdr;
     if (FAILED(m_device->CreateTexture2D(&td, nullptr, &m_outTex))) return false;
     D3D11_RENDER_TARGET_VIEW_DESC rd{}; rd.Format = m_format; rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     D3D11_SHADER_RESOURCE_VIEW_DESC vd{}; vd.Format = m_format; vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd.Texture2D.MipLevels = 1;
@@ -389,6 +395,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                         bool& outputResized)
 {
     outputResized = false;
+    m_outPred = nullptr;   // (set where this frame's drawing goes under the change predicate)
     if (!source || !m_ps || srcWidth <= 0 || srcHeight <= 0)
         return false;
 
@@ -473,6 +480,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     const bool recoveredColour = (m_fmt == StereoFormat::Anaglyph && m_anaMode == 4);
     if (m_halfWidthEyes && recoveredColour && ew > (srcWidth + 1) / 2)
         ew = (srcWidth + 1) / 2;
+    // (Light field: the output is the panel itself, pixel for pixel -- each
+    // sub-pixel is given its own view.)
+    if ((m_fmt == StereoFormat::Quilt || m_fmt == StereoFormat::RGBD) && m_lfPitch > 0.0f && m_lfW > 0 && m_lfH > 0) { ew = m_lfW; eh = m_lfH; }
     if (ew < 1) ew = 1;
     if (eh < 1) eh = 1;
     outputResized = EnsureOutput(ew * 2, eh);
@@ -642,7 +652,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                IsVR360(m_fmt) ? 1 : 0, IsVRSBS(m_fmt) ? 1 : 0,
                m_dispPrevValid ? 1.0f : 0.0f,
                anaRecover ? 16.0f * w16 / srcWidth : 1.0f,
-               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, changeSkip, decode, pairRefine, scrollOn, boxesNew ? 1.0f : 0.0f };
+               anaRecover ? 16.0f * h16 / srcHeight : 1.0f, changeSkip, decode, pairRefine, scrollOn, boxesNew ? 1.0f : 0.0f,
+               (m_fmt == StereoFormat::Quilt || m_fmt == StereoFormat::RGBD) ? m_lfPitch : 0.0f, m_lfSlant };
         for (int c = 0; c < 3; ++c)   // (the Custom pair: SetAnaCustom)
         {
             cb.anaMaskL[c] = m_anaMaskL[c]; cb.anaMaskR[c] = m_anaMaskR[c]; cb.anaWL[c] = m_anaWL[c]; cb.anaWR[c] = m_anaWR[c];
@@ -661,6 +672,30 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
 
     // Render one disparity-pyramid level: source at t0, an optional coarser-level
     // disparity at t2, output to a DispTarget.
+    // Conversion apart from the weave (the DX12 presenter): the GPU takes up
+    // other work -- the weave, on its own high-priority queue -- only between
+    // the batches of commands it is sent. So each pass is sent on its own, and
+    // the two long ones (the pair search, the compose) in bands down the
+    // picture: the weave then waits for a band, not for the whole conversion.
+    auto drawYield = [&](int height, bool bands)
+    {
+        if (m_yieldBands <= 0) { m_context->Draw(3, 0); return; }
+        if (!bands || m_yieldBands == 1 || !m_bandRS || height < m_yieldBands) { m_context->Draw(3, 0); m_context->Flush(); return; }
+        m_context->RSSetState(m_bandRS);
+        for (int b = 0; b < m_yieldBands; ++b)
+        {
+            const D3D11_RECT r{ 0, (LONG)((long long)height * b / m_yieldBands), 32768, (LONG)((long long)height * (b + 1) / m_yieldBands) };
+            m_context->RSSetScissorRects(1, &r);
+            m_context->Draw(3, 0);
+            m_context->Flush();
+        }
+        m_context->RSSetState(nullptr);
+    };
+    if (m_yieldBands > 1 && !m_bandRS)
+    {
+        D3D11_RASTERIZER_DESC rd{}; rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+        m_device->CreateRasterizerState(&rd, &m_bandRS);
+    }
     auto runDispPass = [&](ID3D11PixelShader* ps, const DispTarget& rt,
                            ID3D11ShaderResourceView* prior, ID3D11ShaderResourceView* src)
     {
@@ -671,7 +706,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->RSSetViewports(1, &vp);
         ID3D11ShaderResourceView* srvs[3] = { src, nullptr, prior };
         m_context->PSSetShaderResources(0, 3, srvs);
-        m_context->Draw(3, 0);
+        drawYield(rt.h, false);
         ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
         m_context->PSSetShaderResources(0, 3, nulls);
         m_context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -813,6 +848,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             m_context->PSSetShaderResources(8, 1, nul2);
             m_context->PSSetShaderResources(13, 2, nul2);
             m_context->SetPredication(m_changePred, FALSE);   // (nothing changed: all below is skipped)
+            m_outPred = m_changePred;
             // A page being scrolled: every block changed, but most of them are
             // last frame's, moved. How far (PSScrollCost / PSScrollPick), then
             // which blocks are exactly that (PSChangeScroll, in place of
@@ -987,7 +1023,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     // Quilt: the views resampled along their rows first (PSQuiltH), the compose
     // then only down the columns -- see Converter.hlsl.
     bool quiltRows = false;
-    if (m_fmt == StereoFormat::Quilt && m_psQuiltH && m_quiltTwoPass)
+    if (m_fmt == StereoFormat::Quilt && m_psQuiltH && m_quiltTwoPass && m_lfPitch <= 0.0f)
     {
         const int vh = (std::max)(1, srcHeight / (m_quiltRows > 0 ? m_quiltRows : 1));
         EnsureDispTarget(m_quiltH, m_outWidth, 2 * vh);
@@ -1028,7 +1064,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             m_context->PSSetShaderResources(9, 1, &src4);
             ID3D11ShaderResourceView* grow = changeSkip > 0.5f ? m_changeGrow.srv : nullptr;
             m_context->PSSetShaderResources(15, 1, &grow);
-            m_context->Draw(3, 0);
+            drawYield((int)vp.Height, true);
             ID3D11ShaderResourceView* nulls[3] = {};
             m_context->PSSetShaderResources(0, 3, nulls);
             m_context->PSSetShaderResources(9, 1, nulls);
@@ -1103,7 +1139,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(10, 4, ana);
         ID3D11ShaderResourceView* grow = changeSkip > 0.5f ? m_changeGrow.srv : nullptr;   // (the blocks to redraw: PSChange)
         m_context->PSSetShaderResources(15, 1, &grow);
-        m_context->Draw(3, 0);
+        drawYield(m_outHeight, true);
         ID3D11ShaderResourceView* nulls[3] = { nullptr, nullptr, nullptr };
         m_context->PSSetShaderResources(0, 3, nulls);
         ID3D11ShaderResourceView* nulls7[7] = {};
@@ -1314,6 +1350,26 @@ void Converter::CollectStats()
     }
 }
 
+// The output copied to dst (same size and format): when this frame's drawing
+// ran under the change predicate (nothing changed: nothing drawn), the copy
+// does too -- unless force (dst holds nothing yet).
+void Converter::CopyOutputTo(ID3D11Texture2D* dst, bool force)
+{
+    if (!dst || !m_outTex) return;
+    if (m_outPred && !force) m_context->SetPredication(m_outPred, FALSE);
+    m_context->CopyResource(dst, m_outTex);
+    m_context->SetPredication(nullptr, FALSE);
+}
+
+// Did the last Convert change the output? 1 yes (or drawn unconditionally),
+// 0 no, -1 not known yet (the GPU hasn't finished it).
+int Converter::OutputChanged()
+{
+    if (!m_outPred) return 1;
+    BOOL changed = FALSE;
+    return m_context->GetData(m_outPred, &changed, sizeof(changed), 0) == S_OK ? (changed ? 1 : 0) : -1;
+}
+
 bool Converter::TakeChangeStats(ChangeStats& out)
 {
     CollectStats();
@@ -1462,6 +1518,7 @@ void Converter::Shutdown()
     SAFE_RELEASE(m_psSmooth);
     SAFE_RELEASE(m_psPair);
     SAFE_RELEASE(m_psAnaCompose);
+    SAFE_RELEASE(m_bandRS);
     for (auto*& p : m_psFmt) SAFE_RELEASE(p);
     SAFE_RELEASE(m_tintSRV);
     SAFE_RELEASE(m_tintTex);

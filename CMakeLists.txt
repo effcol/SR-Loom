@@ -157,6 +157,7 @@ add_executable(SRLoom WIN32
     src/shaders/Converter.hlsl
     src/main.cpp
     src/Renderer.cpp
+    src/Present12.cpp
     src/SRWeaver.cpp
     src/TrayIcon.cpp
     src/Capture.cpp
@@ -233,6 +234,7 @@ target_link_libraries(SRLoom PRIVATE
     ${SR_IMPORT_LIBS}
     ${SR_THIRD_PARTY_LIBS}
     d3d11
+    d3d12
     dxgi
     dxguid
     d3dcompiler   # runtime HLSL compile for the smaller shaders (the Converter's are built ahead)
@@ -275,3 +277,27 @@ target_include_directories(captest PRIVATE ${CMAKE_SOURCE_DIR}/src ${SHADER_OUT_
 target_compile_definitions(captest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(captest PRIVATE d3d11 dxgi d3dcompiler user32 gdi32 windowsapp)
 set_target_properties(captest PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/captest)
+
+# dx12test: checks the D3D11 -> D3D12 texture sharing the DX12 weaver option is
+# built on (tools/dx12test). Not part of the app; built only when asked for:
+# cmake --build ... --target dx12test.
+add_executable(dx12test EXCLUDE_FROM_ALL tools/dx12test/dx12test.cpp)
+target_compile_definitions(dx12test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(dx12test PRIVATE d3d11 d3d12 dxgi)
+set_target_properties(dx12test PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/dx12test)
+
+# dx12bench: times Recovered Colour's compose kernel under Direct3D 11 and
+# Direct3D 12 (fxc, dxc, 16-bit floats). Not part of the app:
+# cmake --build ... --target dx12bench.
+add_executable(dx12bench EXCLUDE_FROM_ALL tools/dx12bench/dx12bench.cpp)
+target_compile_definitions(dx12bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(dx12bench PRIVATE d3d11 d3d12 dxgi d3dcompiler)
+set_target_properties(dx12bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/dx12bench)
+
+# lensprobe: what the SR SDK's weaving library reports for the lens (numbers
+# only; no window). cmake --build ... --target lensprobe.
+add_executable(lensprobe EXCLUDE_FROM_ALL tools/lensprobe/lensprobe.cpp)
+target_include_directories(lensprobe PRIVATE "${SR_SDK_DIR}/include")
+target_compile_definitions(lensprobe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(lensprobe PRIVATE ${SR_IMPORT_LIBS} ${SR_THIRD_PARTY_LIBS})
+set_target_properties(lensprobe PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release)

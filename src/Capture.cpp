@@ -173,7 +173,7 @@ bool Capture::StartCaptureInternalActive()
     auto size = m_impl->item.Size();
     m_impl->lastSize = size;
     m_impl->framePool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, size);
+        m_impl->device, (m_hdr ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized), kPoolBuffers, size);
     m_impl->session = m_impl->framePool.CreateCaptureSession(m_impl->item);
     // FrameArrived fires on a pool thread (free-threaded pool): just signal.
     if (!m_impl->frameEvent) m_impl->frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -422,7 +422,7 @@ bool Capture::Update(bool& sizeChanged)
             m_impl->lastSize = contentSize;
             ReleaseDirectViews();   // (the old buffers go)
             m_impl->framePool.Recreate(
-                m_impl->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, contentSize);
+                m_impl->device, (m_hdr ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized), kPoolBuffers, contentSize);
         }
         if (!touched) return false;   // (nothing inside what we weave changed)
         ++m_version;   // (new pixels in m_tex)
@@ -457,16 +457,40 @@ void Capture::EnsureCopy()
     m_contentValid = true;
 }
 
+// HDR: frames captured as 16-bit float (scRGB: linear, brighter-than-white
+// values kept) instead of 8-bit. A session under way is re-made in the new
+// format; the copies and views follow.
+void Capture::SetHdr(bool on)
+{
+    if (on == m_hdr) return;
+    m_hdr = on;
+    m_texFormat = on ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    m_srvFormat = on ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!m_impl || !m_impl->framePool) return;
+    try
+    {
+        if (m_impl->held) { m_impl->held.Close(); m_impl->held = nullptr; m_impl->heldTex = nullptr; }
+        ReleaseDirectViews();
+        SAFE_RELEASE(m_full);
+        ReleaseTarget();
+        m_contentValid = false;
+        m_impl->framePool.Recreate(m_impl->device,
+            on ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized, kPoolBuffers, m_impl->lastSize);
+        Log("Capture: frames now %s", on ? "16-bit float (HDR)" : "8-bit");
+    }
+    catch (hresult_error const& e) { Log("Capture: changing the frame format failed (0x%08X)", (unsigned)e.code()); }
+}
+
 ID3D11ShaderResourceView* Capture::DirectSRV(bool& encoded)
 {
     encoded = false;
     if (!m_direct || !m_impl || !m_impl->heldTex) return SRV();
     ID3D11Texture2D* tex = m_impl->heldTex.get();
     for (const DirectView& v : m_views)
-        if (v.tex == tex) { encoded = true; return v.srv; }
+        if (v.tex == tex) { encoded = !m_hdr; return v.srv; }   // (16-bit float frames are linear already)
     // A buffer not seen yet: a plain UNORM view of it (all it allows).
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format              = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.Format              = m_hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MipLevels = 1;
     ID3D11ShaderResourceView* srv = nullptr;
@@ -481,7 +505,7 @@ ID3D11ShaderResourceView* Capture::DirectSRV(bool& encoded)
     SAFE_RELEASE(slot.tex);
     slot.tex = tex; tex->AddRef();
     slot.srv = srv;
-    encoded = true;
+    encoded = !m_hdr;
     return srv;
 }
 
@@ -625,6 +649,7 @@ bool Capture::EnsureTarget(int width, int height)
     sd.Texture2D.MipLevels = 1;
     if (FAILED(m_device->CreateShaderResourceView(m_tex, &sd, &m_srv)))
     {
+        SAFE_RELEASE(m_full);
         ReleaseTarget();
         return false;
     }

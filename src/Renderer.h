@@ -12,6 +12,7 @@
 struct IDCompositionDevice;
 struct IDCompositionTarget;
 struct IDCompositionVisual;
+namespace srw { class Present12; }
 
 namespace srw
 {
@@ -82,6 +83,28 @@ namespace srw
         // allowed to tear, so it can be put on a display plane of its own. Before
         // Initialize.
         void SetPlaneMode(bool on) { m_planeMode = on; }
+        // ... chosen by itself: opaque (straight to the display) while nothing has to
+        // show through, see-through otherwise. See UpdateAutoPlane.
+        void SetAutoPlane(bool on) { m_autoPlane = on; }
+        bool IsPlane() const { return m_planeMode; }
+        // The Direct3D 12 presenter (the DX12 weaver choice) in place of the
+        // Direct3D 11 one, or back: DirectComposition only. False when it could
+        // not be made (the Direct3D 11 presenter then stays, or is restored).
+        // hdr: its swap chain 16-bit float scRGB (Settings HdrOutput).
+        bool SetDX12(bool on, bool hdr = false);
+        bool WeaveBounds(RECT& out) const;
+        bool DisplayIsHdr(float* maxNits = nullptr);
+        bool BlitPicture(ID3D11Texture2D* src);   // (see Renderer.cpp)
+        bool ReadBackRows(UINT y0, UINT rows, std::vector<uint8_t>& out);   // (see Renderer.cpp)
+        // Weave call to picture on the display, as measured since the last call
+        // (ms; false: no measurements).
+        bool TakeDisplayLatency(double& avgMs, double& minMs, double& maxMs, int& n);
+        // (Measured only when asked for: the Perf Log.)
+        void SetLatencyStats(bool on) { m_latencyStats = on; }
+        // The Direct3D 11 presenter drawing 16-bit float scRGB (Settings HdrOutput).
+        void SetHdrOutput(bool on);
+        bool IsDX12() const { return m_p12 != nullptr; }
+        Present12* DX12() const { return m_p12; }
         // Loops since the last call, and those that began with the frame before
         // still in the swap chain's queue (see WaitForFrame).
         void TakeQueueStats(int& checks, int& busy) { checks = m_queueChecks; busy = m_queueBusy; m_queueChecks = m_queueBusy = 0; }
@@ -120,6 +143,26 @@ namespace srw
         bool CreateBackBufferView();
         bool CreateDCompSwapChain();
         bool InitMask();
+        static constexpr UINT   kMaskCBBytes = 16 + 16 * (64 + 16 * 3 + 64 + 16 + 16);   // (the mask shader's cbuffer M)
+        void FillMaskConstants(uint32_t* head, bool gpuSlots) const;
+        void FillMaskTiles(uint32_t* t) const;
+        bool UpdateGpuShare();
+        ID3D11Texture2D*        m_gpuShareTex = nullptr;   // the GPU tracker's results, shareable (UpdateGpuShare)
+        ID3D11RenderTargetView* m_gpuShareRTV = nullptr;
+        ID3D11PixelShader*      m_gpuSharePS = nullptr;
+        bool                    m_gpuShareFailed = false;
+        Present12*              m_p12       = nullptr; // (SetDX12)
+        bool                    m_hdrOut    = false;   // (SetHdrOutput)
+        void NotePresent();
+        struct PresNote { UINT count = 0; LONGLONG qpc = 0; };
+        static constexpr UINT   kPresRing = 32;
+        PresNote                m_presRing[kPresRing];
+        LONGLONG                m_weaveQpc = 0;
+        UINT                    m_statCount = 0;
+        double                  m_latSum = 0.0, m_latMax = 0.0, m_latMin = 1e9;
+        int                     m_latN = 0;
+        bool                    m_latencyStats = false;
+        const char*             m_maskHLSL  = nullptr; // the mask shader source (InitMask)
         bool                    m_maskDone  = false;   // applied this frame already (ApplyMaskNow)
         int                     m_alphaProbe = 0;      // does the weave leave alpha 1? 0 unknown, 1 read back pending, 2 yes, 3 no (ApplyMask)
         ID3D11Texture2D*        m_alphaProbeTex = nullptr;
@@ -135,6 +178,7 @@ namespace srw
         ID3D11Buffer*           m_maskTiles = nullptr;   // which rects touch each screen tile (the mask shader's t1)
         ID3D11ShaderResourceView* m_maskTilesSRV = nullptr;
         static constexpr int    kMaskTilesX = 32, kMaskTilesY = 18;
+        static constexpr UINT   kMaskTilesBytes = 16 * (1 + 2 * kMaskTilesX * kMaskTilesY);
         bool                    m_maskAll   = true;
         std::vector<RECT>       m_maskRects;
         std::vector<MaskTracked> m_maskTracked;
@@ -160,6 +204,9 @@ namespace srw
         ULONGLONG               m_clockCheckMs = 0;
         bool                    m_allowTearing = false; // GPU/OS supports tearing (VRR)
         bool                    m_planeMode = false;    // (SetPlaneMode)
+        bool                    m_autoPlane = false;    // (SetAutoPlane)
+        int                     m_clearRun = 0;         // frames in a row with nothing to show through
+        void UpdateAutoPlane();
         bool                    m_flip       = true;    // current model: true=flip, false=bit-blt
         bool                    m_layered    = false;   // current window layered state
 

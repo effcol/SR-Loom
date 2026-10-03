@@ -4,6 +4,7 @@
 
 #include "Common.h"
 #include "Renderer.h"
+#include "Present12.h"
 #include "SRWeaver.h"
 #include "TrayIcon.h"
 #include "UpdateChecker.h"
@@ -464,6 +465,8 @@ namespace
         bool                 marked[kCount] = {};
         ID3D11DeviceContext* ctx = nullptr;
         double               seg[kCount] = {}; // seg[i] = ts[i] - ts[i-1], summed
+        double               lastConvMs = 0.0; // the latest frame's conversion (after the capture, up to the weave)
+        unsigned             lastConvSerial = 0;
         int                  n = 0;
 
         bool Init(ID3D11Device* dev, ID3D11DeviceContext* c)
@@ -522,6 +525,8 @@ namespace
                 if (dj.Disjoint || dj.Frequency == 0) continue;
                 const double k = 1000.0 / (double)dj.Frequency;
                 for (int i = 1; i < kCount; ++i) seg[i] += (double)(t[i] - t[i - 1]) * k;
+                lastConvMs = (double)(t[kOurs] - t[kCapture]) * k;
+                ++lastConvSerial;
                 ++n;
             }
         }
@@ -623,7 +628,7 @@ namespace
         HWND                         autoScopeWindow = nullptr;
         bool                         analysisDeferred = false;   // Auto Stereo's CPU analysis runs after this frame's present
         bool                         overlayRgnValid = false;    // the window-overlay's rounded-corner shape is set (UpdateOverlayTracking)
-        bool                         eyeOrderDetect = true;      // Settings::ReadEyeOrderDetect (polled)
+        bool                         eyeOrderDetect = false;     // Settings::ReadEyeOrderDetect (polled)
         bool                         autoEyeSwap = false;        // whole-display weave (fullscreen 3D): detected with the eyes swapped
         // A layout picked by hand (or found for a whole picture): its eye order,
         // checked every 1.5 s in the background (UpdateManualEyeOrder).
@@ -677,6 +682,35 @@ namespace
         double                       autoTimeReadbackMs = 0;   // ... of which: reading the analysis image back from the GPU
         bool                         paceOnCapture = false;    // this loop is paced by capture frames, not DwmFlush
         bool                         deferHeavyConvert = false;// Recovered Colour converted after the present, woven next loop (Settings DeferRecovered)
+        bool                         hdrActive = false;        // the 16-bit float chain is in use (StartSRSession)
+        bool                         hdrDisplay = false;       // Windows has HDR on for the SR display (as last looked)
+        bool                         weaverLatencyAuto = false; // (Settings WeaverLatency 1)
+        double                       latencyEma = 0.0;
+        int                          actApplied = 0;           // (the anti-crosstalk setting last given to the weaver)
+        bool                         actTouched = false;       // (it has been changed from the display's default this run)
+        bool                         lfOn = false, lfSlantSet = false;   // light field (Settings LightField...)
+        float                        lfPitch = 0.0f, lfSlant = 0.0f, lfOffset = 0.0f, lfOffsetNow = 0.0f;
+        int                          lfFollow = 0;             // (Settings LfFollow: the viewing distance taken from the camera)
+        bool                         lfCentre = false;         // (Settings LfCentre: the views kept aimed at the tracked viewer)
+        float                        lfFanCm = 11.6f;          // (how wide the lens' fan of views is where they are aimed)
+        float                        rgbdStrength = 50.0f, rgbdFocus = 50.0f, rgbdLookX = 0.0f, rgbdLookY = 0.0f;   // RGB + depth (Settings Rgbd*)
+        int                          rgbdFlags = 4;            // (1 depth on the left, 2 black near, 4 the side found automatically)
+        bool                         rgbdLook = true;
+        float                        lfSpread = 0.3f;          // (Settings LfSpread: the part of the Quilt's views the fan shows)
+        bool                         lfGeoValid = false;       // (the light field's lens geometry, from the SDK, for the place below)
+        float                        lfGeoPitch = 0.0f, lfGeoSlant = 0.0f, lfGeoPhase = 0.0f, lfGeoX = 0.0f, lfGeoY = 0.0f, lfGeoZ = 0.0f;
+        UINT                         lfGeoW = 0;
+        float                        lfDistanceCm = 60.0f;     // (Settings LfDistance: where the fans are aimed)
+        bool                         lfPattern = false;        // (Settings LfPattern: the alignment pattern)
+        bool                         asyncConvert = true;      // DX12: Recovered Colour converted apart from the weave (Settings AsyncConvert)
+        bool                         asyncMode = false;        // (the weave reads the presenter's own picture: conversion apart from the weave)
+        double                       asyncWaitMs = 1.2;        // (how long the weave waits for a conversion under way: Settings AsyncWaitUs)
+        int                          asyncBands = 4;           // (the conversion sent to the GPU in pieces: Settings AsyncBands)
+        bool                         asyncSlow = false;        // (conversions are slow at the moment: apart from the weave)
+        double                       asyncEnterMs = 3.5;       // (a conversion this long is slow: Settings AsyncEnterUs)
+        int                          asyncSlowRun = 0;         // (slow conversions in a row)
+        unsigned                     asyncSeenSerial = 0;
+        ULONGLONG                    asyncSlowAt = 0;          // (when one last took over 2.5 ms)
         ID3D11ShaderResourceView*    deferSrc = nullptr;       // ... this loop's source, until then
         int                          deferW = 0, deferH = 0;
         // GPU scroll tracking (DirectComposition presenter only): content
@@ -3666,6 +3700,77 @@ namespace
         return a.lastOutput;
     }
 
+    // Starts the SR session with the weaver chosen in Settings. The DX12 choice
+    // first swaps the presenter for its Direct3D 12 one (same window, same
+    // pacing) and has the converter make its output shareable, so the weave
+    // reads it without a copy; when that presenter or its weaver can't be
+    // made, the Direct3D 11 presenter and weaver as before.
+    // HDR: is the 16-bit float chain (capture, conversion, output) to be used now?
+    // Settings HdrOutput: 1 (default) when Windows has HDR switched on for the SR
+    // display, 2 always, 0 never. Only for the layouts that pass the picture's
+    // values straight through (side-by-side, top-and-bottom, interleaved,
+    // checkerboard): brighter-than-white picture is kept. The others (the
+    // anaglyph modes and the rest) work on 0..1 values and would come out
+    // capped at 80 nits, dimmer than the desktop -- they stay on the 8-bit chain,
+    // which Windows shows at its own SDR brightness. Not with Automatic
+    // detection or Auto Stereo, which read the screen as 8-bit.
+    bool HdrWanted(AppState& app, bool displayHdr)
+    {
+        const int set = Settings::ReadHdrOutput();
+        if (!(set == 2 || (set == 1 && displayHdr)) || !app.renderer.IsDComp()) return false;
+        if (app.autoInput || app.autoStereo) return false;
+        switch (app.format)
+        {
+        case StereoFormat::FullSBS: case StereoFormat::HalfSBS: case StereoFormat::FullTAB: case StereoFormat::HalfTAB:
+        case StereoFormat::RowInterleaved: case StereoFormat::ColumnInterleaved: case StereoFormat::Checkerboard:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // The untracked light field needs no weaver and no tracking: the session is
+    // then the lens alone, and the eye-tracking camera stays off. (With Distance
+    // From Camera the tracker is wanted, so the ordinary session.)
+    bool LensOnlyWanted(AppState& app)
+    {
+        return app.lfOn && (app.format == StereoFormat::Quilt || app.format == StereoFormat::RGBD) && !app.lfFollow && !app.lfCentre;
+    }
+
+    bool StartSRSession(AppState& app)
+    {
+        if (app.weaver.HasWeaver()) return true;
+        const bool lensOnly = LensOnlyWanted(app);
+        app.weaver.SetLensOnly(lensOnly);
+        const bool want12 = !lensOnly && Settings::ReadWeaverChoice() >= 4 && app.renderer.IsDComp();   // (4 the modern Direct3D 12 weaver; lens only draws with Direct3D 11)
+        float hdrNits = 0.0f;
+        const bool hdrOn = app.renderer.DisplayIsHdr(&hdrNits);
+        const bool hdrOut = HdrWanted(app, hdrOn);
+        app.hdrDisplay = hdrOn; app.hdrActive = hdrOut;
+        const bool have12 = want12 && app.renderer.SetDX12(true, hdrOut);
+        {
+            Log("SR display: HDR %s in Windows (peak %.0f nits as reported)%s", hdrOn ? "ON" : "off", hdrNits,
+                hdrOut ? " -- 16-bit float output chosen (Settings HdrOutput)" : "");
+        }
+        if (!have12 && app.renderer.IsDX12()) app.renderer.SetDX12(false);
+        if (!have12) app.renderer.SetHdrOutput(hdrOut);   // (the Direct3D 11 presenter's)
+        app.weaver.SetPresenter12(have12 ? app.renderer.DX12() : nullptr);
+        const bool ok = app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+        if (have12 && !app.weaver.IsDX12())
+        {
+            app.weaver.SetPresenter12(nullptr);
+            app.renderer.SetDX12(false);
+        }
+        if (want12) Log("Weaver: DX12 chosen -- %s", app.weaver.IsDX12() ? "Direct3D 12 presenter and weaver" : "not available, using Direct3D 11");
+        app.converter.SetShareableOutput(app.weaver.IsDX12());
+        app.regionWeaver.SetShareable(app.weaver.IsDX12());
+        // (HDR: the capture, the conversion and the output all 16-bit float.)
+        app.capture.SetHdr(hdrOut);
+        app.converter.SetHdr(hdrOut);
+        app.captureRebind = true;   // (the weaver needs its input again)
+        return ok;
+    }
+
     void SetWeaving(AppState& app, bool enable)
     {
         app.weavingEnabled = enable;
@@ -3687,7 +3792,7 @@ namespace
                                       && !app.katanga.IsReceiving());
             if (!app.weaver.HasWeaver())
             {
-                app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                StartSRSession(app);
                 // (The SR display may have been moved -- e.g. the Windows display
                 // arrangement changed -- since start-up asked.)
                 RECT rc{};
@@ -3761,7 +3866,7 @@ namespace
                                   && !app.katanga.IsReceiving());
         if (!app.weaver.HasWeaver())
         {
-            app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+            StartSRSession(app);
             app.captureRebind = true;
         }
         // Lens hint matches format state: lens off during Katanga arm
@@ -6864,7 +6969,8 @@ namespace
                                         (app.manualAnaKind == 2 && app.manualAnaTint) ? 5 : app.anaglyphMode;
                 // (Recovered Colour too: it checks the frame for change before copying
                 // it for itself -- Converter::Convert, directSrc.)
-                const bool direct = !app.autoStereo && (srw::Converter::CheapEncodedSource(app.format, convAnaMode) ||
+                const bool direct = !app.autoStereo && !app.capture.IsHdr() &&   /* (16-bit float frames: the copy -- no decoding to save) */
+                                    (srw::Converter::CheapEncodedSource(app.format, convAnaMode) ||
                                     (app.format == StereoFormat::Anaglyph && convAnaMode == 4 && app.converter.RecoveredWantsDirect()));
                 srcSRV = direct ? app.capture.DirectSRV(srcEncoded) : app.capture.SRV();
                 srcW   = app.capture.Width();
@@ -6915,7 +7021,7 @@ namespace
                             (void*)app.katangaPublisherWnd);
                     }
                     if (!app.weaver.HasWeaver())
-                        app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                        StartSRSession(app);
                     app.weaver.LensEnable();
                     ShowWindow(app.hwnd, SW_SHOW);
                     SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -7459,9 +7565,77 @@ namespace
                 const FramePackPreset& fp = fps[(app.framePackMode >= 0 && app.framePackMode < fpN) ? app.framePackMode : 0];
                 app.converter.SetFramePacking(fp.eyeFrac, fp.gapFrac, fp.eyeAlign);
             }
-            app.converter.SetQuilt(app.quiltCols, app.quiltRows,
-                                   app.quiltLeftIdx, app.quiltRightIdx,
-                                   app.quiltLeftBlend, app.quiltRightBlend);
+            // Light field (an experiment): the Quilt's views interlaced by SR Loom.
+            // Which view a sub-pixel shows is where under its lens it is seen from
+            // the place the views are aimed at -- straight ahead at the Viewing
+            // Distance, or the tracked head with Follow My Head -- as the SDK's own
+            // weaving library gives it for this display (GetLightFieldGeometry).
+            // The middle of the fan of views then points at that place by itself;
+            // Offset turns it from there.
+            {
+                float lfP = 0.0f, lfS = 0.0f;
+                app.lfOffsetNow = app.lfOffset;
+                if (app.lfOn && (app.format == StereoFormat::Quilt || app.format == StereoFormat::RGBD))
+                {
+                    float x = 0.0f, y = 0.0f, z = app.lfDistanceCm;
+                    double hp[3] = {}, ho[3] = {};
+                    // (Distance From Camera: how far away the tracked viewer is -- the
+                    // distance only; the views stay aimed straight ahead.)
+                    if (app.lfFollow && app.weaver.GetHeadPose(hp, ho) && hp[2] > 100.0)
+                        z = (float)(hp[2] / 10.0);   // (mm -> cm)
+                    // (Centre On Me: where the tracked viewer is sideways and in height
+                    // too -- the views aimed there.)
+                    if (app.lfCentre && app.weaver.GetHeadPose(hp, ho) && hp[2] > 100.0)
+                    { x = (float)(hp[0] / 10.0); y = (float)(hp[1] / 10.0); }
+                    // (Asked again only when the place moves: a millimetre, or the distance.)
+                    if (!app.lfGeoValid || std::abs(x - app.lfGeoX) > 0.1f || std::abs(y - app.lfGeoY) > 0.1f || std::abs(z - app.lfGeoZ) > (app.lfFollow ? 2.0f : 0.1f) ||
+                        app.renderer.Width() != app.lfGeoW)
+                    {
+                        app.lfGeoValid = app.weaver.GetLightFieldGeometry((float)app.renderer.Width(), (float)app.renderer.Height(), x, y, z,
+                                                                          app.lfGeoPitch, app.lfGeoSlant, app.lfGeoPhase);
+                        app.lfGeoX = x; app.lfGeoY = y; app.lfGeoZ = z; app.lfGeoW = app.renderer.Width();
+                        // (How wide the fan of views is there: the phase a centimetre to
+                        // the side tells -- for views drawn to order, RGB + depth.)
+                        float p1 = 0.0f, s1 = 0.0f, c1 = 0.0f;
+                        if (app.lfGeoValid && app.weaver.GetLightFieldGeometry((float)app.renderer.Width(), (float)app.renderer.Height(), x + 1.0f, y, z, p1, s1, c1))
+                        {
+                            float d = c1 - app.lfGeoPhase; d -= std::floor(d + 0.5f);
+                            if (std::abs(d) > 1e-4f) app.lfFanCm = 1.0f / std::abs(d);
+                        }
+                        if (app.lfGeoValid && !app.lfFollow)
+                            Log("Light field: aimed at %.0f cm -- lens pitch %.5f px, slant %.5f, phase at the middle %.3f (from the SR SDK)",
+                                z, app.lfGeoPitch, app.lfGeoSlant, app.lfGeoPhase);
+                        else if (!app.lfGeoValid) Log("Light field: the SDK gave no lens geometry");
+                    }
+                    if (app.lfGeoValid)
+                    {
+                        lfP = app.lfGeoPitch; lfS = app.lfGeoSlant;
+                        // (The shader counts the phase from the middle of the picture, + 0.5.)
+                        const float o = app.lfGeoPhase - 0.5f + app.lfOffset;
+                        app.lfOffsetNow = o - std::floor(o);
+                    }
+                }
+                else app.lfGeoValid = false;
+                app.converter.SetLightField(lfP, lfS, (int)app.renderer.Width(), (int)app.renderer.Height());
+            }
+            {
+                // (Light field: the Quilt's pair-of-views parameters carry its own --
+                // the right index the alignment pattern's switch, the left blend the
+                // fan's offset, the right blend the spread of views shown.)
+                const bool rgbd = app.format == StereoFormat::RGBD;
+                const bool lf = app.lfOn && (app.format == StereoFormat::Quilt || rgbd);
+                // (RGB + depth: the layout bits ride in the column count, from 4 up;
+                // the light field's reach in eye spacings, a quarter of it, in the
+                // right blend -- the fan's width over 6.3 cm.)
+                if (rgbd)
+                    app.converter.SetQuilt(4 + (app.rgbdFlags & 7), 1, 0, (lf && app.lfPattern) ? 1 : 0,
+                                           lf ? app.lfOffsetNow : 0.0f, lf ? (std::min)(1.0f, app.lfFanCm / 6.3f * 0.25f) : 0.0f);
+                else
+                app.converter.SetQuilt(app.quiltCols, app.quiltRows,
+                                       app.quiltLeftIdx, lf ? (app.lfPattern ? 1 : 0) : app.quiltRightIdx,
+                                       lf ? app.lfOffsetNow : app.quiltLeftBlend,
+                                       lf ? app.lfSpread : app.quiltRightBlend);
+            }
             // VR view -- if Headlook is on, fold the user's head ORIENTATION
             // (not position) into the view direction. LeiaSR ho[] mapping
             // (matches leia-track-app-XYZ's track_pipeline.h):
@@ -7506,6 +7680,20 @@ namespace
                 app.vrFilterInit = false;
             }
             app.converter.SetVRView(vrYawEffective, vrPitchEffective, app.vrZoom);
+            // RGB + depth: its figures in the constants it has no other use for (see
+            // rgbdView in the shader). The strength: up to 8% of the picture's width
+            // of shift per eye spacing, nearest against furthest. Looking around:
+            // where the head is, in eye spacings from the middle (smoothed a little).
+            if (app.format == StereoFormat::RGBD)
+            {
+                float lx = 0.0f, ly = 0.0f;
+                double hp[3] = {}, ho[3] = {};
+                if (!app.weaver.IsLensOnly() && app.weaver.GetHeadPose(hp, ho) && hp[2] > 100.0)   // (always, when there is tracking: the light field is the way to be without)
+                { lx = (float)(hp[0] / 63.0); ly = (float)((hp[1]) / 63.0); }
+                app.rgbdLookX += (lx - app.rgbdLookX) * 0.35f; app.rgbdLookY += (ly - app.rgbdLookY) * 0.35f;
+                app.converter.SetVRView(app.rgbdLookX, app.rgbdLookY, app.rgbdStrength * 0.0008f);
+                app.converter.SetFramePacking(app.rgbdFocus * 0.01f, 1.0f, 0.0f);
+            }
             // Pane = SWAP CHAIN size, not SR panel size. The weaver samples
             // the SBS pane at the output's UV, so a pane that doesn't match
             // the swap-chain aspect gets squeezed when the weaver writes its
@@ -7566,11 +7754,79 @@ namespace
                 }
                 EyedropEnd(app);
             }
-            if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
+            // DX12, Recovered Colour: conversion apart from the weave (see
+            // Present12.cpp) -- while conversions are slow (video, a screenful
+            // redrawn: over 3.5 ms of GPU each). The weave reads a picture of
+            // its own, so it goes out every refresh whatever the conversion
+            // takes, and no conversion starts while the one before is still
+            // running. Quick conversions (most browsing) stay as they were: the
+            // weave waits for them on the GPU and shows them the same refresh.
+            Present12* p12 = app.renderer.DX12();
+            // (Any layout: Recovered Colour is the one that gets there on a fast
+            // GPU, but on a slow one any conversion can outlast a refresh.)
+            const bool asyncAble = app.asyncConvert && p12 && app.weaver.IsDX12() &&
+                                   fromCapture && !app.deferSrc && !app.autoStereo;
+            if (asyncAble)
             {
-                app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
-                                        app.converter.OutputHeight(), app.converter.OutputFormat());
-                app.captureRebind = false;
+                const double c = app.gpuTimer.lastConvMs;
+                const ULONGLONG nowMs = GetTickCount64();
+                // (Three slow ones in a row, quick ones between them aside from
+                // frames with nothing to do: one long frame -- the first, a new
+                // page -- isn't video.)
+                if (app.gpuTimer.lastConvSerial != app.asyncSeenSerial)
+                {
+                    app.asyncSeenSerial = app.gpuTimer.lastConvSerial;
+                    if (c > app.asyncEnterMs) ++app.asyncSlowRun; else if (c > app.asyncEnterMs * 0.17) app.asyncSlowRun = 0;
+                    if (c > app.asyncEnterMs * 0.7) app.asyncSlowAt = nowMs;
+                }
+                if (!app.asyncSlow && app.asyncSlowRun >= 3) { app.asyncSlow = true; Log("Conversion apart from the weave: on (conversions taking %.1f ms)", c); }
+                else if (app.asyncSlow && nowMs - app.asyncSlowAt > 2000) { app.asyncSlow = false; Log("Conversion apart from the weave: off (conversions quick again)"); }
+            }
+            else { app.asyncSlow = false; app.asyncSlowRun = 0; }
+            const bool asyncConv = asyncAble && app.asyncSlow;
+            app.asyncMode = asyncConv;   // (kept through loops that don't come by here: no new frame)
+            app.converter.SetGpuYield(asyncConv ? app.asyncBands : 0);
+            if (app.deferSrc) {}   // (put off until after the present: below)
+            // (One still running is given a moment -- then the next can start in
+            // this very loop; else none starts.)
+            else if (asyncConv && p12->IsAsync() && p12->ConversionPending() && !p12->AsyncReady(app.asyncWaitMs)) { p12->NoteSkipped(); }
+            else
+            {
+                if (asyncConv && p12->IsAsync())
+                {
+                    // (One that finished: settled before the next begins -- its
+                    // predicate is reused -- and its picture copied out first.)
+                    if (p12->AsyncReady(0.0)) { const int ch = app.converter.OutputChanged(); p12->AsyncResolve(ch < 0 ? 1 : ch); }
+                    p12->AsyncBeforeConvert();
+                }
+                if (app.converter.Convert(srcSRV, srcW, srcH, resized))
+                {
+                    // (The conversion's end marked here, ahead of what follows: its
+                    // GPU time is what the choice above goes by.)
+                    if (asyncAble) app.gpuTimer.Stamp(GpuFrameTimer::kOurs);
+                    if (asyncConv && p12->IsAsync() && p12->AsyncSubmitted(app.converter.OutputTexture()))
+                    {
+                        app.captureRebind = false;
+                    }
+                    else if (asyncConv && !p12->IsAsync())
+                    {
+                        // (Switching over: this frame still the direct way; from the
+                        // next loop the weave has its own picture.)
+                        if (resized || app.captureRebind)
+                        {
+                            app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
+                                                    app.converter.OutputHeight(), app.converter.OutputFormat());
+                            app.captureRebind = false;
+                        }
+                    }
+                    else if (resized || app.captureRebind || app.weaver.HasInputOverride12())
+                    {
+                        app.weaver.SetInputOverride12(nullptr, 0, 0, DXGI_FORMAT_UNKNOWN);
+                        app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
+                                                app.converter.OutputHeight(), app.converter.OutputFormat());
+                        app.captureRebind = false;
+                    }
+                }
             }
         }
         }   // matches the "{" introduced before the liveSource block by the LFPRenderer branch
@@ -7586,8 +7842,39 @@ namespace
             { HitchWatch hw("cut-out update"); UpdateTaskbarCutout(app, false); }
             const clk::time_point tWork = clk::now();
             app.gpuTimer.Stamp(GpuFrameTimer::kOurs);
+            if (Present12* p12 = app.renderer.DX12())
+            {
+                // (Conversion apart from the weave: the newest finished picture.
+                // One under way is waited for only briefly: asyncWaitMs.)
+                // (SetAsync after this frame's choice: the first frame of a run is
+                // still woven the direct way, and the picture kept starts with the
+                // next conversion.)
+                // (Something else named the weaver's input meanwhile -- another
+                // source or layout: this is over.)
+                if (app.weaver.TakeOverrideDropped()) app.asyncMode = false;
+                const bool was = p12->IsAsync();
+                if (app.asyncMode && was)
+                {
+                    if (p12->AsyncReady(0.0)) p12->AsyncResolve(app.converter.OutputChanged());
+                    if (ID3D12Resource* f = p12->AsyncFront())
+                        app.weaver.SetInputOverride12(f, app.converter.OutputPerEyeWidth(), app.converter.OutputHeight(), app.converter.OutputFormat());
+                }
+                else if (!app.asyncMode && app.weaver.HasInputOverride12())
+                {
+                    app.weaver.SetInputOverride12(nullptr, 0, 0, DXGI_FORMAT_UNKNOWN);
+                    app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
+                                            app.converter.OutputHeight(), app.converter.OutputFormat());
+                }
+                if (app.asyncMode != was) p12->SetAsync(app.asyncMode);
+            }
             app.renderer.BindAndClearBackBuffer();
-            { HitchWatch hw("SR weave call"); if (!app.diagSkipWeave) app.weaver.Weave(); }   // (DiagSkipWeave: see Settings.h)
+            {
+                HitchWatch hw("SR weave call");
+                // (Lens only: the light field's picture is already interlaced --
+                // drawn as it is, no weave.)
+                if (app.weaver.IsLensOnly()) app.renderer.BlitPicture(app.converter.OutputTexture());
+                else if (!app.diagSkipWeave) app.weaver.Weave();   // (DiagSkipWeave: see Settings.h)
+            }
             const clk::time_point tWeave = clk::now();
             app.gpuTimer.Stamp(GpuFrameTimer::kWeave);
             if (app.renderer.IsDComp()) app.renderer.ApplyMask();   // (timed apart from the present)
@@ -7695,6 +7982,37 @@ namespace
                     {
                         int qc = 0, qb = 0; app.renderer.TakeQueueStats(qc, qb);
                         if (qc > 0) Log("  swap chain: the frame before still queued at the start of %d of %d loops", qb, qc);
+                        // (The Direct3D 12 presenter's own GPU clock: the marks above are
+                        // Direct3D 11's and don't see its weave.)
+                        {
+                            // (How long a picture really takes from the weave call to the
+                            // display, against what the weaver predicts the eyes ahead by.)
+                            double la = 0, lmin = 0, lmax = 0; int ln = 0;
+                            if (app.renderer.TakeDisplayLatency(la, lmin, lmax, ln))
+                            {
+                                // (The weaver itself is not asked what it predicts by: about 1.9
+                                // refreshes, 11.9 ms at 160 Hz, when it was -- 2026-10. Asking it
+                                // every few seconds went with a run where the weave sat off the
+                                // viewer; not proven the cause, but not worth the risk.)
+                                Log("  weave to display: measured avg %.2f ms (%.2f to %.2f, %d frames)", la, lmin, lmax, ln);
+                                // (Settings WeaverLatency 1: the weaver told what was measured,
+                                // smoothed; it then aims the views at where the eyes will be
+                                // when the picture is actually seen.)
+                                if (app.weaverLatencyAuto && ln > 100)
+                                {
+                                    app.latencyEma = app.latencyEma > 0 ? app.latencyEma * 0.7 + la * 0.3 : la;
+                                    app.weaver.SetLatencyUs((uint64_t)(app.latencyEma * 1000.0));
+                                }
+                            }
+                        }
+                        Present12::AsyncStats as;
+                        if (app.renderer.IsDX12() && app.renderer.DX12()->TakeAsyncStats(as))
+                            Log("  DX12 conversion apart from the weave: %d pictures shown (%d of them a refresh or more after they were asked for), %d conversions changed nothing, %d loops started none (the last still running) | asked-to-shown avg %.2f ms, worst %.2f",
+                                as.shown, as.late, as.same, as.skipped, as.avgMs, as.worstMs);
+                        Present12::Times pt;
+                        if (app.renderer.IsDX12() && app.renderer.DX12()->TakeTimes(pt))
+                            Log("  DX12 presenter (%d frames): GPU ms weave %.2f, mask %.2f | from sending a frame: GPU starts it after %.2f ms, done after %.2f (worst %.2f)",
+                                pt.frames, pt.weaveMs, pt.maskMs, pt.startMs, pt.doneMs, pt.worstDoneMs);
                     }
                     {
                         uint64_t du = 0, dunk = 0, dnone = 0; double darea = 0;
@@ -9146,6 +9464,7 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 {
                     app.displayChangedAtMs = 0;
                     HandleDisplayChange(app);
+                    app.hdrDisplay = app.renderer.DisplayIsHdr();   // (Windows' HDR switch is a display change too)
                 }
                 // Weaving has been off for a while: let the SR session go
                 // (camera off). Kept until now so switching back is instant.
@@ -9159,17 +9478,20 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 // Weaver choice (panel): a different weaver needs a new SR session.
                 const int wantWeaver = Settings::ReadWeaverChoice();
                 if (app.weaverChoiceSeen < 0) app.weaverChoiceSeen = wantWeaver;
-                else if (wantWeaver != app.weaverChoiceSeen)
+                // ... and so does HDR going on or off (Windows' switch, or a layout
+                // the float chain is / isn't for: HdrWanted).
+                else if (wantWeaver != app.weaverChoiceSeen || HdrWanted(app, app.hdrDisplay) != app.hdrActive ||
+                         (app.weaver.HasWeaver() && LensOnlyWanted(app) != app.weaver.IsLensOnly()))   // (... and the light field's lens-only session)
                 {
                     app.weaverChoiceSeen = wantWeaver;
                     if (app.weaver.HasWeaver())
                     {
-                        Log("Weaver choice changed to %d: restarting the SR session", wantWeaver);
+                        Log("Weaver choice %d, HDR chain %s: restarting the SR session", wantWeaver, HdrWanted(app, app.hdrDisplay) ? "on" : "off");
                         app.weaver.StopSR();
                         app.srStopAtMs = 0;
                         if (app.weavingEnabled)
                         {
-                            app.weaver.StartSR(app.renderer.Context(), app.hwnd);
+                            StartSRSession(app);
                             const bool katangaArmed = (app.format == StereoFormat::Katanga && !app.katanga.IsReceiving());
                             if (katangaArmed) app.weaver.LensDisable(); else app.weaver.LensEnable();
                             app.lateLatchingApplied = -1;
@@ -9177,7 +9499,29 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                         }
                     }
                 }
+                // Anti-crosstalk (panel): applied when it changes, and to a new weaver.
+                {
+                    const int act = Settings::ReadWeaverAct(), pct = Settings::ReadWeaverActStrength();
+                    const int key = app.weaver.HasWeaver() ? (act << 16 | pct) + 1 + (app.weaver.WeaverChoice() << 24) : 0;
+                    if (key != app.actApplied)
+                    {
+                        app.actApplied = key;
+                        if (key && (act != 0 || pct != 100 || app.actTouched)) { app.weaver.ApplyAct(act, pct); app.actTouched = true; }
+                    }
+                }
+                app.lfOn = Settings::ReadLightField();
+                app.lfPitch = Settings::ReadLfPitch();
+                app.lfSlantSet = Settings::ReadLfSlant(app.lfSlant);
+                app.lfOffset = Settings::ReadLfOffset();
+                app.lfFollow = Settings::ReadLfFollow();
+                app.lfCentre = false;   // (Centre On Me was taken out again: the camera gives the distance only)
+                app.rgbdStrength = (float)Settings::ReadRgbd(0); app.rgbdFocus = (float)Settings::ReadRgbd(1);
+                app.rgbdFlags = Settings::ReadRgbd(2); app.rgbdLook = Settings::ReadRgbd(3) != 0;
+                app.lfSpread = Settings::ReadLfSpread() / 100.0f;
+                app.lfDistanceCm = Settings::ReadLfDistance();
+                app.lfPattern = Settings::ReadLfPattern();
                 app.perfLog = Settings::ReadPerfLog();
+                app.renderer.SetLatencyStats(app.perfLog);
                 app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
                 const bool skip = Settings::ReadDiagSkipWeave();
                 if (skip != app.diagSkipWeave)
@@ -9360,6 +9704,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Set up Direct3D. The weaver/SR session is started on demand when weaving is
     // enabled; the default source is the monitor (passthrough), so no initial image.
     app.renderer.SetPlaneMode(Settings::ReadWeavePlane());   // (an experiment: see Settings.h)
+    app.renderer.SetAutoPlane(Settings::ReadAutoPlane());
     if (!app.renderer.Initialize(app.hwnd, useDComp))
     {
         if (!useDComp) return 4;
@@ -9422,6 +9767,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     Log("WinMain: converter.Initialize OK");
     app.converter.SetScrollReuse(Settings::ReadScrollReuse());
     app.deferHeavyConvert = Settings::ReadDeferRecovered();
+    app.asyncConvert = Settings::ReadAsyncConvert();
+    app.weaverLatencyAuto = Settings::ReadWeaverLatency() == 1;
+    app.asyncWaitMs = Settings::ReadAsyncWaitUs() / 1000.0;
+    app.asyncBands = Settings::ReadAsyncBands();
+    app.asyncEnterMs = Settings::ReadAsyncEnterUs() / 1000.0;
     Settings::ReadAnaCustom(app.anaCustomL, app.anaCustomR);
     app.anaSavedCount = Settings::ReadAnaSaved(app.anaSaved, 8);
     Log("WinMain: Recovered Colour converted %s", app.deferHeavyConvert ? "after the present (woven next refresh)" : "before the weave");

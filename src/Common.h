@@ -76,9 +76,11 @@ namespace srw
                             // texture (Geo-11 stereo game mods etc.). Bypasses the
                             // Source's captured pixels -- the Source only governs
                             // placement (which window/display the weave sits on).
-        LightField          // Lytro plenoptic (.lfp/.lfr/.lfx). LFPRenderer samples
+        LightField,         // Lytro plenoptic (.lfp/.lfr/.lfx). LFPRenderer samples
                             // per output pixel from the user's actual eye aperture
                             // position each frame. Auto-set when an LFP loads.
+        RGBD                // a picture beside its depth map (colour | depth): each eye's
+                            // view drawn from the depth; the head tracker looks around it.
     };
 
     inline bool IsVRFormat(StereoFormat f)
@@ -306,6 +308,7 @@ namespace srw
             // and switches here on its own when a sender appears.
             { StereoFormat::Katanga,           "Katanga" },
             { StereoFormat::LightField,        "Lytro Light Field" },
+            { StereoFormat::RGBD,              "RGB + Depth" },
         };
         count = (int)(sizeof(list) / sizeof(list[0]));
         return list;

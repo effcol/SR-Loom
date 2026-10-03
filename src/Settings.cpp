@@ -184,9 +184,49 @@ namespace srw::Settings
         }
     }
 
+    bool ReadAutoPlane()
+    {
+        return ReadDword(kSettingsKey, L"AutoPlane", 1) != 0;   // default ON
+    }
+
     bool ReadWeavePlane()
     {
         return ReadDword(kSettingsKey, L"WeavePlane", 0) != 0;   // default OFF
+    }
+
+    int ReadHdrOutput()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"HdrOutput", 1);   // default 1: when Windows has HDR on for the SR display
+        return v <= 2 ? (int)v : 1;
+    }
+
+    int ReadWeaverLatency()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"WeaverLatency", 0);
+        return v <= 1 ? (int)v : 0;
+    }
+
+    bool ReadAsyncConvert()
+    {
+        return ReadDword(kSettingsKey, L"AsyncConvert", 1) != 0;   // default ON (DX12 weaver only)
+    }
+
+    int ReadAsyncEnterUs()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"AsyncEnterUs", 3500);
+        return v >= 50 && v <= 20000 ? (int)v : 3500;
+    }
+
+    int ReadAsyncBands()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"AsyncBands", 4);
+        return v <= 32 ? (int)v : 4;
+    }
+
+    int ReadAsyncWaitUs()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"AsyncWaitUs", 1200);
+        return v <= 5000 ? (int)v : 1200;
     }
 
     bool ReadDeferRecovered()
@@ -196,18 +236,65 @@ namespace srw::Settings
 
     bool ReadScrollReuse()
     {
-        return ReadDword(kSettingsKey, L"ScrollReuse", 1) != 0;   // default ON
+        return ReadDword(kSettingsKey, L"ScrollReuse", 0) != 0;   // default OFF (v3.1: it now costs more than it saves on ordinary pages)
     }
+
+    int ReadWeaverAct()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"WeaverAct", 0);
+        return v <= 3 ? (int)v : 0;
+    }
+    void WriteWeaverAct(int mode) { WriteDword(kSettingsKey, L"WeaverAct", (DWORD)(mode >= 0 && mode <= 3 ? mode : 0)); }
+    int ReadWeaverActStrength()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"WeaverActStrength", 100);
+        return v <= 300 ? (int)v : 100;
+    }
+    void WriteWeaverActStrength(int pct) { WriteDword(kSettingsKey, L"WeaverActStrength", (DWORD)(pct >= 0 && pct <= 300 ? pct : 100)); }
+
+    int   ReadWeaverActDefault() { const DWORD v = ReadDword(kSettingsKey, L"WeaverActDefault", 99); return v <= 2 ? (int)v : -1; }
+    void  WriteWeaverActDefault(int mode) { WriteDword(kSettingsKey, L"WeaverActDefault", (DWORD)mode); }
+    int   ReadLfFollow()    { const DWORD v = ReadDword(kSettingsKey, L"LfFollow", 0); return v <= 2 ? (int)v : 0; }
+    void  WriteLfFollow(int v) { WriteDword(kSettingsKey, L"LfFollow", (DWORD)v); }
+    void  ClearLfSlant()    { WriteDword(kSettingsKey, L"LfSlant", 0); }
+    float ReadLfDistance()  { const DWORD v = ReadDword(kSettingsKey, L"LfDistance", 60); return v >= 20 && v <= 300 ? (float)v : 60.0f; }
+    void  WriteLfDistance(float cm) { WriteDword(kSettingsKey, L"LfDistance", (DWORD)(cm + 0.5f)); }
+    bool  ReadLfPattern()   { return ReadDword(kSettingsKey, L"LfPattern", 0) != 0; }
+    void  WriteLfPattern(bool on) { WriteDword(kSettingsKey, L"LfPattern", on ? 1u : 0u); }
+    bool  ReadLfMeasure()   { return ReadDword(kSettingsKey, L"LfMeasure", 0) != 0; }
+    void  WriteLfMeasure(bool on) { WriteDword(kSettingsKey, L"LfMeasure", on ? 1u : 0u); }
+    int   ReadLfSpread()    { const DWORD v = ReadDword(kSettingsKey, L"LfSpread", 30); return v >= 1 && v <= 100 ? (int)v : 30; }
+    void  WriteLfSpread(float pct) { WriteDword(kSettingsKey, L"LfSpread", (DWORD)(pct + 0.5f)); }
+    bool  ReadLfCentre()    { return ReadDword(kSettingsKey, L"LfCentre", 0) != 0; }
+    void  WriteLfCentre(bool on) { WriteDword(kSettingsKey, L"LfCentre", on ? 1u : 0u); }
+    // RGB + depth: 0 the strength (0-100), 1 the focus plane (0-100), 2 the layout
+    // (bit 0 depth on the left, bit 1 black near), 3 looking around with the head.
+    static const wchar_t* const kRgbdName[4] = { L"RgbdStrength", L"RgbdFocus", L"RgbdFlags", L"RgbdLook" };
+    static const DWORD kRgbdDefault[4] = { 50, 50, 4, 1 };   // (layout: found automatically, white near)
+    int   ReadRgbd(int i)   { if (i < 0 || i > 3) return 0; const DWORD v = ReadDword(kSettingsKey, kRgbdName[i], kRgbdDefault[i]); return v <= 100 ? (int)v : (int)kRgbdDefault[i]; }
+    void  WriteRgbd(int i, int v) { if (i >= 0 && i <= 3) WriteDword(kSettingsKey, kRgbdName[i], (DWORD)(v < 0 ? 0 : v > 100 ? 100 : v)); }
+    bool  ReadLightField()  { return ReadDword(kSettingsKey, L"LightField", 0) != 0; }
+    void  WriteLightField(bool on) { WriteDword(kSettingsKey, L"LightField", on ? 1u : 0u); }
+    // (Stored x 100000; the slant offset by 2 so it can be negative. 0: not set.)
+    float ReadLfPitch()     { return (float)ReadDword(kSettingsKey, L"LfPitch", 0) / 100000.0f; }
+    void  WriteLfPitch(float v) { WriteDword(kSettingsKey, L"LfPitch", (DWORD)(v * 100000.0f + 0.5f)); }
+    bool  ReadLfSlant(float& v) { const DWORD d = ReadDword(kSettingsKey, L"LfSlant", 0); if (!d) return false; v = (float)d / 100000.0f - 2.0f; return true; }
+    void  WriteLfSlant(float v) { WriteDword(kSettingsKey, L"LfSlant", (DWORD)((v + 2.0f) * 100000.0f + 0.5f)); }
+    float ReadLfOffset()    { return (float)ReadDword(kSettingsKey, L"LfOffset", 0) / 100000.0f; }
+    void  WriteLfOffset(float v) { WriteDword(kSettingsKey, L"LfOffset", (DWORD)(v * 100000.0f + 0.5f)); }
 
     int ReadWeaverChoice()
     {
         const DWORD v = ReadDword(kSettingsKey, L"WeaverChoice", 0);
-        return v <= 3 ? (int)v : 0;
+        // (0 the standard weaver on Direct3D 11, 4 on Direct3D 12. The legacy
+        // weavers -- 1-3, 5-6 -- are no longer offered: anti-crosstalk is set on
+        // the standard ones. A stored legacy choice becomes its standard one.)
+        return v >= 4 && v <= 6 ? 4 : 0;
     }
 
     void WriteWeaverChoice(int choice)
     {
-        WriteDword(kSettingsKey, L"WeaverChoice", (DWORD)(choice >= 0 && choice <= 3 ? choice : 0));
+        WriteDword(kSettingsKey, L"WeaverChoice", (DWORD)(choice >= 0 && choice <= 6 ? choice : 0));
     }
 
     void WriteDiagSkipWeave(bool enable)
@@ -232,7 +319,7 @@ namespace srw::Settings
 
     bool ReadEyeOrderDetect()
     {
-        return ReadDword(kSettingsKey, L"EyeOrderDetect", 1) != 0;   // default on (user's decision; see the note in Settings.h)
+        return ReadDword(kSettingsKey, L"EyeOrderDetect", 0) != 0;   // default off (user's decision; see the note in Settings.h)
     }
 
     void WriteEyeOrderDetect(bool enable)

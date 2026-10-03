@@ -12,12 +12,17 @@ namespace SR
 {
     class SRContext;
     class IDX11Weaver1;
+    class IDX12Weaver1;
+    class PredictingDX12Weaver;
+    class IWeaverSettings1;
     class PredictingDX11Weaver;
     class HeadPoseTracker;
     class Window2;
     class SwitchableLensHint;
 }
 
+struct ID3D12Resource;
+namespace srw { class Present12; }
 namespace srw
 {
     class SRWeaver
@@ -69,6 +74,18 @@ namespace srw
         // for the configured render-pipeline latency. Returns false if the
         // weaver isn't created yet.
         bool GetPredictedEyePositions(float leftXYZ[3], float rightXYZ[3]);
+        // The weaver's pipeline latency (see SRWeaver.cpp).
+        uint64_t GetLatencyUs() const;
+        void     SetLatencyUs(uint64_t us);
+        void     ReadLatency();
+        void     ApplyAct(int mode, int strengthPct);   // (anti-crosstalk: see SRWeaver.cpp)
+        // The lens' slant (a coefficient) and pitch (pixels across), as the runtime
+        // reports them; false: not known.
+        bool     GetLens(float& slant, float& pitchPx) const;
+        bool     GetLensGeometry(float& doNmm, float& dotPitchMm) const;
+        // Light field: the lens as seen from a viewing position (cm, from the
+        // display's centre), from the SDK's weaving library. See SRWeaver.cpp.
+        bool     GetLightFieldGeometry(float w, float h, float xCm, float yCm, float zCm, float& pitchPx, float& slant, float& centrePhase);
 
         // Create the weaver bound to the output window + device context, then
         // finalize the SR context. Call after the D3D device exists.
@@ -121,9 +138,23 @@ namespace srw
         // tied to this SRWeaver -- callers must Disable any borrowed
         // subscriptions before Shutdown.
         SR::SRContext* Context() const { return m_context; }
-        bool HasWeaver()  const { return m_weaver != nullptr || m_legacy != nullptr; }
+        bool HasWeaver()  const { return m_weaver != nullptr || m_legacy != nullptr || m_weaver12 != nullptr || m_legacy12 != nullptr || m_lensOnlyUp; }
+        // Lens only: the next SR session holds the lens on with no weaver and no
+        // tracker (see StartSR). Set before the session starts; IsLensOnly: the
+        // session that is up is one.
+        void SetLensOnly(bool on) { m_lensOnly = on; }
+        bool IsLensOnly() const { return m_lensOnlyUp; }
+        // The Direct3D 12 presenter to weave on when the weaver choice is DX12
+        // (4); set before the SR session starts. Null: Direct3D 11 weavers only.
+        void SetPresenter12(Present12* p) { m_p12 = p; }
+        bool IsDX12() const { return m_weaver12 != nullptr || m_legacy12 != nullptr; }
+        void SetInputOverride12(ID3D12Resource* res, int perEyeWidth, int height, DXGI_FORMAT format);
+        bool HasInputOverride12() const { return m_override12; }
+        bool TakeOverrideDropped() { const bool d = m_overrideDropped; m_overrideDropped = false; return d; }
         // Which weaver is running (Settings::ReadWeaverChoice when it was made):
-        // 0 modern, 1-3 legacy with anti-crosstalk Off / Static / Dynamic.
+        // 0 modern, 1-3 legacy with anti-crosstalk Off / Static / Dynamic, 4 the
+        // modern Direct3D 12 one, 5 / 6 the older Direct3D 12 one with static /
+        // dynamic anti-crosstalk.
         int  WeaverChoice() const { return m_choice; }
 
         // Latest tracked head pose (position in mm relative to display centre,
@@ -133,14 +164,35 @@ namespace srw
 
     private:
         class HeadListenerImpl;          // opaque to keep SDK headers out of this file
+        class SystemListenerImpl;        // (the runtime's system events, logged)
+        SystemListenerImpl*       m_sysListener = nullptr;
         void ReleaseViewTexture();
         void StartHeadTracker();
         bool CreateLegacyWeaver(ID3D11DeviceContext* immediateContext, HWND window);
+        bool CreateWeaver12(HWND window);
+        bool CreateLegacy12(HWND window);
+        void SetInput12(ID3D12Resource* res, int perEyeWidth, int height, DXGI_FORMAT format);
         bool FinishWeaver();   // (head tracker, context initialise, lens hint: either weaver)
         void StopHeadTracker();
 
         SR::SRContext*            m_context = nullptr;
         SR::IDX11Weaver1*         m_weaver  = nullptr;
+        // The Direct3D 12 weaver, instead of m_weaver, drawing on m_p12's command list.
+        SR::IDX12Weaver1*         m_weaver12 = nullptr;
+        SR::PredictingDX12Weaver* m_legacy12 = nullptr;  // (the older one: anti-crosstalk on Direct3D 12)
+        Present12*                m_p12     = nullptr;   // not owned
+        ID3D12Resource*           m_input12 = nullptr;   // its input as last set (not owned: the presenter's)
+        bool                      m_override12 = false;  // (SetInputOverride12)
+        bool                      m_overrideDropped = false;
+        uint64_t                  m_latencyUs = 0;       // (ReadLatency / SetLatencyUs)
+        bool                      m_lensOnly = false, m_lensOnlyUp = false;   // (SetLensOnly / the session up is one)
+        float                     m_lensSlant = 0.0f, m_lensPitchPx = 0.0f, m_lensDoNmm = 0.0f, m_dotPitchMm = 0.0f;
+        SR::IWeaverSettings1*     m_ws = nullptr;        // the runtime's settings for the standard weaver in use (not owned)
+        bool                      m_actDefKnown = false; // (ApplyAct: the display's own values, read once a weaver)
+        int                       m_actDefMode = 0;
+        float                     m_actDefStatic = 0.0f, m_actDefDynamic = 0.0f;
+        int                       m_input12W = 0, m_input12H = 0;
+        DXGI_FORMAT               m_input12Fmt = DXGI_FORMAT_UNKNOWN;
         // The legacy (deprecated) weaver, instead of m_weaver when chosen: it
         // has the anti-crosstalk modes the modern one lacks.
         SR::PredictingDX11Weaver* m_legacy  = nullptr;

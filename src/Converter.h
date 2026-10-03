@@ -109,9 +109,25 @@ namespace srw
         // Quilt resampled in two passes (rows, then columns): the same picture,
         // a third of the reads. Off: in one.
         void SetQuiltTwoPass(bool on) { m_quiltTwoPass = on; }
+        // Light field (an experiment): a Quilt's views interlaced across the lens by
+        // SR Loom itself, every view at once -- no eye tracking: move your head to
+        // look around. pitchPx: the lens' pitch in pixels (0 = off); slant: its
+        // slant; panelW / H: the display's size (the output is made pixel for
+        // pixel). The phase offset rides in the Quilt's left blend (SetQuilt).
+        void SetLightField(float pitchPx, float slant, int panelW, int panelH) { m_lfPitch = pitchPx; m_lfSlant = slant; m_lfW = panelW; m_lfH = panelH; }
         // Both eyes from one compute thread where they share source pixels (the
         // anaglyph modes but Recovered, checkerboard, interleaved). Off: pixel shaders.
         void SetComputeBothEyes(bool on) { m_csOn = on; }
+        // The output texture made shareable with another Direct3D device (the
+        // DX12 presenter weaves from it without a copy). Remade on the next
+        // Convert when this changes, which reports it as resized.
+        void SetShareableOutput(bool on) { m_outShare = on; }
+        // Conversion apart from the weave: each pass sent to the GPU on its own and
+        // the long ones in this many bands (0: all in one go, as ever). See Convert.
+        void SetGpuYield(int bands) { m_yieldBands = bands; }
+        // HDR: the output 16-bit float (linear, brighter-than-white values kept)
+        // instead of 8-bit sRGB. Remade on the next Convert, reported as resized.
+        void SetHdr(bool on) { m_hdr = on; m_format = on ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; }
         // Whether Recovered Colour is best given the capture's own frame (above).
         bool RecoveredWantsDirect() const { return m_preCheckOn && m_changeSkipOn; }
 
@@ -165,6 +181,11 @@ namespace srw
                      bool& outputResized);
 
         ID3D11ShaderResourceView* OutputSRV()        const { return m_outSRV; }
+        ID3D11Texture2D*          OutputTexture()    const { return m_outTex; }
+        // For a presenter that weaves from a copy of the output (the DX12
+        // presenter, conversion apart from the weave): see Converter.cpp.
+        void CopyOutputTo(ID3D11Texture2D* dst, bool force);
+        int  OutputChanged();
         int          OutputPerEyeWidth()  const { return m_outWidth / 2; }
         int          OutputHeight()       const { return m_outHeight; }
         DXGI_FORMAT  OutputFormat()       const { return m_format; }
@@ -210,6 +231,8 @@ namespace srw
         ID3D11PixelShader*       m_psQuiltH = nullptr;
         DispTarget               m_quiltH;
         bool                     m_quiltTwoPass = true;
+        float                    m_lfPitch = 0.0f, m_lfSlant = 0.0f;   // (SetLightField)
+        int                      m_lfW = 0, m_lfH = 0;
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -382,6 +405,11 @@ namespace srw
         ID3D11UnorderedAccessView* m_outUAV = nullptr;   // (UNORM view: the both-eyes compute shaders)
         ID3D11ComputeShader*      m_cs[4] = {};           // (both eyes per thread: anaglyph, checkerboard, column, row)
         bool                      m_csOn = true;
+        bool                      m_outShare = false, m_outShared = false;   // (SetShareableOutput: wanted / as made)
+        ID3D11Predicate*          m_outPred = nullptr;   // the predicate the last Convert drew under (not owned; null: none)
+        int                       m_yieldBands = 0;      // (SetGpuYield)
+        ID3D11RasterizerState*    m_bandRS = nullptr;
+        bool                      m_hdr = false, m_outHdr = false;   // (SetHdr: wanted / as the output was made)
         ID3D11ShaderResourceView* m_outSRV = nullptr;
         int                       m_outWidth  = 0;     // full SBS width
         int                       m_outHeight = 0;
@@ -423,7 +451,7 @@ namespace srw
         int          m_targetPaneH = 0;
         bool         m_halfWidthEyes = false;   // (Recovered Colour: full width since PSAnaPair made it affordable)
         bool         m_pairRefineOn  = true;
-        bool         m_scrollReuseOn = true;
+        bool         m_scrollReuseOn = false;
         bool         m_pyramidSkipOn = true;
         bool         m_changeSkipOn = true;
         float        m_vrYaw   = 0.0f;                   // VR viewer: yaw (radians)

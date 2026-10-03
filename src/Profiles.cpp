@@ -41,6 +41,7 @@ namespace
         { srw::StereoFormat::VR360SBS,          "VR360SBS"          },
         { srw::StereoFormat::Katanga,           "Katanga"           },
         { srw::StereoFormat::LightField,        "LightField"        },
+        { srw::StereoFormat::RGBD,              "RGBD"              },
     };
 
     std::string ToLower(std::string s)

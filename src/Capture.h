@@ -86,6 +86,9 @@ namespace srw
         // and DirectSRV() views it; the copy is made only if SRV()/Texture()
         // are asked for (Auto Stereo, analysis, crops).
         void SetZeroCopy(bool on) { m_zeroCopy = on; }
+        // Frames as 16-bit float (HDR) instead of 8-bit: see Capture.cpp.
+        void SetHdr(bool on);
+        bool IsHdr() const { return m_hdr; }
 
         // The newest picture, the cheapest way: the held capture frame itself
         // when zero-copy has it (encoded = true: a UNORM view of sRGB values,
@@ -168,5 +171,6 @@ namespace srw
         // an sRGB shader view (sRGB casting isn't allowed on a fully-typed res).
         DXGI_FORMAT               m_texFormat = DXGI_FORMAT_B8G8R8A8_TYPELESS;
         DXGI_FORMAT               m_srvFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        bool                      m_hdr = false;
     };
 }

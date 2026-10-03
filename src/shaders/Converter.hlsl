@@ -68,7 +68,8 @@ cbuffer Params : register(b0)
     float g_pairRefine;    // anaglyph recovery: 1 = the compose reads dRef / conf from pairTex (PSAnaPair)
     float g_scrollOn;      // anaglyph recovery: 1 = blocks that only scrolled take last frame's output, moved (PSChangeScroll)
     float g_boxesNew;      // anaglyph recovery: 1 = the boxes were judged afresh -- every block one touches is redrawn
-    float g_pad1, g_pad2;
+    float g_lfPitch;       // light field: the lens pitch in px (0 = off); the Quilt's views interlaced here
+    float g_lfSlant;       // ... and its slant
     float4 g_anaMaskL;     // custom anaglyph pair (g_anaCombo 6): .rgb 1 = the channel is the left eye's
     float4 g_anaMaskR;     // ... the right eye's
     float4 g_anaWL;        // ... each eye's brightness from a pixel: dot(pixel, g_anaWL) (least squares, Common.h AnaCustomFromColours)
@@ -1495,6 +1496,109 @@ float3 anaRecoverPixel(float2 e, float3 c, int eye, float dRef)
     return saturate(scaled);
 }
 
+// Light field (an experiment): every view of a Quilt at once, spread across
+// each lens. A lens covers g_lfPitch pixels and leans by g_lfSlant pixels a
+// row; where a sub-pixel sits under its lens (0..1) decides which view it
+// shows -- red, green and blue each a third of a pixel apart. Nothing follows
+// the viewer: moving the head across the lens' fan shows the views in turn.
+// (The same picture goes to both halves of the output: the SR weave of two
+// equal eyes is that picture, pixel for pixel.) pos: the output pixel within
+// its half; e: its place in the picture, 0..1.
+// RGB + depth: a picture beside its depth map (Looking Glass layout: the
+// colour on the left, the depth on the right, white near -- or the other way
+// round, bits 0 and 1 of g_quiltCols). A view of it from somewhere else is
+// drawn by moving each part of the picture sideways by its depth: what is
+// nearer than the focus plane goes against the viewer's movement, what is
+// further, with it. v: where the view is from (x in eye spacings to the
+// right, y upwards). The other figures ride in constants this layout has no
+// other use for: g_vrZoom the strength (picture widths of shift per eye
+// spacing, nearest against furthest), g_fpEyeFrac the focus plane's depth.
+// (The layout, g_quiltCols - 4: bit 0 the depth map is the left half, bit 1
+// black is near, bit 2 the side is found out here.)
+// Which half is the depth map, when that is to be found out: the one with no
+// colour in it. Eight fixed places in each half are looked at -- the same for
+// every pixel, so the whole picture decides alike. A black-and-white photo
+// beside its depth map can't be told this way: the right half is taken.
+bool rgbdDepthLeft()
+{
+    const int rf = g_quiltCols - 4;
+    if ((rf & 4) == 0) return (rf & 1) != 0;
+    float cl = 0.0, cr = 0.0;
+    [unroll] for (int k = 0; k < 8; ++k)
+    {
+        const float2 q = float2(((float)(k % 4) + 0.5) / 4.0, ((float)(k / 4) + 0.5) / 2.0);
+        const float3 a = SrcSampleLevel(samp, float2(q.x * 0.5, q.y), 0).rgb;
+        const float3 b = SrcSampleLevel(samp, float2(0.5 + q.x * 0.5, q.y), 0).rgb;
+        cl += max(max(a.r, a.g), a.b) - min(min(a.r, a.g), a.b);
+        cr += max(max(b.r, b.g), b.b) - min(min(b.r, b.g), b.b);
+    }
+    return cl < cr * 0.5;
+}
+float rgbdDepth(float2 p, bool depthLeft)
+{
+    const float2 uv = float2((depthLeft ? 0.0 : 0.5) + saturate(p.x) * 0.5, saturate(p.y));
+    // (As the depth map stores it: its code value, not the decoded light.)
+    const float d = dot(srgbEncode(saturate(SrcSampleLevel(samp, uv, 0).rgb)), float3(1.0, 1.0, 1.0) / 3.0);
+    return ((g_quiltCols - 4) & 2) != 0 ? 1.0 - d : d;
+}
+float3 rgbdView(float2 e, float2 v, bool depthLeft)
+{
+    const float aspect = g_srcW * 0.5 / max(g_srcH, 1.0);
+    const float2 k = float2(v.x, -v.y * aspect) * g_vrZoom;
+    // (Where in the picture this pixel comes from depends on the depth there:
+    // found by going round a few times.)
+    float2 p = e;
+    [unroll] for (int it = 0; it < 6; ++it) p = e + k * (rgbdDepth(p, depthLeft) - g_fpEyeFrac);
+    return SrcSampleLevel(samp, float2((depthLeft ? 0.5 : 0.0) + saturate(p.x) * 0.5, saturate(p.y)), 0).rgb;
+}
+
+float3 lightField(float2 pos, float2 e)
+{
+    const int total = max(1, g_quiltCols * g_quiltRows);
+    const int viewWpx = max(1, (int)(g_srcW / (float)g_quiltCols));
+    const int viewHpx = max(1, (int)(g_srcH / (float)g_quiltRows));
+    float3 o = 0;
+    [unroll] for (int c = 0; c < 3; ++c)
+    {
+        // (Measured from the middle of the panel: changing the pitch then opens
+        // or closes the fans about the centre instead of sliding everything.)
+        const float ph = frac((pos.x - g_paneW * 0.5 + (float)(c - 1) / 3.0 + (pos.y - g_paneH * 0.5) * g_lfSlant) / g_lfPitch + g_quiltLBlend + 0.5);
+        // (Swap Eyes: the views the other way round.)
+        // (View spread, g_quiltRBlend: how much of the Quilt's range of views the
+        // lens' fan shows, about the middle one. A Quilt made for a wide view
+        // cone squeezed whole into the fan gives each eye views far apart: too
+        // much depth to fuse up close. A part of it keeps the depth natural.)
+        const float pv = 0.5 + ((g_swap ? 1.0 - ph : ph) - 0.5) * max(g_quiltRBlend, 0.02);
+        const int view = clamp((int)(pv * total), 0, total - 1);
+        // (Looking Glass order: view 0 the bottom-left cell.)
+        const float2 cell = float2((view % g_quiltCols) * viewWpx, (g_quiltRows - 1 - view / g_quiltCols) * viewHpx);
+        float3 s = SrcSampleLevel(samp, (cell + saturate(e) * float2(viewWpx, viewHpx)) / float2(g_srcW, g_srcH), 0).rgb;
+        // (Alignment pattern, g_quiltRightIdx > 0: the left half of the fan red,
+        // the right half blue, in place of the picture. Lined up, one eye sees
+        // the whole screen red and the other blue; stripes mean the pitch or the
+        // slant is off.)
+        if (g_quiltRightIdx > 0) s = ph < 0.5 ? float3(1.0, 0.05, 0.0) : float3(0.0, 0.15, 1.0);
+        o[c] = s[c];
+    }
+    return o;
+}
+
+// ... the light field from an RGB + depth picture: each sub-pixel's view is
+// drawn for where its light goes -- across the lens' fan, g_quiltRBlend x 4 eye
+// spacings from one side to the other.
+float3 lightFieldRgbd(float2 pos, float2 e, bool depthLeft)
+{
+    float3 o = 0;
+    [unroll] for (int c = 0; c < 3; ++c)
+    {
+        const float ph = frac((pos.x - g_paneW * 0.5 + (float)(c - 1) / 3.0 + (pos.y - g_paneH * 0.5) * g_lfSlant) / g_lfPitch + g_quiltLBlend + 0.5);
+        float3 s = rgbdView(e, float2(((g_swap ? 1.0 - ph : ph) - 0.5) * g_quiltRBlend * 4.0, 0.0), depthLeft);
+        if (g_quiltRightIdx > 0) s = ph < 0.5 ? float3(1.0, 0.05, 0.0) : float3(0.0, 0.15, 1.0);
+        o[c] = s[c];
+    }
+    return o;
+}
+
 float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRecovery = false)
 {
     const int fmt   = recoveryOnly ? 2 : forceFmt >= 0 ? forceFmt : g_format;
@@ -1682,8 +1786,20 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
         if (right) return float4(SrcSample(samp, e).rgb, 1);
         return float4(srcPrev.Sample(samp, e).rgb, 1);
     }
+    else if (fmt == 13)   // RGB + depth: each eye's view drawn from the depth map
+    {
+        const float2 pe = float2(rightPane ? (uv.x - 0.5) * 2.0 : uv.x * 2.0, uv.y);
+        const bool depthLeft = rgbdDepthLeft();
+        if (g_lfPitch > 0.0)
+            return float4(lightFieldRgbd(float2(rightPane ? i.pos.x - g_paneW : i.pos.x, i.pos.y), pe, depthLeft), 1);
+        // (This eye half the eye separation to its side -- g_fpGapFrac scales it --
+        // plus where the viewer's head is: g_vrYaw / g_vrPitch, in eye spacings.)
+        return float4(rgbdView(pe, float2((right ? 0.5 : -0.5) * g_fpGapFrac + g_vrYaw, g_vrPitch), depthLeft), 1);
+    }
     else if (fmt == 9)   // Quilt: cols x rows grid of views; pick a pair
     {
+        if (g_lfPitch > 0.0)
+            return float4(lightField(float2(rightPane ? i.pos.x - g_paneW : i.pos.x, i.pos.y), float2(rightPane ? (uv.x - 0.5) * 2.0 : uv.x * 2.0, uv.y)), 1);
         // Looking Glass convention: views indexed left-to-right, BOTTOM-to-top.
         // View 0 = bottom-left cell = leftmost camera position; view (cols*rows-1)
         // = top-right cell = rightmost camera position.

@@ -220,8 +220,19 @@ namespace srw
         bool                     m_directComposition     = true;   // presenter (restart to apply)
         bool                     m_lateLatching          = true;   // SR weaver late latching
         bool                     m_perfLog               = false;  // frame / GPU timing in the log
-        bool                     m_eyeOrder              = true;   // Automatic works out the eye order
+        bool                     m_eyeOrder              = false;  // Automatic works out the eye order
         int                      m_weaverChoice          = 0;      // Settings WeaverChoice (0 modern, 1-3 legacy ACT off/static/dynamic)
+        int                      m_actMode               = 0;      // Settings WeaverAct (0 the display's default, 1 off, 2 static, 3 dynamic)
+        float                    m_rgbdStrength = 50.0f, m_rgbdFocus = 50.0f;   // Settings Rgbd* (RGB + depth)
+        bool                     m_rgbdLeft = false, m_rgbdInvert = false, m_rgbdLook = true, m_rgbdAuto = true;
+        bool                     m_lfOn                  = false;  // Settings LightField (and LfPitch / LfSlant / LfOffset)
+        bool                     m_lfFollow = false, m_lfFollowReverse = false;   // Settings LfFollow (0 off, 1 on, 2 reversed)
+        float                    m_lfDistance = 60.0f;             // Settings LfDistance (cm)
+        bool                     m_lfPattern = false;              // Settings LfPattern
+        float                    m_lfSpread = 30.0f;               // Settings LfSpread (% of the Quilt's views)
+        bool                     m_lfCentre = false;               // Settings LfCentre
+        float                    m_lfPitch = 1.8f, m_lfSlant = 0.3f, m_lfOffset = 0.0f;
+        int                      m_actStrength           = 100;    // Settings WeaverActStrength (% of the display's own amount)
         // Inline state for the About popup's "Check for updates" link.
         // Idle by default; switches to Checking on click, then settles to
         // UpToDate / Available / Failed when WM_APP_UPDATE_RESULT lands.
