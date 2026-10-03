@@ -21,6 +21,11 @@ Texture2D    changeTex   : register(t15);  // ... which 16x16 blocks to redraw t
 Texture2D    anaSnapTex  : register(t16);  // ... the 1/16 source when the boxes were judged (Converter::CommitAnaSnapshot)
 Texture2D    anaShiftTex : register(t17);  // ... how far each box has moved since, this frame (PSAnaBoxShift: .r rows of blocks)
 Texture2D    pairTex     : register(t18);  // Recovered Colour at full width: dRef / conf per pixel pair (PSAnaPair)
+Texture2D    srcPrevFull : register(t19);  // anaglyph recovery, scroll reuse: last frame's source, full size
+Texture2D    scrollTex   : register(t20);  // ... how far the picture scrolled since (PSScrollPick: .r rows, 1x1)
+Texture2D    outPrevTex  : register(t21);  // ... last frame's output (read where a block only moved)
+Texture2D    reachTex    : register(t22);  // anaglyph recovery: how far sideways each 16x16 block borrows (PSReach: .r least, .g most, source px)
+Texture2D    flatTex     : register(t23);  // anaglyph recovery: the 1/4 level's plain grey texels, shrunk (PSFlatShrink: .r 1 by one texel, .g by two)
 SamplerState samp    : register(s0);
 
 cbuffer Params : register(b0)
@@ -61,11 +66,21 @@ cbuffer Params : register(b0)
     float g_changeSkip;    // anaglyph recovery: 1 = redraw only the blocks changeTex marks (the rest is last frame's)
     float g_srcDecode;     // 1: srcTex is sRGB-encoded read as UNORM (the capture's own frame, SetSourceEncoded) -- decoded on read
     float g_pairRefine;    // anaglyph recovery: 1 = the compose reads dRef / conf from pairTex (PSAnaPair)
+    float g_scrollOn;      // anaglyph recovery: 1 = blocks that only scrolled take last frame's output, moved (PSChangeScroll)
+    float g_boxesNew;      // anaglyph recovery: 1 = the boxes were judged afresh -- every block one touches is redrawn
+    float g_pad1, g_pad2;
+    float4 g_anaMaskL;     // custom anaglyph pair (g_anaCombo 6): .rgb 1 = the channel is the left eye's
+    float4 g_anaMaskR;     // ... the right eye's
+    float4 g_anaWL;        // ... each eye's brightness from a pixel: dot(pixel, g_anaWL) (least squares, Common.h AnaCustomFromColours)
+    float4 g_anaWR;
+    float4 g_anaTL;        // ... each eye's filter colour (full brightness)
+    float4 g_anaTR;
 };
 
 // Channel-filtered colour for one eye of an anaglyph combo (left: e=0, right: e=1).
 float3 anaFilter(float3 c, int combo, int e)
 {
+    if (combo == 6) return saturate(dot(c, (e == 0) ? g_anaWL.rgb : g_anaWR.rgb)) * ((e == 0) ? g_anaTL.rgb : g_anaTR.rgb);   // Custom: the eye in its own colour
     if (combo == 0) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, c.g, c.b); // Red/Cyan
     if (combo == 1) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, c.g, 0);   // Red/Green
     if (combo == 2) return (e == 0) ? float3(c.r, 0, 0)   : float3(0, 0, c.b);   // Red/Blue
@@ -77,6 +92,7 @@ float3 anaFilter(float3 c, int combo, int e)
 // Per-eye luminance from an anaglyph combo (carries that eye's view / disparity).
 float anaEyeLuma(float3 c, int combo, int e)
 {
+    if (combo == 6) return saturate(dot(c, (e == 0) ? g_anaWL.rgb : g_anaWR.rgb));   // Custom (least squares: AnaCustomFromColours)
     if (combo == 0) return (e == 0) ? c.r : (c.g + c.b) * 0.5; // Red/Cyan
     if (combo == 1) return (e == 0) ? c.r : c.g;               // Red/Green
     if (combo == 2) return (e == 0) ? c.r : c.b;               // Red/Blue
@@ -145,12 +161,14 @@ float3 tintDecode(float3 c, int eye, int row)
 // left out, it adds noise). Amber/blue's left view is red+green.
 float anaChanL(float3 c)
 {
+    if (g_anaCombo == 6) return c[(int)g_anaWL.a];   // (Custom: the channel most its own -- AnaCustomFromColours)
     if (g_anaCombo == 3 || g_anaCombo == 5) return c.g;          // Green/Magenta, Cyan/Magenta
     if (g_anaCombo == 4) return (c.r + c.g) * 0.5;               // Amber/Blue
     return c.r;                                                  // Red/Cyan, Red/Green, Red/Blue
 }
 float anaChanR(float3 c)
 {
+    if (g_anaCombo == 6) return c[(int)g_anaWR.a];
     if (g_anaCombo == 2 || g_anaCombo == 4) return c.b;          // Red/Blue, Amber/Blue
     if (g_anaCombo == 3 || g_anaCombo == 5) return c.r;          // Green/Magenta, Cyan/Magenta
     return c.g;                                                  // Red/Cyan, Red/Green
@@ -205,6 +223,16 @@ void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
 }
 
+// A brightness difference as the descriptors hold it: its 0.75 power, sign kept.
+// Plain differences let bright edges outweigh everything (a step in a bright
+// area is numerically far bigger than the same visible step in a dark one), so
+// dark and low-contrast detail barely counted in a match. The square root
+// ("RootSIFT") evens that out more, but lifts a flat page's noise too: more
+// colour blobs beside pictures. 0.75 keeps most of the gain and adds none
+// (16 Middlebury scenes: error down 2-3% in dark, mid and bright areas alike).
+// descCost's energy floor and evidence threshold are scaled to match.
+float descCurve(float g) { const float r = sqrt(abs(g)); return sign(g) * r * sqrt(r); }
+
 // Four-angle gradient descriptors (SIRA: 0/45/90/135 deg around a pixel) for red &
 // green at uv. Each angle = a 5-tap line -> 4 adjacent differences. Packed as
 // [angle*4 + diff], 16 entries per channel. Multiple angles capture 2D structure,
@@ -221,7 +249,7 @@ void buildDesc(float2 uv, float tx, float ty, out float gRed[16], out float gGrn
             rr[i] = anaChanL(s); gg[i] = anaChanR(s);
         }
         [unroll] for (int k = 0; k < 4; ++k)
-        { gRed[a * 4 + k] = rr[k + 1] - rr[k]; gGrn[a * 4 + k] = gg[k + 1] - gg[k]; }
+        { gRed[a * 4 + k] = descCurve(rr[k + 1] - rr[k]); gGrn[a * 4 + k] = descCurve(gg[k + 1] - gg[k]); }
     }
 }
 
@@ -239,13 +267,13 @@ float descCost(float a16[16], float b16[16])
         ea  += abs(a16[j]);
         eb  += abs(b16[j]);
     }
-    const float cost = sad / (ea + eb + 0.15);
+    const float cost = sad / (ea + eb + 0.2);
     // A candidate where either view has next to no structure can't be
     // checked: NEUTRAL, not bad. Scored as a mismatch, the inside of a plain
     // coloured surface (red paint is blank in the cyan view) always lost to
     // any candidate out on textured background, however poor -- the borrow
     // was pulled out of the surface into its surroundings: the blobs.
-    const float evidence = saturate(min(ea, eb) / 0.6);
+    const float evidence = saturate(min(ea, eb) / 0.85);
     return lerp(0.4, cost, evidence);
 }
 
@@ -253,6 +281,8 @@ float descCost(float a16[16], float b16[16])
 // disparity between the L (red) and R (green) views, both directions, via 4-angle
 // gradient matching. Low resolution makes winner-take-all robust and smooth.
 // Output: .r = dLR (left->right), .g = dRL (right->left), in UV (fraction of width).
+void loadDescL(int2 p, out float d[16]);   // (below: a stored descriptor, PSAnaDesc / PSAnaDescCoarse)
+void loadDescR(int2 p, out float d[16]);
 float4 PSAnaDisp(VSOut i) : SV_Target
 {
     float2 uv  = i.uv;
@@ -266,7 +296,13 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     const float step = 8.0 / (16.0 * max(g_coarseW, 1.0));   // (this level's uv: 16 source px per texel)
     const int N = (int)ceil(maxD / step);
 
-    float refRed[16], refGrn[16]; buildDesc(uv, tx, ty, refRed, refGrn);
+    // Every position a candidate can be at is 8 source px from the next: their
+    // descriptors are worked out once (PSAnaDescCoarse: texel j is the position
+    // 8 x j px) and read here, where each used to be built again for every
+    // pixel that tried it. This pixel's own is at 2x + 1.
+    const int2 p = int2(i.pos.xy);
+    const int j0 = 2 * p.x + 1;
+    float refRed[16], refGrn[16]; loadDescL(int2(j0, p.y), refRed); loadDescR(int2(j0, p.y), refGrn);
 
     // Track the best match AND the best RIVAL (lowest cost at least 3 steps away from
     // the best) per direction. A unique match has its rival much higher; a repetitive
@@ -281,7 +317,8 @@ float4 PSAnaDisp(VSOut i) : SV_Target
         // the edge pixel repeated, which can look like one -- and then a whole
         // band beside the edge borrowed that single column: streaks.)
         if (uv.x + d < 0.0 || uv.x + d > 1.0 / g_lvlToSrcX) continue;
-        float cRed[16], cGrn[16]; buildDesc(uv + float2(d, 0), tx, ty, cRed, cGrn);
+        // (This candidate's descriptors, from PSAnaDescCoarse: 2 loads, not 20 samples.)
+        float cRed[16], cGrn[16]; loadDescL(int2(j0 + k, p.y), cRed); loadDescR(int2(j0 + k, p.y), cGrn);
         float bias = abs(d) * 16.0 * g_coarseW * 0.0004;   // (a preference for small disparities, per pixel -- also not tied to the area's width)
         float sadL = descCost(refRed, cGrn) + bias;   // dLR: red ref vs green candidate
         float sadR = descCost(refGrn, cRed) + bias;   // dRL: green ref vs red candidate
@@ -293,6 +330,18 @@ float4 PSAnaDisp(VSOut i) : SV_Target
     float uniqL = saturate((secondL - bestL) / (secondL + 1e-3) * 5.0);
     float uniqR = saturate((secondR - bestR) / (secondR + 1e-3) * 5.0);
     return float4(dL, dR, uniqL, uniqR);
+}
+
+// The source's 4x4 blocks averaged, plainly (4 bilinear taps, each a 2x2
+// average): for telling whether a frame is the one before again
+// (Converter::Convert, directSrc) -- no more is asked of it.
+float4 PSDownBox(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    const float2 t = 1.0 / float2(W, H);
+    const float2 c = i.pos.xy * 4.0 * t;
+    return 0.25 * (srcTex.SampleLevel(samp, c + float2(-1, -1) * t, 0) + srcTex.SampleLevel(samp, c + float2(1, -1) * t, 0) +
+                   srcTex.SampleLevel(samp, c + float2(-1, 1) * t, 0) + srcTex.SampleLevel(samp, c + float2(1, 1) * t, 0));
 }
 
 // 4x box downsample of the bound source (t0): each output pixel is the average
@@ -324,6 +373,50 @@ float4 PSDown(VSOut i) : SV_Target
     return acc / 64.0;
 }
 
+// The same downsample, and whether the block is plain grey: every tap (each a
+// 2x2 average) neutral and all alike to within the plain-grey test's 0.01
+// (anaFlatAt). Target 1: 1 = plain.
+struct DownFlatOut { float4 avg : SV_Target0; float flat : SV_Target1; };
+DownFlatOut PSDownFlat(VSOut i)
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    const float2 t = 1.0 / float2(W, H);
+    const float2 c = i.pos.xy * 4.0 * t;
+    const float o[4] = { -3.0, -1.0, 1.0, 3.0 };
+    const float wt[4] = { 1.0, 3.0, 3.0, 1.0 };
+    float4 acc = 0; float3 lo = 1e9, hi = -1e9; float dev = 0;
+    [unroll] for (int y = 0; y < 4; ++y)
+    [unroll] for (int x = 0; x < 4; ++x)
+    {
+        const float4 s = SrcSampleLevel(samp, c + t * float2(o[x], o[y]), 0);
+        acc += s * (wt[x] * wt[y]);
+        lo = min(lo, s.rgb); hi = max(hi, s.rgb);
+        dev = max(dev, max(abs(s.r - s.g), abs(s.r - s.b)));
+    }
+    DownFlatOut o2;
+    o2.avg = acc / 64.0;
+    o2.flat = (dev < 0.01 && all(hi - lo < 0.01)) ? 1.0 : 0.0;
+    return o2;
+}
+// Target 1/4: .r 1 where the 3x3 texels around are all plain (PSDownFlat at
+// t0), .g where the 5x5 are. A pixel pair in a .r texel is plain grey for
+// both eyes (PSAnaPair: no refine); a .g texel's smoothed disparity is read
+// by no pixel that's recovered (PSAnaSmooth: not worked out).
+float4 PSFlatShrink(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int2 p = int2(i.pos.xy);
+    float m1 = 1, m2 = 1;
+    [unroll] for (int y = -2; y <= 2; ++y)
+    [unroll] for (int x = -2; x <= 2; ++x)
+    {
+        const float f = srcTex.Load(int3(clamp(p + int2(x, y), int2(0, 0), int2(W, H) - 1), 0)).r;
+        m2 = min(m2, f);
+        if (abs(x) <= 1 && abs(y) <= 1) m1 = min(m1, f);
+    }
+    return float4(m1, m2, 0, 0);
+}
+
 // Descriptor pass: each refine-level pixel's 4-angle gradient descriptor
 // (buildDesc: 16 left-view + 16 right-view values, 20 texture reads), worked
 // out ONCE and stored as 32 halves in four uint4 targets. The refine below
@@ -331,11 +424,20 @@ float4 PSDown(VSOut i) : SV_Target
 // costs 2 loads each instead of 20 samples.
 struct DescOut { uint4 a : SV_Target0; uint4 b : SV_Target1; uint4 c : SV_Target2; uint4 d : SV_Target3; };
 uint packH(float x, float y) { return f32tof16(x) | (f32tof16(y) << 16); }
-DescOut PSAnaDesc(VSOut i)
+DescOut descAt(float2 uv);
+DescOut PSAnaDesc(VSOut i) { return descAt(i.uv); }
+// The same for the coarse search (PSAnaDisp), whose candidates sit every 8
+// source px -- half a coarse texel: a target twice the level's width plus
+// one, texel j holding the descriptor at 8 x j px.
+DescOut PSAnaDescCoarse(VSOut i)
+{
+    return descAt(float2((i.pos.x - 0.5) * 0.5 / max(g_coarseW, 1.0), i.uv.y));
+}
+DescOut descAt(float2 uv)
 {
     float tx = 1.0 / max(g_coarseW, 1.0);
     float ty = 1.0 / max(g_coarseH, 1.0);
-    float L[16], R[16]; buildDesc(i.uv, tx, ty, L, R);
+    float L[16], R[16]; buildDesc(uv, tx, ty, L, R);
     DescOut o;
     o.a = uint4(packH(L[0], L[1]),  packH(L[2], L[3]),   packH(L[4], L[5]),   packH(L[6], L[7]));
     o.b = uint4(packH(L[8], L[9]),  packH(L[10], L[11]), packH(L[12], L[13]), packH(L[14], L[15]));
@@ -361,6 +463,7 @@ void loadDescR(int2 p, out float d[16])   // right view's
     [unroll] for (int k = 0; k < 8; ++k) { d[k] = a[k]; d[k + 8] = b[k]; }
 }
 
+float2 anaSkipQ(int2 p);   // (below, with PSChangeGrow2)
 // Pyramid refine: start from a coarser level (dispTex = prior) and do a local
 // 4-angle gradient search to sharpen the disparity. Outputs (dLR, dRL, 0, 0).
 // Candidates sit on this level's pixel grid (the prior rounded to a whole
@@ -368,6 +471,7 @@ void loadDescR(int2 p, out float d[16])   // right view's
 // descriptor comes from PSAnaDesc's targets.
 float4 PSAnaRefine(VSOut i) : SV_Target
 {
+    if (anaSkipQ(int2(i.pos.xy)).r < 0.5) discard;   // (nothing redrawn reads it: PSChangeGrow2)
     float2 uv  = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     int2   p  = int2(i.pos.xy);
@@ -386,6 +490,7 @@ float4 PSAnaRefine(VSOut i) : SV_Target
     uint cw, ch; dispTex.GetDimensions(cw, ch);
     const int2 b0 = int2(floor(uv * float2(cw, ch) - 0.5));
     float bestL = 1e9, dL = priorAll.r, bestR = 1e9, dR = priorAll.g;
+    int kL00 = 0, kR00 = 0;
     [loop] for (int h = 0; h < 5; ++h)
     {
         float2 pr = priorAll.rg;
@@ -396,6 +501,11 @@ float4 PSAnaRefine(VSOut i) : SV_Target
         }
         const int kL0 = (int)round(pr.r * g_coarseW);
         const int kR0 = (int)round(pr.g * g_coarseW);
+        // (A neighbouring block's answer within 4 of the interpolated one: its
+        // +-2 are all among that one's +-6 already -- nothing new to try. Most
+        // of the picture: the blocks around agree.)
+        if (h == 0) { kL00 = kL0; kR00 = kR0; }
+        else if (abs(kL0 - kL00) <= 4 && abs(kR0 - kR00) <= 4) continue;
         const int M = (h == 0) ? 6 : 2;
         [loop] for (int k = -M; k <= M; ++k)
         {
@@ -428,6 +538,7 @@ float4 PSAnaRefine(VSOut i) : SV_Target
 // borrow-trust gate. dispTex holds the refined (dLR, dRL). Output adds .b = conf.
 float4 PSAnaFill(VSOut i) : SV_Target
 {
+    if (anaSkipQ(int2(i.pos.xy)).r < 0.5) discard;
     float2 uv  = i.uv;
     float  ctx = 1.0 / max(g_coarseW, 1.0);
     // (Left-right agreement is judged in pixels -- 4 source px per texel here.
@@ -492,23 +603,301 @@ float4 PSChange(VSOut i) : SV_Target
         d = max(d, max(max(abs(a.r - p.r), abs(a.g - p.g)), abs(a.b - p.b)));
     }
     // (Linear light, 4x4 averages: a single pixel changing by a few levels shows.)
-    const bool boxes = any(anaBoxMapTex.Load(int3(b, 0)).xy != changePrevMapTex.Load(int3(b, 0)).xy);
+    // (The boxes judged afresh, g_boxesNew: any block one touched or touches.)
+    const float2 bmNow = anaBoxMapTex.Load(int3(b, 0)).xy, bmWas = changePrevMapTex.Load(int3(b, 0)).xy;
+    const bool boxes = any(bmNow != bmWas) || (g_boxesNew > 0.5 && (any(bmNow != 0) || any(bmWas != 0)));
     if (d < 0.0005 && !boxes) discard;
     return 1;
 }
 
-// Target 1/16 size: a block is redrawn if a change is within reach of it --
-// the disparity search reaches g_dispMaxUV of the width sideways (a pixel's
-// colour can come from that far), the 1/4 smoothing a few blocks up and down.
+// How far sideways each 16x16 block's output reaches for its colour (source
+// px, .r the least offset, .g the most): the disparities it was last drawn
+// with (PSReach, kept from frame to frame, following a scroll). Unbound: the
+// whole search range.
+float2 reachAt(int2 b, int dy, bool still, bool moved)
+{
+    uint rw, rh; reachTex.GetDimensions(rw, rh);
+    const float all = g_dispMaxUV * g_srcW;
+    if (rw == 0) return float2(-all, all);
+    float2 r = float2(1e9, -1e9);
+    if (still) { const float2 v = reachTex.Load(int3(b, 0)).rg; r = float2(min(r.x, v.x), max(r.y, v.y)); }
+    if (moved)
+    {
+        // (The block's picture was dy rows away: the one or two blocks it lay in.)
+        const int r0 = clamp((int)floor((b.y * 16 + dy) / 16.0), 0, (int)rh - 1), r1 = clamp((int)floor((b.y * 16 + 15 + dy) / 16.0), 0, (int)rh - 1);
+        const float2 v0 = reachTex.Load(int3(b.x, r0, 0)).rg, v1 = reachTex.Load(int3(b.x, r1, 0)).rg;
+        r = float2(min(r.x, min(v0.x, v1.x)), max(r.y, max(v0.y, v1.y)));
+    }
+    return clamp(r, -all, all);
+}
+
+// Target 1/16 size: which blocks are drawn again. A block's output is its own
+// pixels and the colour it borrowed from the other view -- so far to one
+// side as its disparity (reachAt), a few px more for the last alignment. It is
+// redrawn if it changed itself, or anything in that reach did. (It used to be
+// the whole search range either side, 6% of the width: a caret, a pointer, a
+// small animation redrew a band a few hundred px wide around itself, every
+// frame.) .r 1 = redrawn.
+// Scroll reuse (PSChangeScroll: .g a block that's where it was, .b one that
+// only moved): a block keeps last frame's output -- in place, or from where
+// it was (.g 1) -- when everything in its reach did as it did. One that
+// stayed beside one that moved, within reach: what it borrowed isn't beside
+// it any more -- redrawn.
 float4 PSChangeGrow(VSOut i) : SV_Target
 {
     const int2 b = int2(i.pos.xy);
     uint W, H; srcTex.GetDimensions(W, H);
-    const int rx = (int)ceil(g_dispMaxUV * g_srcW / 16.0) + 1, ry = 3;
+    const float4 own = srcTex.Load(int3(b, 0));
+    if (own.r > 0.5) return 1;
+    const bool scroll = g_scrollOn > 0.5;
+    if (scroll && own.a > 0.5) return 1;   // (a box's block: PSChangeScroll)
+    const int dy = scroll ? (int)scrollTex.Load(int3(0, 0, 0)).r : 0;
+    // (A block that only moved: its reach came with it. One that could be
+    // either -- a plain area: both.)
+    const float2 reach = reachAt(b, dy, !scroll || own.b < 0.5, scroll && dy != 0 && own.g < 0.5);
+    const int rx = (int)ceil(g_dispMaxUV * g_srcW / 16.0) + 1;
+    const int x0 = max(max(0, b.x - rx), b.x + (int)floor((reach.x - 8.0) / 16.0));
+    const int x1 = min(min((int)W - 1, b.x + rx), b.x + (int)floor((reach.y + 23.0) / 16.0));
+    bool anyS = own.g > 0.5, anyM = own.b > 0.5;
+    [loop] for (int y = max(0, b.y - 1); y <= min((int)H - 1, b.y + 1); ++y)
+    [loop] for (int x = x0; x <= x1; ++x)
+    {
+        const float3 c = srcTex.Load(int3(x, y, 0)).rgb;
+        if (c.r > 0.5) return 1;
+        anyS = anyS || c.g > 0.5;
+        anyM = anyM || c.b > 0.5;
+    }
+    if (scroll && anyS && anyM) return 1;
+    return float4(0, scroll && anyM ? 1 : 0, 0, 0);
+}
+
+// Target 1/16 size: each block's reach (reachAt) after this frame. A block
+// drawn again: from the disparities it was drawn with (the smoothed map, t2,
+// its 4x4 texels and one more around -- the compose reads between them). One
+// kept: the reach it had, from where its picture was.
+float4 PSReach(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy);
+    bool fresh = g_changeSkip < 0.5, moved = false;
+    if (!fresh)
+    {
+        const float2 ch = changeTex.Load(int3(b, 0)).rg;
+        fresh = ch.r > 0.5; moved = ch.g > 0.5;
+    }
+    if (!fresh)
+    {
+        const int dy = g_scrollOn > 0.5 ? (int)scrollTex.Load(int3(0, 0, 0)).r : 0;
+        return float4(reachAt(b, dy, !moved, moved), 0, 1);
+    }
+    uint dw, dh; dispTex.GetDimensions(dw, dh);
+    const float toPx = g_lvlToSrcX * g_srcW;
+    float2 r = float2(1e9, -1e9);
+    [unroll] for (int y = -1; y <= 4; ++y)
+    [unroll] for (int x = -1; x <= 4; ++x)
+    {
+        const float4 d = dispTex.Load(int3(clamp(b * 4 + int2(x, y), 0, int2(dw, dh) - 1), 0));
+        if (d.b < 0.0) continue;   // (not worked out this frame: PSAnaSmooth)
+        const float lo = min(d.r, d.g) * toPx, hi = max(d.r, d.g) * toPx;
+        r = float2(min(r.x, lo), max(r.y, hi));
+    }
+    const float all = g_dispMaxUV * g_srcW;
+    if (r.x > r.y) r = float2(-all, all);
+    return float4(r, 0, 1);
+}
+
+// Target 1/16 size, from PSChangeGrow's blocks to redraw (t0): what the
+// disparity passes at 1/4 size have to work out for them. .g 1 = the smoothed
+// disparity is read here (a redrawn block or one beside it); .r 1 = the
+// refine and fill are (those, plus what the fill reaches for from them: 24
+// texels and a disparity sideways, the smoothing's 2 texels up and down).
+// The rest of each pass is skipped (anaSkipQ).
+float4 PSChangeGrow2(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy);
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int rx = (int)ceil(g_dispMaxUV * g_srcW / 16.0) + 8, ry = 2;
+    bool nearby = false, beside = false;
     [loop] for (int y = max(0, b.y - ry); y <= min((int)H - 1, b.y + ry); ++y)
     [loop] for (int x = max(0, b.x - rx); x <= min((int)W - 1, b.x + rx); ++x)
-        if (SrcLoad(int3(x, y, 0)).r > 0.5) return 1;
-    return 0;
+        if (srcTex.Load(int3(x, y, 0)).r > 0.5)
+        {
+            nearby = true;
+            if (abs(x - b.x) <= 1 && abs(y - b.y) <= 1) beside = true;
+        }
+    return float4(nearby ? 1 : 0, beside ? 1 : 0, 0, 0);
+}
+// (For a pass at 1/4 size, at pixel p: what PSChangeGrow2 says of its block.)
+float2 anaSkipQ(int2 p)
+{
+    if (g_changeSkip < 0.5) return 1;
+    uint cw, chh; changeTex.GetDimensions(cw, chh);
+    if (cw == 0) return 1;
+    return changeTex.Load(int3(clamp(p / 4, 0, int2(cw, chh) - 1), 0)).rg;
+}
+
+// For the perf log (Converter::TakeScrollStats): of PSChangeGrow's blocks
+// (t0), how many are redrawn (.r) and how many take last frame's output,
+// moved (.g) -- per row (target 1 x rows), then summed (1 x 1; .b the
+// scroll's rows, .a 1: a frame where something changed).
+float4 PSChangeStatRows(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    float2 s = 0;
+    [loop] for (uint x = 0; x < W; ++x) { const float2 c = srcTex.Load(int3(x, (int)i.pos.y, 0)).rg; s += float2(c.r > 0.5 ? 1 : 0, (c.r < 0.5 && c.g > 0.5) ? 1 : 0); }
+    return float4(s, 0, 0);
+}
+float4 PSChangeStat(VSOut i) : SV_Target
+{
+    uint W, H; srcTex.GetDimensions(W, H);
+    float2 s = 0;
+    [loop] for (uint y = 0; y < H; ++y) s += srcTex.Load(int3(0, y, 0)).rg;
+    uint sw, sh; scrollTex.GetDimensions(sw, sh);
+    return float4(s, (g_scrollOn > 0.5 && sw > 0) ? scrollTex.Load(int3(0, 0, 0)).r : 0, 1);
+}
+
+// ----- A page being scrolled (anaglyph recovery) --------------------------
+// Scrolling moves the whole picture every frame, so every block "changed"
+// and all of it was recovered again -- the costliest frames there are, just
+// when smoothness shows. But a scrolled picture is last frame's, moved: the
+// output for it is last frame's output, moved the same. So: how far did it
+// scroll (PSScrollCost / PSScrollPick), which blocks are exactly last
+// frame's source at that offset (PSChangeScroll), and only the rest -- the
+// rows that came into view, anything that changed besides -- is recovered.
+// All comparisons are exact: a pixel that differs at all is redrawn.
+static const int kScroll = 192;   // (rows a frame, either way; Converter.cpp)
+
+// Target (2 x kScroll + 1) x 54, a texel per offset and row of a grid of
+// pixels: of those that aren't what they were last frame, .r how many are
+// what was that many rows away, .g how many there are. (Per row, then summed
+// -- PSScrollSum: one pixel's shader doing the whole grid ran for
+// milliseconds.)
+float4 PSScrollCost(VSOut i) : SV_Target
+{
+    const int dy = (int)i.pos.x - kScroll, gy = (int)i.pos.y;
+    if (dy == 0) return 0;
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int py = (gy * 2 + 1) * (int)H / 108, qy = py + dy;
+    const bool inside = qy >= 0 && qy < (int)H;
+    float match = 0, moving = 0;
+    [unroll] for (int gx = 0; gx < 96; ++gx)
+    {
+        const int px = (gx * 2 + 1) * (int)W / 192 + (gy * 5) % 13;
+        const float3 a = srcTex.Load(int3(px, py, 0)).rgb;
+        const bool moved = any(a != srcPrevFull.Load(int3(px, py, 0)).rgb);
+        const bool same = all(a == srcPrevFull.Load(int3(px, clamp(qy, 0, (int)H - 1), 0)).rgb);
+        moving += moved ? 1.0 : 0.0;
+        match += (moved && inside && same) ? 1.0 : 0.0;
+    }
+    return float4(match, moving, 0, 0);
+}
+// Target (2 x kScroll + 1) x 1: the rows summed.
+float4 PSScrollSum(VSOut i) : SV_Target
+{
+    float2 s = 0;
+    [unroll] for (int gy = 0; gy < 54; ++gy) s += srcTex.Load(int3((int)i.pos.x, gy, 0)).rg;
+    return float4(s, 0, 0);
+}
+
+// Target 1 x 1 (cleared to 0): .r the offset most of the moving pixels agree
+// on. None: discarded -- and the pass's occlusion predicate skips the copy of
+// last frame's output (Converter::Convert).
+float4 PSScrollPick(VSOut i) : SV_Target
+{
+    float best = 0, bestDy = 0, moving = 0;
+    [loop] for (int k = 0; k <= 2 * kScroll; ++k)
+    {
+        const float2 c = srcTex.Load(int3(k, 0, 0)).rg;
+        const float dy = (float)(k - kScroll);
+        moving = max(moving, c.g);
+        if (c.r > best || (c.r == best && abs(dy) < abs(bestDy))) { best = c.r; bestDy = dy; }
+    }
+    // (A scroll moves nearly everything that changed: a page of text matches
+    // itself at many offsets, each a little less well.)
+    if (best < 12.0 || best < 0.5 * moving) discard;
+    return float4(bestDy, 0, 0, 1);
+}
+
+// Per 4x4 pixels of the source (t0) against last frame's (t19), target 1/4
+// size: .r 1 = not what was there, .g 1 = not what was there the scroll away.
+float4 PSChangeScrollQ(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy) * 4;
+    uint W, H; srcTex.GetDimensions(W, H);
+    const int dy = (int)scrollTex.Load(int3(0, 0, 0)).r;
+    if (dy == 0) discard;   // (no scroll: PSChangeScroll judges the blocks as PSChange does)
+    bool diffS = false, diffM = false;
+    [unroll] for (int y = 0; y < 4; ++y)
+    {
+        const int sy = min(b.y + y, (int)H - 1), my = sy + dy;
+        if (my < 0 || my >= (int)H) diffM = true;
+        [unroll] for (int x = 0; x < 4; ++x)
+        {
+            const int sx = min(b.x + x, (int)W - 1);
+            const float3 a = srcTex.Load(int3(sx, sy, 0)).rgb;
+            if (any(a != srcPrevFull.Load(int3(sx, sy, 0)).rgb)) diffS = true;
+            if (any(a != srcPrevFull.Load(int3(sx, clamp(my, 0, (int)H - 1), 0)).rgb)) diffM = true;
+        }
+    }
+    return float4(diffS ? 1 : 0, diffM ? 1 : 0, 0, 0);
+}
+// Target 1/16 size, per 16x16 block (PSChangeScrollQ's 4x4 at t0): .r 1 =
+// changed (neither where it was nor moved by the scroll), .g only where it
+// was, .b only moved. (Both: a plain area -- all 0.)
+float4 boxRect(int bi);   // (below)
+float4 PSChangeScroll(VSOut i) : SV_Target
+{
+    const int2 b = int2(i.pos.xy) * 4;
+    // (A block one of the black-and-white / one-colour boxes touches, now or
+    // where its picture was last frame: decoded the box's way, and the box
+    // follows a scroll in whole blocks only -- always redrawn, .a. Its
+    // neighbours aren't for that: nothing in the source changed.)
+    const int2 bb = int2(i.pos.xy);
+    const int sdy = (int)scrollTex.Load(int3(0, 0, 0)).r;
+    uint mw, mh; changePrevMapTex.GetDimensions(mw, mh);
+    bool boxed = any(anaBoxMapTex.Load(int3(bb, 0)).xy != 0);
+    if (mw > 0)
+    {
+        const int r0 = clamp((int)floor((bb.y * 16 + sdy) / 16.0), 0, (int)mh - 1), r1 = clamp((int)floor((bb.y * 16 + 15 + sdy) / 16.0), 0, (int)mh - 1);
+        boxed = boxed || any(changePrevMapTex.Load(int3(bb.x, r0, 0)).xy != 0) || any(changePrevMapTex.Load(int3(bb.x, r1, 0)).xy != 0)
+                      || any(changePrevMapTex.Load(int3(bb, 0)).xy != 0);
+    }
+    // (Except a block well inside one box, this frame and last, the boxes not
+    // judged afresh: every pixel of it is decoded from its own source pixel
+    // alone, the same way both frames -- last frame's output for it, moved,
+    // is this frame's. Well inside: the box follows the page a block at a time.)
+    if (boxed && mw > 0 && sdy != 0 && g_boxesNew < 0.5)
+    {
+        const float2 mN = anaBoxMapTex.Load(int3(bb, 0)).xy;
+        const int q0 = clamp((int)floor((bb.y * 16 + sdy) / 16.0), 0, (int)mh - 1), q1 = clamp((int)floor((bb.y * 16 + 15 + sdy) / 16.0), 0, (int)mh - 1);
+        if (mN.x != 0 && mN.y == 0 && all(changePrevMapTex.Load(int3(bb.x, q0, 0)).xy == mN) && all(changePrevMapTex.Load(int3(bb.x, q1, 0)).xy == mN))
+        {
+            const float4 br = boxRect((int)mN.x - 1) * float4(g_srcW, g_srcH, g_srcW, g_srcH);
+            const float2 p0 = float2(bb) * 16.0, p1 = p0 + 16.0;
+            if (p0.x >= br.x + 16.0 && p1.x <= br.z - 16.0 && p0.y >= br.y + 32.0 && p1.y <= br.w - 32.0) boxed = false;
+        }
+    }
+    const float boxA = boxed ? 1 : 0;
+    if (sdy == 0)
+    {
+        // Not scrolling: PSChange's test, on the 1/4 source (t9) and last frame's (t8).
+        float dq = 0;
+        [unroll] for (int qy = 0; qy < 4; ++qy)
+        [unroll] for (int qx = 0; qx < 4; ++qx)
+        {
+            const int3 q = int3(b + int2(qx, qy), 0);
+            const float3 a = srcQ.Load(q).rgb, p = srcPrevQ.Load(q).rgb;
+            dq = max(dq, max(max(abs(a.r - p.r), abs(a.g - p.g)), abs(a.b - p.b)));
+        }
+        const float2 bmNow = anaBoxMapTex.Load(int3(bb, 0)).xy, bmWas = changePrevMapTex.Load(int3(bb, 0)).xy;
+        const bool boxes = any(bmNow != bmWas) || (g_boxesNew > 0.5 && (any(bmNow != 0) || any(bmWas != 0)));
+        return (dq < 0.0005 && !boxes) ? float4(0, 1, 0, 0) : float4(1, 0, 0, 0);
+    }
+    float2 d = 0;
+    [unroll] for (int y = 0; y < 4; ++y)
+    [unroll] for (int x = 0; x < 4; ++x)
+        d = max(d, srcTex.Load(int3(b + int2(x, y), 0)).rg);
+    const bool diffS = d.r > 0.5, diffM = d.g > 0.5;
+    return float4(diffS && diffM ? 1 : 0, !diffS && diffM ? 1 : 0, diffS && !diffM ? 1 : 0, boxA);
 }
 // ----- Is each box still what it was judged? (Converter::SetAnaBoxes) -----
 // The black-and-white / one-colour boxes come from a check on an earlier frame.
@@ -653,6 +1042,11 @@ float4 PSAnaBoxMap(VSOut i) : SV_Target
 
 float4 PSAnaSmooth(VSOut i) : SV_Target
 {
+    // (Plain grey all round: read by nothing recovered -- PSFlatShrink.)
+    { uint fw, fh; flatTex.GetDimensions(fw, fh); if (fw > 0 && flatTex.Load(int3(i.pos.xy, 0)).g > 0.5) return float4(0, 0, -1, -1); }
+    // (Not read by anything redrawn this frame: not worked out -- and marked so,
+    // confidence -1, for the next frame's steadying below.)
+    if (anaSkipQ(int2(i.pos.xy)).g < 0.5) return float4(0, 0, -1, -1);
     float2 uv = i.uv;
     float  tx = 1.0 / max(g_coarseW, 1.0);
     float  ty = 1.0 / max(g_coarseH, 1.0);
@@ -666,26 +1060,42 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
     // background's at every edge (a value belonging to neither), and dragged
     // a correct value toward wrong neighbours; on real stereo pairs that is
     // where ~9% of the blob pixels, right until here, were lost.
-    float2 nds[25]; float nws[25];
+    // (Left's then right's: holding both sets of 25 at once took 43 registers
+    // a pixel -- few pixels in flight. The weights are shared; the second set
+    // is read again, from the cache. All reads at texel centres: Load.)
+    uint dw, dh; dispTex.GetDimensions(dw, dh);
+    const int2 p0 = int2(i.pos.xy), pmax = int2(dw, dh) - 1;
+    float v[25]; float nws[25];
     const int R = 2;
     [unroll] for (int dy = -R; dy <= R; ++dy)
     [unroll] for (int dx = -R; dx <= R; ++dx)
     {
         const int idx = (dy + R) * 5 + (dx + R);
-        float2 nuv = uv + float2((float)dx * tx, (float)dy * ty);
-        float4 nd  = dispTex.SampleLevel(samp, nuv, 0.0);
-        float3 nc  = SrcSampleLevel(samp, nuv, 0.0).rgb;
+        const int3 q = int3(clamp(p0 + int2(dx, dy), int2(0, 0), pmax), 0);
+        float4 nd  = dispTex.Load(q);
+        float3 nc  = SrcLoad(q).rgb;
         float  ws  = exp(-(float)(dx * dx + dy * dy) / 8.0);   // spatial
         float  wl  = exp(-abs(y0 - (anaChanL(nc) + anaChanR(nc))) * 6.0);      // luminance (edge-aware)
-        nds[idx] = nd.rg; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
+        v[idx] = nd.r; nws[idx] = ws * wl * (0.2 + max(nd.b, nd.a));        // trust confident neighbours
     }
-    float2 d = nds[12]; float bestL = 1e9, bestR = 1e9;
-    [unroll] for (int a = 0; a < 25; ++a)   // (unrolled: nds / nws then stay in registers, not indexed memory)
+    float2 d; float best = 1e9; d.x = v[12];
+    [unroll] for (int a = 0; a < 25; ++a)   // (unrolled: v / nws then stay in registers, not indexed memory)
+    if (abs(a % 5 - 2) <= 1 && abs(a / 5 - 2) <= 1)   // (candidates: the middle 3x3, each weighed against all 25 -- a third of the work, the same results on the test scenes)
     {
-        float sL = 0, sR = 0;
-        [unroll] for (int b = 0; b < 25; ++b) { sL += nws[b] * abs(nds[a].x - nds[b].x); sR += nws[b] * abs(nds[a].y - nds[b].y); }
-        if (sL < bestL) { bestL = sL; d.x = nds[a].x; }
-        if (sR < bestR) { bestR = sR; d.y = nds[a].y; }
+        float s = 0;
+        [unroll] for (int b = 0; b < 25; ++b) s += nws[b] * abs(v[a] - v[b]);
+        if (s < best) { best = s; d.x = v[a]; }
+    }
+    [unroll] for (int ry = -R; ry <= R; ++ry)
+    [unroll] for (int rx = -R; rx <= R; ++rx)
+        v[(ry + R) * 5 + (rx + R)] = dispTex.Load(int3(clamp(p0 + int2(rx, ry), int2(0, 0), pmax), 0)).g;
+    best = 1e9; d.y = v[12];
+    [unroll] for (int a2 = 0; a2 < 25; ++a2)
+    if (abs(a2 % 5 - 2) <= 1 && abs(a2 / 5 - 2) <= 1)
+    {
+        float s = 0;
+        [unroll] for (int b = 0; b < 25; ++b) s += nws[b] * abs(v[a2] - v[b]);
+        if (s < best) { best = s; d.y = v[a2]; }
     }
     // Video: each frame's disparity is estimated afresh and wobbles a little,
     // which showed as shimmering borrowed colour. Where this spot looks as it
@@ -695,8 +1105,9 @@ float4 PSAnaSmooth(VSOut i) : SV_Target
     {
         const float3 was = srcPrevQ.SampleLevel(samp, uv, 0.0).rgb;
         const float change = dot(abs(c0 - was), float3(1.0, 1.0, 1.0)) / 3.0;
-        const float keep = 0.6 * saturate(1.0 - change * 20.0);   // (~5% change: none kept)
-        d = lerp(d, dispPrevTex.SampleLevel(samp, uv, 0.0).rg, keep);
+        const float keep = saturate(1.0 - change * 20.0);   // (~5% change: none kept; none at all: all of last frame's -- a still picture's colour no longer flickers with the video's noise)
+        const float4 pd = dispPrevTex.SampleLevel(samp, uv, 0.0);
+        if (pd.b >= 0.0) d = lerp(d, pd.rg, keep);   // (-1: not worked out last frame, see above)
     }
     return float4(d, myConf.x, myConf.y);
 }
@@ -733,18 +1144,82 @@ float3 sampleLanczos3Cell(float2 uvWithinCell, int2 cellMinPx, int2 cellSizePx)
     float2 frac = px - float2(ip);
     float3 acc  = 0;
     float  wsum = 0;
+    // (The 6 + 6 weights once, not one of each for all 36 taps.)
+    float wxs[6], wys[6];
+    [unroll] for (int k = 0; k < 6; ++k) { wxs[k] = lanczos3Weight((float)(k - 2) - frac.x); wys[k] = lanczos3Weight((float)(k - 2) - frac.y); }
     [unroll] for (int dy = -2; dy <= 3; ++dy)
     {
-        float wy = lanczos3Weight((float)dy - frac.y);
+        float wy = wys[dy + 2];
         [unroll] for (int dx = -2; dx <= 3; ++dx)
         {
-            float wx = lanczos3Weight((float)dx - frac.x);
+            float wx = wxs[dx + 2];
             float w = wx * wy;
             int2 q = clamp(int2(ip.x + dx, ip.y + dy),
                            int2(0, 0), cellSizePx - int2(1, 1));
             acc  += SrcLoad(int3(cellMinPx + q, 0)).rgb * w;
             wsum += w;
         }
+    }
+    return acc / max(wsum, 1e-5);
+}
+
+// Quilt in two passes. The Lanczos kernel is the product of a horizontal and a
+// vertical one, so it can be applied one direction at a time with exactly
+// the same result: first along each row of the view (PSQuiltH, 6 reads, at
+// the output's width but only the view's few hundred rows), then down the
+// columns of that (the compose, 6 reads). 12 reads an output pixel instead
+// of 36 -- 24 instead of 72 while cross-fading between two views.
+// Target: the output's width (both panes) by twice the view's height -- the
+// nearer view's rows, then the next view's (only while cross-fading).
+float4 PSQuiltH(VSOut i) : SV_Target
+{
+    const int ew = (int)g_paneW;
+    const int ox = (int)i.pos.x, oy = (int)i.pos.y;
+    const bool rightPane = ox >= ew;
+    bool right = rightPane; if (g_swap) right = !right;
+    float ex = ((float)(ox - (rightPane ? ew : 0)) + 0.5) / g_paneW;
+    ex += (right ? -g_convergence : g_convergence);
+    int total  = max(1, g_quiltCols * g_quiltRows);
+    int viewLo = clamp(right ? g_quiltRightIdx : g_quiltLeftIdx, 0, total - 1);
+    int viewHi = min(viewLo + 1, total - 1);
+    const float blend = saturate(right ? g_quiltRBlend : g_quiltLBlend);
+    const int viewWpx = max(1, (int)(g_srcW / (float)g_quiltCols));
+    const int viewHpx = max(1, (int)(g_srcH / (float)g_quiltRows));
+    const bool hi = oy >= viewHpx;
+    if (hi && (blend <= 0.002 || viewHi == viewLo)) return 0;   // (no cross-fade: not needed)
+    const int view = hi ? viewHi : viewLo, row = oy - (hi ? viewHpx : 0);
+    // (Pillarboxed: as the one-pass version.)
+    float viewAspect = (g_srcW / (float)g_quiltCols) / max(1.0, g_srcH / (float)g_quiltRows);
+    float paneAspect = (g_paneH > 0.0) ? (g_paneW / g_paneH) : viewAspect;
+    if (viewAspect < paneAspect)
+    {
+        const float widthFrac = viewAspect / paneAspect, marginX = (1.0 - widthFrac) * 0.5;
+        if (ex < marginX || ex > 1.0 - marginX) return 0;
+        ex = (ex - marginX) / widthFrac;
+    }
+    const int2 cell = int2((view % g_quiltCols) * viewWpx, (g_quiltRows - 1 - view / g_quiltCols) * viewHpx);
+    const float p = ex * viewWpx - 0.5;
+    const int ip = (int)floor(p); const float fr = p - ip;
+    float3 acc = 0; float wsum = 0;
+    [unroll] for (int dx = -2; dx <= 3; ++dx)
+    {
+        const float w = lanczos3Weight((float)dx - fr);
+        acc += SrcLoad(int3(cell.x + clamp(ip + dx, 0, viewWpx - 1), cell.y + clamp(row, 0, viewHpx - 1), 0)).rgb * w;
+        wsum += w;
+    }
+    return float4(acc / max(wsum, 1e-5), 1);
+}
+// ... and down the columns (the compose): view `upper` 0 the nearer, 1 the next.
+float3 quiltVertical(int ox, float evy, int viewHpx, int upper)
+{
+    const float p = evy * viewHpx - 0.5;
+    const int ip = (int)floor(p); const float fr = p - ip;
+    float3 acc = 0; float wsum = 0;
+    [unroll] for (int dy = -2; dy <= 3; ++dy)
+    {
+        const float w = lanczos3Weight((float)dy - fr);
+        acc += dispTex.Load(int3(ox, upper * viewHpx + clamp(ip + dy, 0, viewHpx - 1), 0)).rgb * w;
+        wsum += w;
     }
     return acc / max(wsum, 1e-5);
 }
@@ -806,24 +1281,30 @@ void AnaSearch(float2 e, int eye, float4 dC, float rgR[4], float rgG[4], float p
         float3 s = SrcSampleLevel(samp, float2(e.x + d0 + (float)(q - 5) * px, e.y), 0).rgb;
         sr[q] = anaChanL(s); sg[q] = anaChanR(s);
     }
+    // (Each difference through descCurve once: the candidates' windows share them.)
+    float cref[4], ccand[10];
+    [unroll] for (int j = 0; j < 4; ++j) cref[j] = descCurve((eye == 0) ? rgR[j] : rgG[j]);
+    [unroll] for (int j2 = 0; j2 < 10; ++j2) ccand[j2] = descCurve((eye == 0) ? sg[j2 + 1] - sg[j2] : sr[j2 + 1] - sr[j2]);   // (left: red ref vs green cand; right: green vs red)
     float sads[7];
     [unroll] for (int r = 0; r < 7; ++r)
     {
         float sd = 0.0;
         [unroll] for (int k2 = 0; k2 < 4; ++k2)
-            sd += (eye == 0) ? abs(rgR[k2] - (sg[r + k2 + 1] - sg[r + k2]))    // left: red ref vs green cand
-                             : abs(rgG[k2] - (sr[r + k2 + 1] - sr[r + k2]));   // right: green ref vs red cand
+            sd += abs(cref[k2] - ccand[r + k2]);
         sads[r] = sd;
     }
     // (Ties go to the centre -- the disparity from the maps -- not to the
     // first candidate, which shifted every flat area by -3 px.)
-    [unroll] for (int t0 = 0; t0 < 7; ++t0) sads[t0] += abs((float)(t0 - 3)) * 0.002;
+    [unroll] for (int t0 = 0; t0 < 7; ++t0) sads[t0] += abs((float)(t0 - 3)) * 0.02;   // (strong enough that noise can't move it: flicker)
     int bi = 3; float bs = sads[3];
     [unroll] for (int t = 0; t < 7; ++t) if (sads[t] < bs) { bs = sads[t]; bi = t; }
     dRef = d0 + (float)(bi - 3) * px;
+    // (The two neighbouring costs picked out without indexing an array by bi --
+    // that put the array in slow memory, for every pixel pair.)
+    float cm = 0, cc0 = bs, cp = 0;
+    [unroll] for (int t2 = 0; t2 < 7; ++t2) { cm = (t2 == bi - 1) ? sads[t2] : cm; cp = (t2 == bi + 1) ? sads[t2] : cp; }
     if (bi > 0 && bi < 6)   // parabola vertex from the two neighbouring costs
     {
-        float cm = sads[bi - 1], cc0 = sads[bi], cp = sads[bi + 1];
         float den = cm - 2.0 * cc0 + cp;
         float delta = (abs(den) > 1e-5) ? 0.5 * (cm - cp) / den : 0.0;
         dRef += clamp(delta, -1.0, 1.0) * px;
@@ -868,6 +1349,29 @@ void AnaRefine(float2 e, int eye, float3 c, float px, out float dRef, out float 
 // share (the pixel, the disparity maps' value, the gradient window) is worked
 // out once. Target: one texel per pair; .rg the left eye's dRef / conf, .ba
 // the right eye's. The compose reads it.
+// Both eyes see the same plain grey around here -- the anaglyph flat and
+// neutral: what's shown already IS each eye's colour (a page beside the
+// picture, plain grey sky), nothing to recover.
+bool anaFlatAt(float2 e, float3 c)
+{
+    const float2 pxy = 1.0 / float2(g_srcW, g_srcH);
+    float dev = max(abs(c.r - c.g), abs(c.r - c.b));
+    [unroll] for (int fy = -1; fy <= 1; ++fy)
+    [unroll] for (int fx = -1; fx <= 1; ++fx)
+    {
+        const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * pxy, 0).rgb;
+        dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
+        dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
+    }
+    return dev < 0.01;
+}
+// (For a pixel pair: 1 the first pixel plain grey, 2 the second, 3 both.)
+float anaFlatPair(float2 e, float3 c)
+{
+    const float2 e2 = float2(e.x + 1.0 / g_paneW, e.y);
+    return (anaFlatAt(e, c) ? 1.0 : 0.0) + (anaFlatAt(e2, SrcSample(samp, e2).rgb) ? 2.0 : 0.0);
+}
+
 float4 PSAnaPair(VSOut i) : SV_Target
 {
     const int ew = (int)g_paneW;
@@ -885,17 +1389,31 @@ float4 PSAnaPair(VSOut i) : SV_Target
     if (g_convergence == 0.0)
     {
         const float3 c = SrcSample(samp, e).rgb;
+        // (Plain grey round this pair, from the 1/4 level -- PSFlatShrink: no tests.)
+        {
+            uint fw, fh; flatTex.GetDimensions(fw, fh);
+            if (fw > 0 && flatTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 4.0), 0, int2(fw, fh) - 1), 0)).r > 0.5)
+                return float4(0, 3, 0, 3);
+        }
+        // (Both plain grey: no refine. .g / .a tell the compose which are, and it shows them as they are.)
+        const float flat = anaFlatPair(e, c);
+        if (flat > 2.5) return float4(0, flat, 0, flat);
         const float4 dC = AnaDispAt(e, c);
         float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
         AnaSearch(e, 0, dC, rgR, rgG, px, dL, cL);
         AnaSearch(e, 1, dC, rgR, rgG, px, dR, cR);
+        return float4(dL, flat, dR, flat);   // (.g / .a: which of the pair is plain grey)
     }
     else
     {
-        AnaRefine(eL, 0, SrcSample(samp, eL).rgb, px, dL, cL);
-        AnaRefine(eR, 1, SrcSample(samp, eR).rgb, px, dR, cR);
+        const float3 cl = SrcSample(samp, eL).rgb, cr = SrcSample(samp, eR).rgb;
+        const float fl = anaFlatPair(eL, cl), fr = anaFlatPair(eR, cr);
+        dL = dR = 0;
+        if (fl < 2.5) AnaRefine(eL, 0, cl, px, dL, cL);
+        if (fr < 2.5) AnaRefine(eR, 1, cr, px, dR, cR);
+        return float4(dL, fl, dR, fr);
     }
-    return float4(dL, cL, dR, cR);
+    return 0;
 }
 
 // forceFmt: compiled for one format alone (>= 0; -1: the format from the
@@ -904,6 +1422,79 @@ float4 PSAnaPair(VSOut i) : SV_Target
 // recoveryOnly: the Recovered Colour compose alone (PSAnaCompose); its per-pixel
 // refine folds away too (PSAnaPair has done it). noRecovery: the anaglyph modes
 // without Recovered Colour.
+// Recovered Colour, one pixel (source place e, its colour c, which eye): if a
+// black-and-white / one-colour box (SetAnaBoxes) holds it, its colour decoded
+// that way -- true; else false.
+bool anaBoxDecode(float2 e, float3 c, int eye, out float3 o)
+{
+    o = c;
+    uint mw, mh; anaBoxMapTex.GetDimensions(mw, mh);
+    const float2 cand = mw > 0 ? anaBoxMapTex.Load(int3(min(int2(e * float2(g_srcW, g_srcH) / 16.0), int2(mw, mh) - 1), 0)).xy : 0;
+    [unroll] for (int ci = 0; ci < 2; ++ci)
+    {
+        const int bi = (int)cand[ci] - 1;
+        if (bi < 0) break;
+        const float4 br = boxRect(bi);
+        if (e.x < br.x || e.x > br.z || e.y < br.y || e.y > br.w) continue;
+        const float4 bk = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0));
+        if (bk.x > 1.5)
+        {
+            // (Plain grey here -- page the box reaches over after a scroll: as
+            // it is; the tint would paint it.)
+            const float3 sc = srgbEncode(saturate(c));
+            o = (max(max(sc.r, sc.g), sc.b) - min(min(sc.r, sc.g), sc.b) < 3.0 / 255.0) ? c : tintDecode(c, eye, (int)bk.y);
+            return true;
+        }
+        if (bk.x > 0.5) { o = decodeAnaglyph(c, g_anaCombo, eye, 3); return true; }
+    }
+    return false;
+}
+// ... and recovered: its own channel(s) as seen, the other view's from where
+// it's matched (dRef, uv x offset), brought to this eye's brightness.
+float3 anaRecoverPixel(float2 e, float3 c, int eye, float dRef)
+{
+    const float px = 1.0 / g_srcW, py = 1.0 / g_srcH;
+    float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
+    // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
+    // matched centre tap defines the "patch region"; each neighbour is
+    // exponentially down-weighted by its luminance difference from the
+    // centre, so taps that land across an object edge at the matched
+    // location contribute almost nothing. Plain 9-tap averaging smeared
+    // cross-eye colour across edges -> the persistent borrow-edge
+    // marbelling. SIRA's superpixel containment serves the same purpose;
+    // luminance-weighting is the shader-feasible analogue.
+    float3 centreC = SrcSampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
+    float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
+    float3 there = 0;
+    float  tw    = 1e-4;
+    [unroll] for (int by = -1; by <= 1; ++by)
+    [unroll] for (int bx = -1; bx <= 1; ++bx)
+    {
+        float3 s = SrcSampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+        float  sY = dot(s, float3(0.299, 0.587, 0.114));
+        // (Brightness compared on its square root, as the eye sees it: a step
+        // in a dark area counts as much as the same visible step in a bright one.)
+        float  w  = exp(-abs(sqrt(max(sY, 0.0)) - sqrt(max(centreY, 0.0))) * 8.0);
+        there += s * w;
+        tw    += w;
+    }
+    there /= tw;
+    // Own channel(s) as seen, the other view's from the aligned borrow
+    // (red/cyan left: own red, borrowed green + blue). Custom: the share of
+    // each channel that's this eye's.
+    float3 ownMask = (g_anaCombo == 6) ? ((eye == 0) ? g_anaMaskL.rgb : g_anaMaskR.rgb) : anaFilter(float3(1, 1, 1), g_anaCombo, eye);
+    float3 alignedCol = c * ownMask + there * (1.0 - ownMask);
+    float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
+    // (Brought to this eye's brightness -- but if that pushes a channel
+    // past full, the whole colour is scaled back rather than that channel
+    // cut off: clipping one channel changed the hue, red paint going
+    // pink or white even where the match was right.)
+    float3 scaled = alignedCol * (eyeY / aY);
+    const float peak = max(max(scaled.r, scaled.g), scaled.b);
+    if (peak > 1.0) scaled /= peak;
+    return saturate(scaled);
+}
+
 float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRecovery = false)
 {
     const int fmt   = recoveryOnly ? 2 : forceFmt >= 0 ? forceFmt : g_format;
@@ -922,9 +1513,11 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
     // directions, moving the zero-disparity plane in/out of the screen.
     e.x += (right ? -g_convergence : g_convergence);
 
-    if (fmt == 1)        // Top-and-bottom: top=left, bottom=right
+    if (fmt == 1 || fmt == 12)   // Top-and-bottom: top=left, bottom=right
     {
-        float2 s = float2(e.x, right ? 0.5 + e.y * 0.5 : e.y * 0.5);
+        // (12: Full top-and-bottom on a wide source -- a screen showing a tall
+        // 16:18 frame pillarboxed: the picture is the middle half of the width.)
+        float2 s = float2(g_format == 12 ? 0.25 + e.x * 0.5 : e.x, right ? 0.5 + e.y * 0.5 : e.y * 0.5);
         return SrcSample(samp, s);
     }
     else if (fmt == 3)   // Row interleaved: even rows=left, odd=right
@@ -966,10 +1559,20 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
     {
         // (Recovery: a block nothing changed near since the last frame keeps
         // last frame's output -- see PSChange.)
-        if (g_changeSkip > 0.5)
+        if (!noRecovery && g_changeSkip > 0.5)
         {
             uint cw, chh; changeTex.GetDimensions(cw, chh);
-            if (cw > 0 && changeTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 16.0), 0, int2(cw, chh) - 1), 0)).r < 0.5) discard;
+            if (cw > 0)
+            {
+                const float2 ch = changeTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 16.0), 0, int2(cw, chh) - 1), 0)).rg;
+                if (ch.r < 0.5)
+                {
+                    // (A block that only scrolled: last frame's output for it, from where it was.)
+                    if (g_scrollOn > 0.5 && ch.g > 0.5)
+                        return outPrevTex.Load(int3((int)i.pos.x, (int)i.pos.y + (int)scrollTex.Load(int3(0, 0, 0)).r, 0));
+                    discard;
+                }
+            }
         }
         int eye = right ? 1 : 0;
         float3 c = SrcSample(samp, e).rgb;
@@ -980,29 +1583,7 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
         // Recovered Colour on a page of several: the pictures that were black-and-
         // white (Mono) or one colour (their tint) are decoded so inside their
         // boxes (Converter::SetAnaBoxes); the rest is recovered.
-        if (!noRecovery && amode == 4)
-        {
-            // (The boxes touching this 16x16 block, still so this frame: PSAnaBoxMap.)
-            uint mw, mh; anaBoxMapTex.GetDimensions(mw, mh);
-            const float2 cand = mw > 0 ? anaBoxMapTex.Load(int3(min(int2(e * float2(g_srcW, g_srcH) / 16.0), int2(mw, mh) - 1), 0)).xy : 0;
-            [unroll] for (int ci = 0; ci < 2; ++ci)
-            {
-                const int bi = (int)cand[ci] - 1;
-                if (bi < 0) break;
-                const float4 br = boxRect(bi);
-                if (e.x < br.x || e.x > br.z || e.y < br.y || e.y > br.w) continue;
-                const float4 bk = anaBoxTex.Load(int3(2 + 2 * bi, 0, 0));
-                if (bk.x > 1.5)
-                {
-                    // (Plain grey here -- page the box reaches over after a scroll: as
-                    // it is; the tint would paint it.)
-                    const float3 sc = srgbEncode(saturate(c));
-                    if (max(max(sc.r, sc.g), sc.b) - min(min(sc.r, sc.g), sc.b) < 3.0 / 255.0) return float4(c, 1);
-                    return float4(tintDecode(c, eye, (int)bk.y), 1);
-                }
-                if (bk.x > 0.5) return float4(decodeAnaglyph(c, g_anaCombo, eye, 3), 1);
-            }
-        }
+        { float3 bo; if (!noRecovery && amode == 4 && anaBoxDecode(e, c, eye, bo)) return float4(bo, 1); }
 
         // Multi-scale aligned recovery (red/cyan only). Reads the coarse disparity
         // map (PSAnaDisp), refines it at full resolution, checks left-right
@@ -1012,21 +1593,10 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
         {
             float px = 1.0 / g_srcW;
             float py = 1.0 / g_srcH;
-            // Where both eyes see the same plain grey here -- the anaglyph flat and
-            // neutral around this pixel -- what's shown already IS each eye's
-            // colour: nothing to recover (a page beside the picture, plain grey
-            // sky), and a borrow could only bring the wrong colour in.
-            {
-                float dev = max(abs(c.r - c.g), abs(c.r - c.b));
-                [unroll] for (int fy = -1; fy <= 1; ++fy)
-                [unroll] for (int fx = -1; fx <= 1; ++fx)
-                {
-                    const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * float2(px, py), 0).rgb;
-                    dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
-                    dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
-                }
-                if (dev < 0.01) return float4(c, 1);
-            }
+            // Where both eyes see the same plain grey here (anaFlatAt): shown as
+            // it is -- a borrow could only bring the wrong colour in. (With
+            // PSAnaPair's result: judged there, once per pixel pair.)
+            if (!recoveryOnly && g_pairRefine < 0.5 && anaFlatAt(e, c)) return float4(c, 1);
             // Where to borrow from (the other eye), and how far to trust it:
             // worked out once per pixel pair by PSAnaPair when that ran (the
             // disparity barely changes from one pixel to the next), else here.
@@ -1037,48 +1607,14 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
                 const int ox = (int)i.pos.x, pane = ox >= ew ? 1 : 0;   // (this output pixel: which half, where in it)
                 const float4 pp = pairTex.Load(int3(clamp(ox - pane * ew, 0, ew - 1) / 2, (int)i.pos.y, 0));
                 const float2 pr = eye == 0 ? pp.rg : pp.ba;   // (.rg the left eye's, .ba the right's)
-                dRef = pr.x; conf = pr.y;
+                dRef = pr.x; conf = 0;
+                // (Plain grey, as PSAnaPair judged this pixel of the pair: shown as it is.)
+                const int which = (clamp(ox - pane * ew, 0, ew - 1) & 1) ? 2 : 1;
+                if (((int)(pr.y + 0.5) & which) != 0) return float4(c, 1);
             }
             else if (!recoveryOnly) AnaRefine(e, eye, c, px, dRef, conf);
             else { dRef = 0; conf = 0; }   // (PSAnaCompose only runs with PSAnaPair's result)
-            float eyeY = anaEyeLuma(c, g_anaCombo, eye);            // own sharp luminance
-
-            // Block processing (SIRA-style) -- LUMINANCE-WEIGHTED 3x3 borrow. The
-            // matched centre tap defines the "patch region"; each neighbour is
-            // exponentially down-weighted by its luminance difference from the
-            // centre, so taps that land across an object edge at the matched
-            // location contribute almost nothing. Plain 9-tap averaging smeared
-            // cross-eye colour across edges -> the persistent borrow-edge
-            // marbelling. SIRA's superpixel containment serves the same purpose;
-            // luminance-weighting is the shader-feasible analogue.
-            float3 centreC = SrcSampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
-            float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
-            float3 there = 0;
-            float  tw    = 1e-4;
-            [unroll] for (int by = -1; by <= 1; ++by)
-            [unroll] for (int bx = -1; bx <= 1; ++bx)
-            {
-                float3 s = SrcSampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
-                float  sY = dot(s, float3(0.299, 0.587, 0.114));
-                float  w  = exp(-abs(sY - centreY) * 8.0);  // ~0.125 luma delta -> ~37% weight
-                there += s * w;
-                tw    += w;
-            }
-            there /= tw;
-
-            // Own channel(s) as seen, the other view's from the aligned borrow
-            // (red/cyan left: own red, borrowed green + blue).
-            float3 ownMask = anaFilter(float3(1, 1, 1), g_anaCombo, eye);
-            float3 alignedCol = c * ownMask + there * (1.0 - ownMask);
-            float aY = max(dot(alignedCol, float3(0.299, 0.587, 0.114)), 1e-3);
-            // (Brought to this eye's brightness -- but if that pushes a channel
-            // past full, the whole colour is scaled back rather than that channel
-            // cut off: clipping one channel changed the hue, red paint going
-            // pink or white even where the match was right.)
-            float3 scaled = alignedCol * (eyeY / aY);
-            const float peak = max(max(scaled.r, scaled.g), scaled.b);
-            if (peak > 1.0) scaled /= peak;
-            return float4(saturate(scaled), conf);
+            return float4(anaRecoverPixel(e, c, eye, dRef), conf);
         }
 
         if (amode == 0 || (!noRecovery && amode == 4)) // Recovered colour: per-eye luminance + shared,
@@ -1187,6 +1723,17 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
         // Glass's smooth between-views transition. We skip the second sample
         // (and its 36 texture reads) when blend rounds to zero -- the common
         // case for a perfectly-still head pinned to one view.
+        // (Two passes when PSQuiltH has run -- its rows at t2: the same, cheaper.)
+        {
+            uint qw, qh; dispTex.GetDimensions(qw, qh);
+            if (qw > 0)
+            {
+                const int vh = max(1, (int)(g_srcH / (float)g_quiltRows));
+                float3 r2 = quiltVertical((int)i.pos.x, ev.y, vh, 0);
+                if (blend > 0.002 && viewHi != viewLo) r2 = lerp(r2, quiltVertical((int)i.pos.x, ev.y, vh, 1), blend);
+                return float4(r2, 1);
+            }
+        }
         int viewWpx = max(1, (int)(g_srcW / (float)g_quiltCols));
         int viewHpx = max(1, (int)(g_srcH / (float)g_quiltRows));
         int2 cellLo = int2(colLo * viewWpx, (g_quiltRows - 1 - rowLoB) * viewHpx);
@@ -1297,3 +1844,28 @@ float4 PSFmtColumn(VSOut i)  : SV_Target { return Opaque(ConvertCoreImpl(i, fals
 float4 PSFmtChecker(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 5)); }
 float4 PSFmtFramePack(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 7)); }
 float4 PSFmtAnaglyph(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 2, true)); }   // (not Recovered Colour)
+float4 PSFmtQuilt(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 9)); }
+
+// ----- Both eyes from one thread (compute) ---------------------------------
+// In the anaglyph modes, checkerboard and the interleaved layouts, the two
+// eyes' pixels at a place come from the same source pixels. A pixel shader
+// draws each eye on its own -- every source read twice. Here one thread does
+// both: the reads are shared, and each eye is written to its half of the
+// output (a UNORM view of it: the sRGB encode is done here, as the render
+// target's view did).
+RWTexture2D<float4> outU : register(u0);
+void csBothEyes(uint2 id, int fmt, bool noRecovery)
+{
+    uint W, H; outU.GetDimensions(W, H);
+    const uint ew = W / 2;
+    if (id.x >= ew || id.y >= H) return;
+    VSOut a; a.pos = float4(id.x + 0.5, id.y + 0.5, 0, 1); a.uv = a.pos.xy / float2(W, H);
+    VSOut b = a; b.pos.x += ew; b.uv.x = b.pos.x / W;
+    const float3 l = ConvertCoreImpl(a, false, fmt, noRecovery).rgb, r = ConvertCoreImpl(b, false, fmt, noRecovery).rgb;
+    outU[id] = float4(srgbEncode(saturate(l)), 1);
+    outU[uint2(id.x + ew, id.y)] = float4(srgbEncode(saturate(r)), 1);
+}
+[numthreads(16, 8, 1)] void CSFmtAnaglyph(uint3 id : SV_DispatchThreadID) { csBothEyes(id.xy, 2, true); }
+[numthreads(16, 8, 1)] void CSFmtChecker(uint3 id : SV_DispatchThreadID)  { csBothEyes(id.xy, 5, false); }
+[numthreads(16, 8, 1)] void CSFmtColumn(uint3 id : SV_DispatchThreadID)   { csBothEyes(id.xy, 4, false); }
+[numthreads(16, 8, 1)] void CSFmtRow(uint3 id : SV_DispatchThreadID)      { csBothEyes(id.xy, 3, false); }

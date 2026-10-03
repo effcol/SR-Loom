@@ -122,6 +122,23 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
             // (Ours is a few ms a frame; theirs isn't slowed noticeably.)
             const HRESULT hp = dxgiDevice1->SetGPUThreadPriority(7);
             Log("Renderer: GPU thread priority +7 %s (0x%08lX)", SUCCEEDED(hp) ? "set" : "refused", (unsigned long)hp);
+            // ... and the whole process a class up in the GPU scheduler (what
+            // capture / VR compositors ask for): that thread priority only
+            // orders work within the same class, and under a busy browser our
+            // passes measured about three times their time on an idle GPU.
+            // High needs no special rights on most systems; else above normal.
+            if (HMODULE gdi = GetModuleHandleW(L"gdi32.dll"))
+            {
+                typedef LONG (WINAPI* SetClassFn)(HANDLE, int);   // (D3DKMTSetProcessSchedulingPriorityClass)
+                if (auto fn = (SetClassFn)GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
+                {
+                    LONG st = fn(GetCurrentProcess(), 4);          // (D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH)
+                    int cls = 4;
+                    if (st != 0) { st = fn(GetCurrentProcess(), 3); cls = 3; }   // (..._ABOVE_NORMAL)
+                    Log("Renderer: GPU scheduling class %s %s (0x%08lX)", cls == 4 ? "high" : "above normal",
+                        st == 0 ? "set" : "refused", (unsigned long)st);
+                }
+            }
             dxgiDevice1->Release();
         }
     }
@@ -209,7 +226,22 @@ bool Renderer::CreateDCompSwapChain()
     sd.Scaling          = DXGI_SCALING_STRETCH;
     sd.AlphaMode        = DXGI_ALPHA_MODE_PREMULTIPLIED;   // see-through where alpha = 0
     sd.Flags            = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    // (Plane mode, Settings WeavePlane -- an experiment: opaque, and allowed to
+    // tear, so Windows may give the weave a display plane of its own: shown
+    // without being composited, and not re-dirtying the screen capture. No
+    // cut-outs then: nothing is see-through.)
+    if (m_planeMode)
+    {
+        sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        if (m_allowTearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
     HRESULT hr = m_factory->CreateSwapChainForComposition(m_device, &sd, nullptr, &m_swapChain);
+    if (FAILED(hr) && (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING))
+    {
+        sd.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        hr = m_factory->CreateSwapChainForComposition(m_device, &sd, nullptr, &m_swapChain);
+    }
+    if (m_planeMode) Log("Renderer: plane mode -- opaque%s (0x%08X)", (sd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? ", tearing allowed" : "", (unsigned)hr);
     if (FAILED(hr))
     {
         sd.Flags = 0;
@@ -398,6 +430,7 @@ void Renderer::SetVisibleTracked(const std::vector<MaskTracked>& tracked, const 
 
 void Renderer::ApplyMask()
 {
+    if (m_planeMode) { m_maskDone = true; return; }   // (opaque: nothing to cut out)
     if (!m_rtv || !m_maskPS || !m_dcomp) return;
     m_maskDone = true;
     // Does the SR weave leave the picture opaque (alpha 1, as cleared)? Then
@@ -710,6 +743,14 @@ void Renderer::WaitForFrame()
         }
         m_compositorOtherClock = other;
     }
+    // (Not waited on with the compositor on another clock -- above -- but asked,
+    // without waiting: is the last frame still queued? Then this loop's present
+    // has to wait for it. Counted for the perf log: TakeQueueStats.)
+    if (m_waitable && m_compositorOtherClock)
+    {
+        ++m_queueChecks;
+        if (WaitForSingleObjectEx(m_waitable, 0, TRUE) != WAIT_OBJECT_0) ++m_queueBusy;
+    }
     if (m_waitable && !m_compositorOtherClock)
         WaitForSingleObjectEx(m_waitable, 100, TRUE);   // (short: the swap chain -- and this handle -- may be remade from another thread meanwhile)
     m_lastCompositorWaitMs = std::chrono::duration<double, std::milli>(wclk::now() - w0).count();
@@ -805,7 +846,7 @@ void Renderer::Present(bool vsync, bool flushDwm)
         // waitable object (WaitForFrame) paces the loop.
         if (!m_maskDone) ApplyMask();
         m_maskDone = false;
-        m_swapChain->Present(0, 0);
+        m_swapChain->Present(0, (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         m_lastPresentEnd = std::chrono::steady_clock::now();
         return;
     }

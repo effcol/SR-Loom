@@ -293,6 +293,18 @@ bool Capture::Update(bool& sizeChanged)
             frame = next;
         }
 
+        // (Perf log: how much of the frame Windows says changed -- TakeDirtyStats.)
+        {
+            ++m_statUpdates;
+            if (!dirtyKnown) ++m_statDirtyUnknown;
+            else
+            {
+                double a = 0;
+                for (const RECT& d : dirty) a += (double)(std::max)(0L, d.right - d.left) * (double)(std::max)(0L, d.bottom - d.top);
+                if (a <= 0) ++m_statDirtyNone;
+                else if (m_frameW > 0 && m_frameH > 0) m_statDirtyArea += (std::min)(1.0, a / ((double)m_frameW * m_frameH));
+            }
+        }
         // When this frame was captured (QPC-based, 100 ns units).
         try { m_lastFrameTime = frame.SystemRelativeTime().count(); } catch (...) {}
         auto contentSize = frame.ContentSize();

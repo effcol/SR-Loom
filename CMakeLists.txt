@@ -133,8 +133,8 @@ set(SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
 set(CONVERTER_ENTRIES
-    VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSAnaPair:ps_5_0 PSAnaCompose:ps_5_0 PSFmtHalfSBS:ps_5_0 PSFmtFullSBS:ps_5_0 PSFmtTAB:ps_5_0 PSFmtRow:ps_5_0 PSFmtColumn:ps_5_0 PSFmtChecker:ps_5_0 PSFmtFramePack:ps_5_0 PSFmtAnaglyph:ps_5_0 PSAnaBoxCheck:ps_5_0 PSAnaBoxRows:ps_5_0 PSAnaBoxMap:ps_5_0 PSChange:ps_5_0 PSChangeGrow:ps_5_0 PSAnaBoxShiftCost:ps_5_0 PSAnaBoxShift:ps_5_0)
+    VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSAnaDescCoarse:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
+    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSAnaPair:ps_5_0 PSAnaCompose:ps_5_0 PSFmtHalfSBS:ps_5_0 PSFmtFullSBS:ps_5_0 PSFmtTAB:ps_5_0 PSFmtRow:ps_5_0 PSFmtColumn:ps_5_0 PSFmtChecker:ps_5_0 PSFmtFramePack:ps_5_0 PSFmtAnaglyph:ps_5_0 PSFmtQuilt:ps_5_0 CSFmtAnaglyph:cs_5_0 CSFmtChecker:cs_5_0 CSFmtColumn:cs_5_0 CSFmtRow:cs_5_0 PSQuiltH:ps_5_0 PSAnaBoxCheck:ps_5_0 PSAnaBoxRows:ps_5_0 PSAnaBoxMap:ps_5_0 PSChange:ps_5_0 PSChangeGrow:ps_5_0 PSChangeGrow2:ps_5_0 PSDownBox:ps_5_0 PSDownFlat:ps_5_0 PSFlatShrink:ps_5_0 PSReach:ps_5_0 PSChangeStatRows:ps_5_0 PSChangeStat:ps_5_0 PSScrollCost:ps_5_0 PSScrollSum:ps_5_0 PSScrollPick:ps_5_0 PSChangeScrollQ:ps_5_0 PSChangeScroll:ps_5_0 PSAnaBoxShiftCost:ps_5_0 PSAnaBoxShift:ps_5_0)
 set(CONVERTER_SHADER_HEADERS)
 foreach(E ${CONVERTER_ENTRIES})
     string(REPLACE ":" ";" P "${E}")

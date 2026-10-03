@@ -56,6 +56,16 @@ namespace srw
 
         // Frames Windows delivered since the last call and their rate (by
         // capture timestamps; includes frames Update() skipped). Resets.
+        // What Windows reported as changed since the last call: updates taken,
+        // those with no dirty-region information, those with nothing changed,
+        // and the average share of the frame the rest said had changed (0-1).
+        void TakeDirtyStats(uint64_t& updates, uint64_t& unknown, uint64_t& none, double& area)
+        {
+            updates = m_statUpdates; unknown = m_statDirtyUnknown; none = m_statDirtyNone;
+            const uint64_t some = m_statUpdates - m_statDirtyUnknown - m_statDirtyNone;
+            area = some > 0 ? m_statDirtyArea / some : 0.0;
+            m_statUpdates = m_statDirtyUnknown = m_statDirtyNone = 0; m_statDirtyArea = 0;
+        }
         double TakeDeliveryRate(uint64_t& frames)
         {
             frames = m_statFrames;
@@ -149,6 +159,9 @@ namespace srw
         int                       m_viewNext = 0;
         int                       m_retireIn = 0;
         uint64_t                  m_statFrames = 0;
+        // (For the perf log, TakeDirtyStats: what Windows said had changed.)
+        uint64_t                  m_statUpdates = 0, m_statDirtyUnknown = 0, m_statDirtyNone = 0;
+        double                    m_statDirtyArea = 0;   // (sum over updates of the changed share of the frame, 0-1)
         int64_t                   m_statFirstT = 0, m_statLastT = 0;
         bool                      m_captureCursor = false;   // composite the OS cursor into the frame
         // TYPELESS buffer so we can copy the BGRA frame into it and still create

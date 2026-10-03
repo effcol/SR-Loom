@@ -25,6 +25,16 @@ namespace srw
         bool         swapEyes      = false;
         int          anaglyphCombo = 0;
         int          anaglyphMode  = 4;
+        float        anaCustomL[3] = { 1, 0, 0 };   // GUI-owned while the Custom pair is picked: the left filter's colour
+        float        anaCustomR[3] = { 0, 1, 1 };   // ... the right's
+        bool         anaCustomChanged = false;      // (set by Render when either was edited)
+        static constexpr int kAnaSavedMax = 8;
+        float        anaSaved[kAnaSavedMax][6] = {}; // saved Custom pairs (left rgb, right rgb)
+        int          anaSavedCount = 0;
+        bool         anaSavedAdd = false;            // (set by Render: save the current pair)
+        int          anaSavedLoad = -1, anaSavedDelete = -1;   // (set by Render: use / remove saved pair k)
+        int          anaPickRequest = 0;             // (set by Render: 1 / 2 pick the left / right colour from the picture)
+        int          anaPickActive = 0;              // the colour being picked now (0 none)
         float        convergence   = 0.0f;   // GUI-owned: zero-plane horizontal shift (-1..1)
         int          pulfrichMode  = 0;      // 0 = time delay, 1 = ND filter
         int          pulfrichDelay = 1;      // 1..4 frames

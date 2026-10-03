@@ -78,6 +78,13 @@ namespace srw
         // The last WaitForFrame's parts (ms): waiting for the compositor to take
         // the previous frame, and for the SR display's vertical blank.
         double LastCompositorWaitMs() const { return m_lastCompositorWaitMs; }
+        // Experiment (Settings WeavePlane): the DirectComposition swap chain opaque and
+        // allowed to tear, so it can be put on a display plane of its own. Before
+        // Initialize.
+        void SetPlaneMode(bool on) { m_planeMode = on; }
+        // Loops since the last call, and those that began with the frame before
+        // still in the swap chain's queue (see WaitForFrame).
+        void TakeQueueStats(int& checks, int& busy) { checks = m_queueChecks; busy = m_queueBusy; m_queueChecks = m_queueBusy = 0; }
         double LastVBlankWaitMs() const { return m_lastVBlankWaitMs; }
         // Time left until the SR display's next refresh (ms), from the last one
         // WaitForFrame saw; -1 if not known (no refresh sync).
@@ -152,6 +159,7 @@ namespace srw
         bool                    m_compositorOtherClock = false;   // (WaitForFrame: Windows composes at another rate than the SR display)
         ULONGLONG               m_clockCheckMs = 0;
         bool                    m_allowTearing = false; // GPU/OS supports tearing (VRR)
+        bool                    m_planeMode = false;    // (SetPlaneMode)
         bool                    m_flip       = true;    // current model: true=flip, false=bit-blt
         bool                    m_layered    = false;   // current window layered state
 
@@ -163,6 +171,7 @@ namespace srw
         std::chrono::steady_clock::time_point m_lastPresentEnd{};
         std::chrono::steady_clock::time_point m_lastFrameStart{};   // render cap counts from here
         double m_lastCompositorWaitMs = 0.0, m_lastVBlankWaitMs = 0.0;
+        int    m_queueChecks = 0, m_queueBusy = 0;
         std::chrono::steady_clock::time_point m_lastVBlank{};   // when the last WaitForVBlank returned (the display's phase)
         // The SR display's output: frames start on its vertical blank (see
         // WaitForFrame), locking the loop to its refresh rate.

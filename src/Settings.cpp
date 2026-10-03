@@ -143,6 +143,62 @@ namespace srw::Settings
         return ReadDword(kSettingsKey, L"RenderThread", 1) != 0;   // default ON
     }
 
+    void ReadAnaCustom(float left[3], float right[3])
+    {
+        const DWORD l = ReadDword(kSettingsKey, L"AnaCustomLeft", 0x0000FF), r = ReadDword(kSettingsKey, L"AnaCustomRight", 0xFFFF00);   // (0x00BBGGRR)
+        for (int c = 0; c < 3; ++c) { left[c] = ((l >> (8 * c)) & 0xFF) / 255.0f; right[c] = ((r >> (8 * c)) & 0xFF) / 255.0f; }
+    }
+
+    void WriteAnaCustom(const float left[3], const float right[3])
+    {
+        DWORD l = 0, r = 0;
+        for (int c = 0; c < 3; ++c)
+        {
+            l |= (DWORD)(left[c]  < 0 ? 0 : left[c]  > 1 ? 255 : (int)(left[c]  * 255.0f + 0.5f)) << (8 * c);
+            r |= (DWORD)(right[c] < 0 ? 0 : right[c] > 1 ? 255 : (int)(right[c] * 255.0f + 0.5f)) << (8 * c);
+        }
+        WriteDword(kSettingsKey, L"AnaCustomLeft", l); WriteDword(kSettingsKey, L"AnaCustomRight", r);
+    }
+
+    int ReadAnaSaved(float pairs[][6], int max)
+    {
+        int n = (int)ReadDword(kSettingsKey, L"AnaSavedCount", 0);
+        if (n > max) n = max;
+        for (int k = 0; k < n; ++k)
+        {
+            wchar_t nl[32], nr[32]; swprintf_s(nl, L"AnaSaved%dL", k); swprintf_s(nr, L"AnaSaved%dR", k);
+            const DWORD l = ReadDword(kSettingsKey, nl, 0x0000FF), r = ReadDword(kSettingsKey, nr, 0xFFFF00);
+            for (int c = 0; c < 3; ++c) { pairs[k][c] = ((l >> (8 * c)) & 0xFF) / 255.0f; pairs[k][3 + c] = ((r >> (8 * c)) & 0xFF) / 255.0f; }
+        }
+        return n;
+    }
+
+    void WriteAnaSaved(const float pairs[][6], int count)
+    {
+        auto pack = [](const float* v) { DWORD d = 0; for (int c = 0; c < 3; ++c) d |= (DWORD)(v[c] < 0 ? 0 : v[c] > 1 ? 255 : (int)(v[c] * 255.0f + 0.5f)) << (8 * c); return d; };
+        WriteDword(kSettingsKey, L"AnaSavedCount", (DWORD)count);
+        for (int k = 0; k < count; ++k)
+        {
+            wchar_t nl[32], nr[32]; swprintf_s(nl, L"AnaSaved%dL", k); swprintf_s(nr, L"AnaSaved%dR", k);
+            WriteDword(kSettingsKey, nl, pack(pairs[k])); WriteDword(kSettingsKey, nr, pack(pairs[k] + 3));
+        }
+    }
+
+    bool ReadWeavePlane()
+    {
+        return ReadDword(kSettingsKey, L"WeavePlane", 0) != 0;   // default OFF
+    }
+
+    bool ReadDeferRecovered()
+    {
+        return ReadDword(kSettingsKey, L"DeferRecovered", 0) != 0;   // default OFF: the user felt the delay
+    }
+
+    bool ReadScrollReuse()
+    {
+        return ReadDword(kSettingsKey, L"ScrollReuse", 1) != 0;   // default ON
+    }
+
     int ReadWeaverChoice()
     {
         const DWORD v = ReadDword(kSettingsKey, L"WeaverChoice", 0);

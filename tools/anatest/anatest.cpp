@@ -426,7 +426,8 @@ int wmain(int argc, wchar_t** argv)
         }
     }
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx)))
+    // (ANATEST_DEBUG: the D3D debug layer, its messages printed after the change test.)
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, getenv("ANATEST_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx)))
     { fwprintf(stderr, L"no D3D11 device\n"); return 1; }
 
     // The source as SR Loom sees a capture: RGBA8, read through an sRGB view.
@@ -436,12 +437,39 @@ int wmain(int argc, wchar_t** argv)
     D3D11_SUBRESOURCE_DATA sd{ px.data(), w * 4, 0 };
     ID3D11Texture2D* src = nullptr; dev->CreateTexture2D(&td, &sd, &src);
     D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
-    vd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd.Texture2D.MipLevels = 1;
+    // (ANATEST_ENCODED: read as the app reads a zero-copy capture -- a plain UNORM
+    // view, the shaders decoding sRGB themselves: Converter::SetSourceEncoded.)
+    const bool encodedSrc = getenv("ANATEST_ENCODED") != nullptr;
+    vd.Format = encodedSrc ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd.Texture2D.MipLevels = 1;
     ID3D11ShaderResourceView* srv = nullptr; dev->CreateShaderResourceView(src, &vd, &srv);
 
     Converter conv;
     if (!conv.Initialize(dev, ctx)) { fwprintf(stderr, L"converter init failed\n"); return 1; }
 #ifndef ANATEST_HEAD
+    // ANATEST_QUILTTEST=cols,rows: the picture taken as a quilt, converted for a
+    // 3840x2160 pane, cross-fading between views: the two-pass resampling against
+    // the one-pass (must match), and both GPU times.
+    if (const char* qt = getenv("ANATEST_QUILTTEST"))
+    {
+        int qc = 8, qr = 6; sscanf_s(qt, "%d,%d", &qc, &qr);
+        auto run = [&](bool two, double& ms) {
+            Converter q; q.Initialize(dev, ctx);
+            q.SetFormat(StereoFormat::Quilt, false, 0, 0);
+            q.SetQuilt(qc, qr, qc * qr / 2 - 1, qc * qr / 2 + 1, 0.4f, 0.6f);
+            q.SetTargetPaneSize(3840, 2160);
+            q.SetQuiltTwoPass(two);
+            ms = TimeConversions(dev, ctx, q, srv, (int)w, (int)h);
+            auto o = ReadOutputBytes(dev, ctx, q);
+            q.Shutdown();
+            return o;
+        };
+        double m1 = 0, m2 = 0;
+        const auto a = run(false, m1), b = run(true, m2);
+        int worst = 0; size_t diff = 0;
+        for (size_t k = 0; k < a.size() && k < b.size(); ++k) { const int d = std::abs((int)a[k] - (int)b[k]); worst = (std::max)(worst, d); diff += d > 1; }
+        wprintf(L"quilt %dx%d: one pass %.3f ms, two passes %.3f ms | largest difference %d, bytes off by >1: %zu of %zu\n", qc, qr, m1, m2, worst, diff, a.size());
+        return 0;
+    }
     // ANATEST_FORMATS=right.png (the input is the pair's left picture): every
     // packed layout checked end to end. The pair packed the way each layout
     // defines it, converted, and each output eye scored against the true left
@@ -528,6 +556,7 @@ int wmain(int argc, wchar_t** argv)
             D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
             ID3D11ShaderResourceView* v2 = nullptr; dev->CreateShaderResourceView(t2, &vd2, &v2);
             Converter cv; cv.Initialize(dev, ctx);
+            if (getenv("ANATEST_NOCS")) cv.SetComputeBothEyes(false);
             cv.SetFormat(c.f, false, 0, 4);
             if (c.f == StereoFormat::FramePacking) cv.SetFramePacking((float)h / c.sh, (float)(c.sh - 2 * (int)h) / c.sh, 0.0f);
             bool rs = false; cv.Convert(v2, c.sw, c.sh, rs);
@@ -590,6 +619,7 @@ int wmain(int argc, wchar_t** argv)
             for (const M& m : ms)
             {
                 Converter cv; cv.Initialize(dev, ctx);
+                if (getenv("ANATEST_NOCS")) cv.SetComputeBothEyes(false);
                 cv.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
                 cv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);
                 cv.SetChangeSkip(m.skip);
@@ -618,8 +648,15 @@ int wmain(int argc, wchar_t** argv)
 #endif
     conv.SetFormat(StereoFormat::Anaglyph, false, combo, mode);
     conv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);   // (full-width eyes: the measurements below assume them)
+    conv.SetSourceEncoded(encodedSrc);
     if (getenv("ANATEST_NOSKIP")) conv.SetChangeSkip(false);   // (every frame redrawn whole: worst-case timing)
     if (getenv("ANATEST_NOPAIR")) conv.SetPairRefine(false);   // (full-width Recovered Colour: refine per pixel, not per pair)
+    if (getenv("ANATEST_NOSCROLL")) conv.SetScrollReuse(false);   // (a scrolled block redrawn, not last frame's moved)
+    if (getenv("ANATEST_NOPYRSKIP")) conv.SetPyramidSkip(false);   // (the 1/4 passes in full whenever anything changed)
+    if (getenv("ANATEST_NOREACH")) conv.SetReach(false);   // (a change redraws everything within the whole search range)
+    if (getenv("ANATEST_NOPRECHECK")) conv.SetPreCheck(false);   // (an encoded source read as it is, every pass decoding)
+    if (getenv("ANATEST_NOCS")) conv.SetComputeBothEyes(false);   // (each eye drawn by a pixel shader)
+    if (getenv("ANATEST_NOFLAT")) conv.SetFlatSkip(false);   // (each pixel pair tested for plain grey itself)
 #ifndef ANATEST_HEAD
     // Mode 3 or 5: what the app's check (AnalyseAnaPicture) makes of the whole
     // image; 5 decodes with its tint tables.
@@ -644,6 +681,7 @@ int wmain(int argc, wchar_t** argv)
     // (AnalyseAnaPicture), the black-and-white / one-colour ones decoded so
     // inside their box.
     static std::vector<std::shared_ptr<const AnaTint>> boxTints;
+    static Converter::AnaBox g_testBoxes[32]; static int g_testBoxCount = 0;
     if (mode == 4 && getenv("ANATEST_BOXES"))
     {
         // (ANATEST_BOXFROM=page.png: the boxes judged on that frame -- e.g. before
@@ -691,9 +729,64 @@ int wmain(int argc, wchar_t** argv)
             ctx->UpdateSubresource(src, 0, nullptr, px.data(), w * 4, 0);
         }
         conv.SetAnaBoxes(boxes, nb);
+        memcpy(g_testBoxes, boxes, sizeof(boxes)); g_testBoxCount = nb;   // (for the change test's full redraw)
     }
 #endif
 #ifndef ANATEST_HEAD
+    // ANATEST_NOISETEST=n,amp: the same picture n times with a little noise
+    // (+-amp levels a channel, as video has), every frame redrawn. How steady
+    // is the output? Per frame, the share of the left eye's pixels that changed
+    // by more than 16 from the frame before -- all, and those dark in the
+    // picture (luma < 64): a picture that isn't changing shouldn't flicker.
+    if (const char* nt = getenv("ANATEST_NOISETEST"))
+    {
+        int nn = 20, amp = 2; sscanf_s(nt, "%d,%d", &nn, &amp);
+        conv.SetChangeSkip(false);
+        auto readEye = [&]() {
+            ID3D11Resource* r = nullptr; conv.OutputSRV()->GetResource(&r);
+            ID3D11Texture2D* t = nullptr; r->QueryInterface(&t); r->Release();
+            D3D11_TEXTURE2D_DESC d{}; t->GetDesc(&d);
+            d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+            ID3D11Texture2D* st = nullptr; dev->CreateTexture2D(&d, nullptr, &st);
+            ctx->CopyResource(st, t); t->Release();
+            D3D11_MAPPED_SUBRESOURCE mm{}; ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm);
+            std::vector<uint8_t> o((size_t)w * h * 4);
+            for (UINT y = 0; y < h; ++y) memcpy(&o[(size_t)y * w * 4], (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch, (size_t)w * 4);
+            ctx->Unmap(st, 0); st->Release();
+            return o;
+        };
+        uint32_t rng = 12345;
+        std::vector<uint8_t> prev; double all = 0, dark = 0; size_t nDark = 0; int cmp = 0;
+        for (size_t i = 0; i < px.size(); i += 4) nDark += (0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]) < 64;
+        for (int f = 0; f < nn; ++f)
+        {
+            std::vector<uint8_t> fr(px);
+            for (size_t i = 0; i < fr.size(); ++i)
+            {
+                if ((i & 3) == 3) continue;
+                rng = rng * 1664525u + 1013904223u;
+                const int v = (int)fr[i] + (int)((rng >> 16) % (2 * amp + 1)) - amp;
+                fr[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+            }
+            ctx->UpdateSubresource(src, 0, nullptr, fr.data(), w * 4, 0);
+            bool rs3 = false; conv.Convert(srv, (int)w, (int)h, rs3);
+            auto cur = readEye();
+            if (!prev.empty())
+            {
+                size_t ca = 0, cd = 0;
+                for (size_t i = 0; i < cur.size(); i += 4)
+                {
+                    int dmax = 0; for (int k = 0; k < 3; ++k) dmax = (std::max)(dmax, std::abs((int)cur[i + k] - (int)prev[i + k]));
+                    if (dmax > 16) { ++ca; if ((0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]) < 64) ++cd; }
+                }
+                all += (double)ca / (w * h); dark += nDark ? (double)cd / nDark : 0; ++cmp;
+            }
+            prev.swap(cur);
+        }
+        wprintf(L"noise test (%d frames, +-%d): flicker %.3f%% of pixels a frame, %.3f%% of the dark ones (%.0f%% of the picture is dark)\n",
+                nn, amp, 100.0 * all / (std::max)(cmp, 1), 100.0 * dark / (std::max)(cmp, 1), 100.0 * nDark / ((double)w * h));
+        return 0;
+    }
     // ANATEST_CHANGETEST=dy,n: only the changed blocks redrawn (PSChange) must
     // give the same picture as drawing it all. n frames where the right 40% of
     // the image scrolls dy px a frame (a scrolling pane; the rest still), then
@@ -701,13 +794,13 @@ int wmain(int argc, wchar_t** argv)
     // Also each frame's GPU time.
     if (const char* ct = getenv("ANATEST_CHANGETEST"))
     {
-        int cdy = 0, cn = 0; sscanf_s(ct, "%d,%d", &cdy, &cn);
+        int cdy = 0, cn = 0, cfull = 0; sscanf_s(ct, "%d,%d,%d", &cdy, &cn, &cfull);   // (,1: the whole picture scrolls, wrapping round)
         auto frame = [&](int f) {
             std::vector<uint8_t> o(px);
-            const UINT x0 = w * 6 / 10;
+            const UINT x0 = cfull ? 0 : w * 6 / 10;
             for (UINT y = 0; y < h; ++y)
             {
-                const int sy = (int)y + f * cdy;
+                const int sy = cfull ? (((int)y + f * cdy) % (int)h + (int)h) % (int)h : (int)y + f * cdy;
                 for (UINT x = x0; x < w; ++x)
                 {
                     const size_t d = ((size_t)y * w + x) * 4;
@@ -731,6 +824,7 @@ int wmain(int argc, wchar_t** argv)
             return o;
         };
         bool rs = false;
+        conv.SetChangeStats(true);
         double ms[8] = {}; int cnt = 0;
         conv.TakeRecoveryTimes(ms, cnt);
         for (int f = 0; f < cn; ++f)
@@ -745,6 +839,8 @@ int wmain(int argc, wchar_t** argv)
         conv.TakeRecoveryTimes(ms, cnt);
         double tot = 0; for (double v : ms) tot += v;
         const auto a = readOut(conv);
+        { Sleep(50); Converter::ChangeStats cs; conv.Convert(srv, (int)w, (int)h, rs); if (conv.TakeChangeStats(cs))
+            printf("  frames: %d converted, %d whole, %d with changes (%.1f%% redrawn, %.1f%% kept and moved), %d scrolls (%.0f rows), reuse %d%c", cs.frames, cs.full, cs.changed, cs.redrawn * 100, cs.moved * 100, cs.scrolled, cs.rows, cs.reuse ? 1 : 0, 10); }
         // (Still frames: the same picture again and again.)
         double msS[8] = {}; int cntS = 0;
         conv.TakeRecoveryTimes(msS, cntS);
@@ -752,12 +848,24 @@ int wmain(int argc, wchar_t** argv)
         Sleep(100);
         conv.TakeRecoveryTimes(msS, cntS);
         double totS = 0; for (double v : msS) totS += v;
+        // ANATEST_BOXSWAP: the boxes judged afresh (the first one gone) on a still
+        // picture -- only their blocks are redrawn (g_boxesNew); the result must
+        // be a full redraw's with those boxes.
+        std::vector<uint8_t> a2;
+        if (getenv("ANATEST_BOXSWAP") && g_testBoxCount > 1)
+        {
+            conv.SetAnaBoxes(g_testBoxes + 1, g_testBoxCount - 1);
+            for (int f = 0; f < 3; ++f) { conv.Convert(srv, (int)w, (int)h, rs); ctx->Flush(); }
+            a2 = readOut(conv);
+        }
         // The same frames with every frame drawn in full.
         Converter fresh;
         fresh.Initialize(dev, ctx);
         fresh.SetFormat(StereoFormat::Anaglyph, false, combo, mode);
         fresh.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);
         fresh.SetChangeSkip(false);
+        fresh.SetSourceEncoded(encodedSrc);
+        if (g_testBoxCount > 0) fresh.SetAnaBoxes(g_testBoxes, g_testBoxCount);
         double msF[8] = {}; int cntF = 0;
         for (int f = 0; f < cn; ++f)
         {
@@ -775,9 +883,61 @@ int wmain(int argc, wchar_t** argv)
         long bad = 0; int worst = 0;
         for (size_t i = 0; i < a.size() && i < b.size(); i += 4)
             for (int k = 0; k < 3; ++k) { const int dd = std::abs((int)a[i + k] - (int)b[i + k]); worst = (std::max)(worst, dd); if (dd > 8) { ++bad; break; } }
+        // (The whole picture scrolled, the true views known: both outputs against
+        // them -- is last frame's output, moved, as good as a fresh one?)
+        if (cfull && !truthL.empty() && tw == w && th == h && a.size() == (size_t)w * 2 * h * 4 && b.size() == a.size())
+        {
+            auto score = [&](const std::vector<uint8_t>& o, const wchar_t* name) {
+                double sum = 0; size_t off = 0, n = 0;
+                for (int eye = 0; eye < 2; ++eye)
+                    for (UINT y = 0; y < h; ++y)
+                    {
+                        const UINT ty = (UINT)((((int)y + (cn - 1) * cdy) % (int)h + (int)h) % (int)h);
+                        for (UINT x = 0; x < w; ++x)
+                        {
+                            const uint8_t* p = &o[((size_t)y * w * 2 + (size_t)eye * w + x) * 4];
+                            const uint8_t* g = &(eye ? truthR : truthL)[((size_t)ty * w + x) * 4];
+                            int worstC = 0;
+                            for (int c = 0; c < 3; ++c) { const int d = std::abs((int)p[c] - (int)g[c]); sum += d; worstC = (std::max)(worstC, d); }
+                            if (worstC > 40) ++off;
+                            ++n;
+                        }
+                    }
+                wprintf(L"  scroll truth, %s: mean abs err %.3f, px off >40: %.3f%%\n", name, sum / (n * 3.0), 100.0 * off / n);
+            };
+            score(a, L"as scrolled");
+            score(b, L"drawn in full");
+        }
+        wprintf(L"  (stages: search %.2f, desc %.2f, refine %.2f, fill %.2f, smooth %.2f, compose %.2f, end %.2f %.2f)\n", ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7]);
         wprintf(L"change test: %d frames, part scrolling: recovery %.2f ms/frame (%d timed) | still frames %.2f ms/frame (%d timed) | "
                 L"vs a full redraw: %ld px differ by > 8 of %zu (worst %d)\n", cn, tot, cnt, totS, cntS, bad, a.size() / 4, worst);
+        if (!a2.empty())
+        {
+            fresh.SetAnaBoxes(g_testBoxes + 1, g_testBoxCount - 1);
+            fresh.Convert(srv, (int)w, (int)h, rs); ctx->Flush();
+            const auto b2 = readOut(fresh);
+            long bad2 = 0, moved = 0;
+            for (size_t i = 0; i < a2.size() && i < b2.size(); i += 4)
+            {
+                for (int k = 0; k < 3; ++k) if (std::abs((int)a2[i + k] - (int)b2[i + k]) > 8) { ++bad2; break; }
+                for (int k = 0; k < 3; ++k) if (std::abs((int)a2[i + k] - (int)a[i + k]) > 8) { ++moved; break; }
+            }
+            wprintf(L"box swap: %ld px changed by the new boxes; vs a full redraw with them: %ld px differ by > 8\n", moved, bad2);
+        }
         fresh.Shutdown();
+        if (getenv("ANATEST_DEBUG"))
+        {
+            ID3D11InfoQueue* iq = nullptr; dev->QueryInterface(&iq);
+            const UINT64 nm = iq ? iq->GetNumStoredMessages() : 0;
+            for (UINT64 mi = 0; mi < nm && mi < 12; ++mi)
+            {
+                SIZE_T len = 0; iq->GetMessage(mi, nullptr, &len);
+                std::vector<char> buf(len); auto* dm = (D3D11_MESSAGE*)buf.data();
+                if (SUCCEEDED(iq->GetMessage(mi, dm, &len))) printf("  d3d: %.*s\n", (int)dm->DescriptionByteLength, dm->pDescription);
+            }
+            printf("  d3d: %llu messages\n", nm);
+            if (iq) iq->Release();
+        }
     }
 #endif
     bool resized = false;
@@ -1013,6 +1173,29 @@ int wmain(int argc, wchar_t** argv)
                     ++n;
                 }
             wprintf(L"truth %s: mean abs err %.2f, px off >40: %.3f%%\n", name, sum / (n * 3.0), 100.0 * bad / n);
+            // The same by how bright the TRUE pixel is: dark (< 64), mid, bright
+            // (>= 160) -- whether a change helps or hurts the dark areas.
+            {
+                double bs[3] = {}; size_t bb[3] = {}, bn[3] = {};
+                for (UINT y = 0; y < picH; ++y)
+                    for (UINT x = 0; x < picW; ++x)
+                    {
+                        const uint8_t* o = base + (size_t)(picY + y) * m.RowPitch + (size_t)(eyeX0 + picX + x) * 4;
+                        const uint8_t* g = &t[((size_t)y * tw + x) * 4];
+                        const int lum = (g[0] + g[1] + g[2]) / 3;
+                        const int b = lum < 64 ? 0 : lum < 160 ? 1 : 2;
+                        int worst = 0;
+                        for (int c = 0; c < 3; ++c) { const int d = std::abs((int)o[c] - (int)g[c]); bs[b] += d; worst = (std::max)(worst, d); }
+                        if (worst > 40) ++bb[b];
+                        ++bn[b];
+                    }
+                const wchar_t* nm[3] = { L"dark", L"mid", L"bright" };
+                wprintf(L"bright %s:", name);
+                for (int b = 0; b < 3; ++b)
+                    wprintf(L" %s err %.2f, >40 %.2f%% (%.0f%% of px) |", nm[b], bn[b] ? bs[b] / (bn[b] * 3.0) : 0.0,
+                            bn[b] ? 100.0 * bb[b] / bn[b] : 0.0, 100.0 * bn[b] / (double)n);
+                wprintf(L"\n");
+            }
             // The same in the outer 60 px of each side (frame-edge streaks).
             {
                 const UINT B = (std::min)(60u, picW / 4);
@@ -1256,6 +1439,7 @@ int wmain(int argc, wchar_t** argv)
                     }
                     const char* cat[7] = { "occluded", "never-found", "lost@refine", "lost@fill", "lost@smooth", "lost@full-res", "depth-right" };
                     size_t cb[7] = {}, ca[7] = {}, nb = 0, na = 0;
+                    size_t flatAll[5] = {}, flatBlob[5] = {}, tflatAll[5] = {}, tflatBlob[5] = {}, bothFlatBlob = 0;
                     std::vector<uint8_t> bm((size_t)picW * picH * 4, 0);
                     // ANATEST_OCCSTATS (a build writing an occlusion flag to alpha): how
                     // well the flag finds the truly occluded pixels.
@@ -1300,7 +1484,31 @@ int wmain(int argc, wchar_t** argv)
                             }
                             ++ca[c]; ++na;
                             if (blob) { ++cb[c]; ++nb; uint8_t* b = &bm[((size_t)y * picW + x) * 4]; const uint8_t col[7][3] = { {255,255,255},{255,0,0},{255,160,0},{255,255,0},{0,255,0},{0,160,255},{255,0,255} }; b[0] = col[c][0]; b[1] = col[c][1]; b[2] = col[c][2]; }
+                            // (How flat the left eye's own channel -- the anaglyph's red -- and
+                            // the TRUE view's borrowed channels are around this pixel: the largest
+                            // difference to the 8 pixels 3 away. For blob pixels vs all.)
+                            {
+                                int od = 0, td = 0;
+                                const uint8_t* a0 = &px[((size_t)(picY + y) * w + picX + x) * 4];
+                                for (int fy = -1; fy <= 1; ++fy) for (int fx = -1; fx <= 1; ++fx)
+                                {
+                                    const int qx = (std::min)((std::max)((int)x + fx * 3, 0), (int)picW - 1), qy = (std::min)((std::max)((int)y + fy * 3, 0), (int)picH - 1);
+                                    od = (std::max)(od, std::abs((int)px[((size_t)(picY + qy) * w + picX + qx) * 4] - (int)a0[0]));
+                                    const uint8_t* tq = &truthL[((size_t)qy * tw + qx) * 4];
+                                    td = (std::max)(td, (std::max)(std::abs((int)tq[1] - (int)t[1]), std::abs((int)tq[2] - (int)t[2])));
+                                }
+                                const int ob = od < 4 ? 0 : od < 8 ? 1 : od < 16 ? 2 : od < 32 ? 3 : 4, tb = td < 4 ? 0 : td < 8 ? 1 : td < 16 ? 2 : td < 32 ? 3 : 4;
+                                ++flatAll[ob]; ++tflatAll[tb]; if (blob) { ++flatBlob[ob]; ++tflatBlob[tb]; if (od < 8 && td < 8) ++bothFlatBlob; }
+                            }
                         }
+                    {
+                        const wchar_t* bn[5] = { L"<4", L"4-8", L"8-16", L"16-32", L">=32" };
+                        wprintf(L"blob px by OWN-channel variation (levels):");
+                        for (int i = 0; i < 5; ++i) wprintf(L"  %s %.0f%% (all px %.0f%%)", bn[i], 100.0 * flatBlob[i] / (std::max)(nb, (size_t)1), 100.0 * flatAll[i] / (std::max)(na, (size_t)1));
+                        wprintf(L"\nblob px by TRUE borrowed-colour variation:");
+                        for (int i = 0; i < 5; ++i) wprintf(L"  %s %.0f%% (all px %.0f%%)", bn[i], 100.0 * tflatBlob[i] / (std::max)(nb, (size_t)1), 100.0 * tflatAll[i] / (std::max)(na, (size_t)1));
+                        wprintf(L"\nblob px flat in both (< 8): %.0f%%\n", 100.0 * bothFlatBlob / (std::max)(nb, (size_t)1));
+                    }
                     wprintf(L"blobs: %.2f%% of px.  first wrong at:", 100.0 * nb / (std::max)(na, (size_t)1));
                     for (int i = 0; i < 7; ++i) wprintf(L"  %S %.0f%%", cat[i], 100.0 * cb[i] / (std::max)(nb, (size_t)1));
                     wprintf(L"\n  (all px:");

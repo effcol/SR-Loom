@@ -56,9 +56,32 @@ namespace srw::Settings
     // no UI). 0: one thread for both, as before v3.1 -- for comparing, or if
     // something misbehaves. HKCU\Software\SRLoom\RenderThread. Read at start-up.
     bool ReadRenderThread();
+    // Recovered Colour while a page scrolls: what only moved keeps last frame's
+    // result, moved, instead of being recovered again (default ON; no UI). 0:
+    // every moved part recovered again -- for comparing.
+    // HKCU\Software\SRLoom\ScrollReuse. Read at start-up.
+    bool ReadScrollReuse();
+    // Recovered Colour converted after each frame is presented and woven the
+    // next refresh (default OFF; no UI): the weave is never held up by it, but
+    // the picture is a refresh late -- felt as lag. 0: converted first, as
+    // always before. HKCU\Software\SRLoom\DeferRecovered. Read at start-up.
+    bool ReadDeferRecovered();
+    // Experiment (default OFF; no UI): the weave's swap chain opaque and allowed to
+    // tear, so Windows may give it a display plane of its own -- not composited,
+    // and not making the screen capture see a change every refresh. No cut-outs
+    // (taskbar, pop-ups) while on. HKCU\Software\SRLoom\WeavePlane. Read at start-up.
+    bool ReadWeavePlane();
+    // The Custom anaglyph pair's two picked colours (0-1 red, green, blue each;
+    // default red / cyan). HKCU\Software\SRLoom\AnaCustomLeft, AnaCustomRight.
+    void ReadAnaCustom(float left[3], float right[3]);
+    void WriteAnaCustom(const float left[3], const float right[3]);
+    // Saved Custom pairs (up to 8; each left rgb then right rgb, 0-1).
+    // HKCU\Software\SRLoom\AnaSavedCount, AnaSaved0L, AnaSaved0R, ...
+    int  ReadAnaSaved(float pairs[][6], int max);
+    void WriteAnaSaved(const float pairs[][6], int count);
     // Which SR weaver (default 0): 0 the modern one; 1-3 the legacy one with
     // anti-crosstalk Off / Static / Dynamic (only it has those). Applies when
-    // the SR session is next made. HKCUSoftwareSRLoomWeaverChoice.
+    // the SR session is next made. HKCU\Software\SRLoom\WeaverChoice.
     int  ReadWeaverChoice();
     void WriteWeaverChoice(int choice);
 

@@ -1544,6 +1544,61 @@ bool Gui::Render(GuiState& state)
                             post(ID_TRAY_ANA_COMBO_BASE + (UINT)i);
                     ImGui::EndCombo();
                 }
+                // The Custom pair: the two filters' colours, picked. (Which of red,
+                // green and blue goes to which eye follows from them: shown beside.)
+                if (state.anaglyphCombo == kAnaComboCustom)
+                {
+                    // Each eye's filter colour by its hue alone (brightness doesn't matter:
+                    // only which colours each eye's picture is in) -- a swatch and a slider.
+                    auto hueRow = [&](const char* label, const char* id, float* rgb) {
+                        float h = 0, s = 0, v = 0;
+                        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s, v);
+                        float deg = h * 360.0f;
+                        ImGui::PushID(id);
+                        ImGui::ColorButton("##sw", ImVec4(rgb[0], rgb[1], rgb[2], 1), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoAlpha,
+                                           ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight()));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        char fmt[48]; snprintf(fmt, sizeof(fmt), "%s  %%.0f", label);
+                        if (ImGui::SliderFloat("##h", &deg, 0.0f, 360.0f, fmt))
+                        {
+                            ImGui::ColorConvertHSVtoRGB(deg / 360.0f, 1.0f, 1.0f, rgb[0], rgb[1], rgb[2]);
+                            state.anaCustomChanged = true;
+                        }
+                        ImGui::PopID();
+                    };
+                    hueRow("Left", "##anahl", state.anaCustomL);
+                    hueRow("Right", "##anahr", state.anaCustomR);
+                    const AnaCustom k = AnaCustomFromColours(state.anaCustomL, state.anaCustomR);
+                    const float* ml = k.ml; const float* mr = k.mr;
+                    char sl[4] = {}, sr[4] = {}; int nl = 0, nr = 0;
+                    for (int c = 0; c < 3; ++c) { if (ml[c] > 0.25f) sl[nl++] = "RGB"[c]; if (mr[c] > 0.25f) sr[nr++] = "RGB"[c]; }
+                    ImGui::TextDisabled("Left eye: %s   Right eye: %s", nl ? sl : "-", nr ? sr : "-");
+                    // Pick each colour from the picture itself (the next click on it), and
+                    // keep pairs for later: click one to use it, right-click to remove it.
+                    if (ImGui::SmallButton(state.anaPickActive == 1 ? "Click the picture...##pl" : "Pick left##pl")) state.anaPickRequest = 1;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(state.anaPickActive == 2 ? "Click the picture...##pr" : "Pick right##pr")) state.anaPickRequest = 2;
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Save##anasave")) state.anaSavedAdd = true;
+                    for (int k = 0; k < state.anaSavedCount; ++k)
+                    {
+                        if (k > 0) ImGui::SameLine();
+                        ImGui::PushID(k);
+                        const float* s = state.anaSaved[k];
+                        const ImGuiColorEditFlags bf = ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoAlpha;
+                        const float sz = ImGui::GetFrameHeight() * 0.8f;
+                        bool use = ImGui::ColorButton("##sl", ImVec4(s[0], s[1], s[2], 1), bf, ImVec2(sz, sz));
+                        const bool rl = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                        ImGui::SameLine(0, 0);
+                        use |= ImGui::ColorButton("##sr", ImVec4(s[3], s[4], s[5], 1), bf, ImVec2(sz, sz));
+                        const bool rr = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to use this pair, right-click to remove it");
+                        if (use) state.anaSavedLoad = k;
+                        if (rl || rr) state.anaSavedDelete = k;
+                        ImGui::PopID();
+                    }
+                }
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 if (ImGui::BeginCombo("##anarecovery", curMode))
                 {

@@ -316,10 +316,53 @@ namespace srw
     {
         static const char* const combos[] = {
             "Red / Cyan", "Red / Green", "Red / Blue",
-            "Green / Magenta", "Amber / Blue", "Cyan / Magenta",
+            "Green / Magenta", "Amber / Blue", "Cyan / Magenta", "Custom",
         };
         count = (int)(sizeof(combos) / sizeof(combos[0]));
         return combos;
+    }
+
+    constexpr int kAnaComboCustom = 6;   // (AnaglyphComboList's last entry: the two colours are picked)
+    // A custom anaglyph pair, from the two filter colours picked (only their hue
+    // and strength of colour count: both are taken at full brightness).
+    // An anaglyph made with filter colours fl and fr holds, in each pixel,
+    // L x fl + R x fr -- L and R the two eyes' brightness. So each eye's
+    // brightness is worked back out by least squares: L = wl . pixel, R = wr .
+    // pixel (for red / cyan exactly red, and the mean of green and blue, as the
+    // preset). Any two different colours work, and turning one changes the
+    // result smoothly. tl / tr: the colours themselves (Filtered shows each
+    // eye in its own). ml / mr: how much of each channel is each eye's own,
+    // for Recovered Colour (what one has more of than the other).
+    // (cl / cr: the one channel each eye's view is matched on in Recovered Colour --
+    // the one most its own, green first on a tie, as the presets do: a blend of
+    // channels matched worse.)
+    struct AnaCustom { float wl[3], wr[3], tl[3], tr[3], ml[3], mr[3]; int cl = 0, cr = 1; };
+    inline AnaCustom AnaCustomFromColours(const float l[3], const float r[3])
+    {
+        AnaCustom k{};
+        const float lm = (std::max)((std::max)(l[0], l[1]), (std::max)(l[2], 1e-4f));
+        const float rm = (std::max)((std::max)(r[0], r[1]), (std::max)(r[2], 1e-4f));
+        float fl[3], fr[3];
+        for (int c = 0; c < 3; ++c) { fl[c] = l[c] / lm; fr[c] = r[c] / rm; }
+        float a = 0, b = 0, d = 0;
+        for (int c = 0; c < 3; ++c) { a += fl[c] * fl[c]; b += fl[c] * fr[c]; d += fr[c] * fr[c]; }
+        const float det = a * d - b * b;
+        if (det < 0.05f)   // (the same colour twice, near enough: nothing to tell apart -- red / cyan)
+        {
+            const float L[3] = { 1, 0, 0 }, R[3] = { 0, 1, 1 };
+            return AnaCustomFromColours(L, R);
+        }
+        for (int c = 0; c < 3; ++c)
+        {
+            k.wl[c] = (d * fl[c] - b * fr[c]) / det;
+            k.wr[c] = (a * fr[c] - b * fl[c]) / det;
+            k.tl[c] = fl[c]; k.tr[c] = fr[c];
+            k.ml[c] = (std::max)(0.0f, fl[c] - fr[c]);
+            k.mr[c] = (std::max)(0.0f, fr[c] - fl[c]);
+        }
+        auto pick = [](const float m[3]) { const int order[3] = { 1, 0, 2 }; int best = 1; for (int c : order) if (m[c] > m[best] + 1e-3f) best = c; return best; };
+        k.cl = pick(k.ml); k.cr = pick(k.mr);
+        return k;
     }
 
     // How each eye is reconstructed from the anaglyph. Listed in DISPLAY order, but

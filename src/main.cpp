@@ -453,7 +453,9 @@ namespace
     {
         // Timestamps, in frame order. Any not reached in a frame (e.g. the
         // Auto Stereo ones in other modes) are stamped at End (zero length).
-        enum Mark { kStart, kCapture, kAnalysis, kTracking, kOurs, kWeave, kMask, kEnd, kCount };
+        // (kPresent: up to the present. kEnd: what ran after it -- a conversion
+        // put off until the frame was on its way, see deferConvert.)
+        enum Mark { kStart, kCapture, kAnalysis, kTracking, kOurs, kWeave, kMask, kPresent, kEnd, kCount };
         static constexpr int kRing = 6;
         struct Set { ID3D11Query* disjoint = nullptr; ID3D11Query* ts[kCount] = {}; bool pending = false; };
         Set                  sets[kRing];
@@ -674,6 +676,9 @@ namespace
         double                       autoTimeAnalysisMs = 0;   // frame profile (below)
         double                       autoTimeReadbackMs = 0;   // ... of which: reading the analysis image back from the GPU
         bool                         paceOnCapture = false;    // this loop is paced by capture frames, not DwmFlush
+        bool                         deferHeavyConvert = false;// Recovered Colour converted after the present, woven next loop (Settings DeferRecovered)
+        ID3D11ShaderResourceView*    deferSrc = nullptr;       // ... this loop's source, until then
+        int                          deferW = 0, deferH = 0;
         // GPU scroll tracking (DirectComposition presenter only): content
         // pictures are positioned on the GPU each frame; see GpuTrack.h.
         GpuTracker                   gpuTracker;
@@ -892,7 +897,18 @@ namespace
         SourceKind   source         = SourceKind::CaptureMonitor;  // default: weave the screen (fullscreen SBS)
         StereoFormat format         = StereoFormat::HalfSBS;  // default: most on-screen SBS content is half-width
         bool         swapEyes       = false;
-        int          anaglyphCombo  = 0;   // 0..5 colour combination
+        int          anaglyphCombo  = 0;   // 0..5 colour combination, 6 Custom (kAnaComboCustom: the colours below)
+        float        anaCustomL[3]  = { 1, 0, 0 };   // the Custom pair's left filter colour (Settings AnaCustomLeft)
+        float        anaCustomR[3]  = { 0, 1, 1 };   // ... the right's
+        float        anaSaved[8][6] = {};             // saved Custom pairs (Settings AnaSaved*)
+        int          anaSavedCount  = 0;
+        // The Custom pair's eyedropper: 1 / 2 picking the left / right colour from the
+        // picture (the weave window takes the next click: EyedropStart / EyedropEnd).
+        int          eyedrop        = 0;
+        bool         eyedropClicked = false;
+        POINT        eyedropPt      = {};             // (the click, weave-window client px)
+        LONG_PTR     eyedropOldEx   = 0;
+        ULONGLONG    eyedropSince   = 0;
         int          anaglyphMode   = 4;   // shader mode value (4 = Recovered colour, the default)
         PulfrichMode pulfrichMode   = PulfrichMode::TimeDelay;
         int          pulfrichDelay  = 1;   // delay frames (time-delay mode)
@@ -4715,6 +4731,110 @@ namespace
     // whole frame is checked (a page or bars around the picture are plain grey
     // and don't count) -- there a new picture's first verdict counts at once,
     // after that a change needs two checks that agree.
+    // The Custom anaglyph pair's eyedropper. While picking, the weave window takes
+    // clicks (it's normally click-through, so the click would go to whatever is
+    // underneath); the click's colour comes from the picture being converted, not
+    // the screen -- that shows the weave.
+    // An eyedropper cursor (Windows has none): a pipette drawn into 32 x 32
+    // masks, its tip -- the hot spot -- bottom left. White with a black edge.
+    HCURSOR EyedropCursor()
+    {
+        static HCURSOR s_cur = nullptr;
+        if (s_cur) return s_cur;
+        BYTE andPlane[32 * 4], xorPlane[32 * 4];
+        memset(andPlane, 0xFF, sizeof(andPlane)); memset(xorPlane, 0, sizeof(xorPlane));
+        auto segDist = [](float px, float py, float ax, float ay, float bx, float by) {
+            const float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+            float t = (vx * wx + vy * wy) / (vx * vx + vy * vy); t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const float dx = wx - t * vx, dy = wy - t * vy; return sqrtf(dx * dx + dy * dy); };
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x)
+            {
+                const float px = x + 0.5f, py = y + 0.5f;
+                const float tube = segDist(px, py, 4.0f, 27.0f, 20.0f, 11.0f);   // (the glass tube)
+                const float tip  = segDist(px, py, 1.5f, 29.5f, 4.0f, 27.0f);    // (its point)
+                const float bulbX = px - 24.0f, bulbY = py - 7.0f;
+                const float bulb = sqrtf(bulbX * bulbX + bulbY * bulbY);         // (the rubber bulb)
+                int v = -1;   // -1 nothing, 0 black, 1 white
+                if (bulb <= 5.5f) v = 0;
+                else if (tube <= 1.6f) v = 1;
+                else if (tube <= 3.0f || tip <= 1.3f) v = 0;
+                if (bulb <= 4.0f || (tube <= 3.0f && px > 17.0f && py < 14.0f && tube > 1.6f)) v = 0;
+                if (v < 0) continue;
+                const int i = y * 4 + x / 8, bit = 0x80 >> (x % 8);
+                andPlane[i] &= (BYTE)~bit;
+                if (v == 1) xorPlane[i] |= (BYTE)bit;
+            }
+        s_cur = CreateCursor(GetModuleHandleW(nullptr), 1, 30, 32, 32, andPlane, xorPlane);
+        return s_cur ? s_cur : LoadCursor(nullptr, IDC_CROSS);
+    }
+    void EyedropEnd(AppState& app)
+    {
+        if (!app.eyedrop) return;
+        app.eyedrop = 0; app.eyedropClicked = false;
+        if (app.hwnd && IsWindow(app.hwnd))
+        {
+            SetWindowLongPtr(app.hwnd, GWL_EXSTYLE, app.eyedropOldEx);
+            SetWindowPos(app.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+    void EyedropStart(AppState& app, int which)
+    {
+        EyedropEnd(app);
+        if (!app.hwnd || !IsWindow(app.hwnd) || !app.weavingEnabled) return;
+        app.eyedrop = which; app.eyedropClicked = false; app.eyedropSince = GetTickCount64();
+        app.eyedropOldEx = GetWindowLongPtr(app.hwnd, GWL_EXSTYLE);
+        if (app.eyedropOldEx & WS_EX_TRANSPARENT)
+        {
+            SetWindowLongPtr(app.hwnd, GWL_EXSTYLE, app.eyedropOldEx & ~(LONG_PTR)WS_EX_TRANSPARENT);
+            SetWindowPos(app.hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        Log("Anaglyph: picking the %s colour from the picture", which == 1 ? "left" : "right");
+    }
+    // The picture's colour (sRGB, 0-1) around the clicked point: the converter's
+    // source, scaled to the weave window (what's woven fills it). A 5x5 average.
+    bool SampleSourceColour(AppState& app, ID3D11ShaderResourceView* srv, int srcW, int srcH, POINT pt, float rgb[3])
+    {
+        RECT cr{}; if (!srv || srcW <= 0 || srcH <= 0 || !GetClientRect(app.hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0) return false;
+        ID3D11Resource* res = nullptr; srv->GetResource(&res);
+        ID3D11Texture2D* tex = nullptr; if (res) { res->QueryInterface(&tex); res->Release(); }
+        if (!tex) return false;
+        D3D11_TEXTURE2D_DESC td{}; tex->GetDesc(&td);
+        const bool bgra = td.Format == DXGI_FORMAT_B8G8R8A8_UNORM || td.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || td.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        const bool rgba = td.Format == DXGI_FORMAT_R8G8B8A8_UNORM || td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        bool ok = false;
+        if (bgra || rgba)
+        {
+            const int x = (std::min)((int)td.Width - 1, (int)((pt.x + 0.5) * srcW / cr.right)), y = (std::min)((int)td.Height - 1, (int)((pt.y + 0.5) * srcH / cr.bottom));
+            const int x0 = (std::max)(0, x - 2), y0 = (std::max)(0, y - 2), x1 = (std::min)((int)td.Width, x + 3), y1 = (std::min)((int)td.Height, y + 3);
+            D3D11_TEXTURE2D_DESC sd = td; sd.Width = (UINT)(x1 - x0); sd.Height = (UINT)(y1 - y0); sd.MipLevels = 1; sd.ArraySize = 1;
+            sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+            ID3D11Texture2D* st = nullptr;
+            ID3D11DeviceContext* ctx = app.renderer.Context();
+            if (SUCCEEDED(app.renderer.Device()->CreateTexture2D(&sd, nullptr, &st)))
+            {
+                D3D11_BOX box{ (UINT)x0, (UINT)y0, 0, (UINT)x1, (UINT)y1, 1 };
+                ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, &box);
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+                {
+                    double s[3] = {}; int n = 0;
+                    for (UINT yy = 0; yy < sd.Height; ++yy)
+                        for (UINT xx = 0; xx < sd.Width; ++xx)
+                        {
+                            const uint8_t* p = (const uint8_t*)m.pData + (size_t)yy * m.RowPitch + (size_t)xx * 4;
+                            s[0] += bgra ? p[2] : p[0]; s[1] += p[1]; s[2] += bgra ? p[0] : p[2]; ++n;
+                        }
+                    ctx->Unmap(st, 0);
+                    if (n > 0) { for (int c = 0; c < 3; ++c) rgb[c] = (float)(s[c] / n / 255.0); ok = true; }
+                }
+                st->Release();
+            }
+        }
+        tex->Release();
+        return ok;
+    }
+
     void UpdateManualAnaColour(AppState& app)
     {
         ID3D11ShaderResourceView* srv = nullptr; int w = 0, h = 0;
@@ -4725,7 +4845,9 @@ namespace
         }
         else if (app.dxgiActive) { srv = app.captureDxgi.SRV(); w = app.captureDxgi.Width(); h = app.captureDxgi.Height(); }   // (what the converter gets)
         else if (app.capture.IsActive()) { srv = app.capture.CopyView();   /* (only checked here) */ w = app.capture.Width(); h = app.capture.Height(); }
+        // (Not for a Custom pair: the check's tests are for the six known pairs.)
         const bool on = app.weavingEnabled && app.format == StereoFormat::Anaglyph && app.anaglyphMode == 4 &&
+                        app.anaglyphCombo < kAnaComboCustom &&
                         !app.autoStereo;
         if (!on || !srv || w <= 0 || h <= 0)
         {
@@ -6740,7 +6862,10 @@ namespace
                 // (The converter's anaglyph mode as SetFormat below gives it.)
                 const int convAnaMode = app.manualAnaKind == 1 ? 3 :
                                         (app.manualAnaKind == 2 && app.manualAnaTint) ? 5 : app.anaglyphMode;
-                const bool direct = !app.autoStereo && srw::Converter::CheapEncodedSource(app.format, convAnaMode);
+                // (Recovered Colour too: it checks the frame for change before copying
+                // it for itself -- Converter::Convert, directSrc.)
+                const bool direct = !app.autoStereo && (srw::Converter::CheapEncodedSource(app.format, convAnaMode) ||
+                                    (app.format == StereoFormat::Anaglyph && convAnaMode == 4 && app.converter.RecoveredWantsDirect()));
                 srcSRV = direct ? app.capture.DirectSRV(srcEncoded) : app.capture.SRV();
                 srcW   = app.capture.Width();
                 srcH   = app.capture.Height();
@@ -7302,6 +7427,9 @@ namespace
             // (What the picture under an anaglyph was -- UpdateManualAnaColour:
             // black-and-white -> Mono, one colour -> its tint.)
             const bool anaTinted = app.manualAnaKind == 2 && app.manualAnaTint;
+            {
+                app.converter.SetAnaCustom(AnaCustomFromColours(app.anaCustomL, app.anaCustomR));
+            }
             app.converter.SetFormat(app.format, swapNow, app.anaglyphCombo,
                                     app.manualAnaKind == 1 ? 3 : anaTinted ? 5 : app.anaglyphMode);
             app.converter.SetAnaTint(anaTinted ? app.manualAnaTint->single : nullptr,
@@ -7408,6 +7536,36 @@ namespace
             const bool fromCapture = srcSRV && !fromKatanga && (srcEncoded || srcSRV == app.capture.CopyView());
             app.converter.SetSourceVersion(fromCapture ? app.capture.ContentVersion() : 0);
             app.converter.SetSourceEncoded(srcEncoded, fromCapture && srcEncoded ? &app.capture : nullptr);
+            app.converter.SetChangeStats(app.perfLog);
+            // Recovered Colour is the one conversion that can take several ms of
+            // GPU. Done here, it sits between a new frame arriving and the weave:
+            // a frame that arrives shortly before the refresh (the loop waits for
+            // one until 3 ms before) is then late for it, and the frame before
+            // shows twice -- a judder, many times a second on a scrolling page.
+            // So it's put off until this loop's frame is on its way (below, after
+            // the present): the weave takes the picture converted last loop, on
+            // time every time, and the conversion has the whole refresh that
+            // follows. The price: the picture one refresh later (head tracking
+            // isn't -- the weave is as late as ever).
+            if (app.deferHeavyConvert && app.converter.IsRecoveredColour() && fromCapture && app.converter.OutputSRV() &&
+                !app.captureRebind && !app.autoStereo)
+            {
+                app.deferSrc = srcSRV; app.deferW = srcW; app.deferH = srcH;
+            }
+            else
+            // (The Custom pair's eyedropper: the click's colour, from this very picture.)
+            if (app.eyedrop && (app.eyedropClicked || GetTickCount64() - app.eyedropSince > 20000))
+            {
+                float rgb[3];
+                if (app.eyedropClicked && SampleSourceColour(app, srcSRV, srcW, srcH, app.eyedropPt, rgb))
+                {
+                    float* dst = app.eyedrop == 1 ? app.anaCustomL : app.anaCustomR;
+                    for (int c = 0; c < 3; ++c) dst[c] = rgb[c];
+                    Settings::WriteAnaCustom(app.anaCustomL, app.anaCustomR);
+                    Log("Anaglyph: picked the %s colour %.0f %.0f %.0f", app.eyedrop == 1 ? "left" : "right", rgb[0] * 255, rgb[1] * 255, rgb[2] * 255);
+                }
+                EyedropEnd(app);
+            }
             if (app.converter.Convert(srcSRV, srcW, srcH, resized) && (resized || app.captureRebind))
             {
                 app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
@@ -7435,8 +7593,25 @@ namespace
             if (app.renderer.IsDComp()) app.renderer.ApplyMask();   // (timed apart from the present)
             app.gpuTimer.Stamp(GpuFrameTimer::kMask);
             { HitchWatch hw("present"); app.renderer.Present(false, !app.paceOnCapture); }   // no-vsync: lowest latency (VRR absorbs tearing)
+            app.gpuTimer.Stamp(GpuFrameTimer::kPresent);
             const clk::time_point tEnd = clk::now();
             app.prof.lastEnd = tEnd;
+            // (The conversion put off above: its result is woven next loop.)
+            if (app.deferSrc)
+            {
+                bool resized = false;
+                if (app.converter.Convert(app.deferSrc, app.deferW, app.deferH, resized) && (resized || app.captureRebind))
+                {
+                    app.weaver.SetInputView(app.converter.OutputSRV(), app.converter.OutputPerEyeWidth(),
+                                            app.converter.OutputHeight(), app.converter.OutputFormat());
+                    app.captureRebind = false;
+                }
+                app.deferSrc = nullptr;
+                // (Sent to the GPU now. Left in Direct3D's own queue it went with the
+                // NEXT loop's commands -- run just before that weave, where it was
+                // before, only a refresh later as well.)
+                app.renderer.Context()->Flush();
+            }
             app.gpuTimer.End();
             if (app.analysisDeferred)   // (see the Auto Stereo analysis above)
             {
@@ -7493,11 +7668,12 @@ namespace
                 if (p.loops > 0 && app.perfLog)
                 {
                     const double secs = (GetTickCount() - p.last) / 1000.0;
-                    Log("Frame profile (%s%s, display %.0f Hz): %.1f loops/s, %.1f new frames/s | avg ms: pace-wait %.2f, "
+                    Log("Frame profile (%s%s, %s, display %.0f Hz): %.1f loops/s, %.1f new frames/s | avg ms: pace-wait %.2f, "
                         "our work %.2f (auto analysis %.2f, of which readback %.2f), weave %.2f, present+compositor %.2f, whole loop %.2f (worst %.1f) | outside the weave %.2f (panel %.2f)",
                         app.autoStereo ? "Auto Stereo" : (app.mode == OutputMode::LookingGlass ? "Looking Glass" :
                                                           app.mode == OutputMode::Fullscreen ? "Fullscreen" : "other"),
                         app.renderer.IsDComp() ? ", DirectComposition" : app.renderer.IsFlipModel() ? ", flip" : ", bit-blt",
+                        FsCurrentFormatLabel(app.format),
                         SrRefreshHz(app),
                         p.loops / secs, p.frames / secs, p.wait / p.loops, p.work / p.loops, p.analysis / p.loops, p.readback / p.loops,
                         p.weave / p.loops, p.present / p.loops, p.total / p.loops, p.worst,
@@ -7516,21 +7692,32 @@ namespace
                     GpuFrameTimer& g = app.gpuTimer;
                     uint64_t capFrames = 0;
                     const double capFps = app.capture.TakeDeliveryRate(capFrames);
+                    {
+                        int qc = 0, qb = 0; app.renderer.TakeQueueStats(qc, qb);
+                        if (qc > 0) Log("  swap chain: the frame before still queued at the start of %d of %d loops", qb, qc);
+                    }
+                    {
+                        uint64_t du = 0, dunk = 0, dnone = 0; double darea = 0;
+                        app.capture.TakeDirtyStats(du, dunk, dnone, darea);
+                        if (du > 0)
+                            Log("  capture: %llu frames taken -- Windows reported nothing changed in %llu, no information for %llu, else %.0f%% of the screen changed (average)",
+                                du, dnone, dunk, darea * 100.0);
+                    }
                     // (Outside Auto Stereo the analysis/tracking marks are never
                     // reached: everything after the capture copy is conversion.)
                     if (g.n > 0 && !app.autoStereo)
-                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, conversion %.2f], SR weave %.2f, mask %.2f, present %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, conversion %.2f], SR weave %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
                             g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
                             g.Avg(GpuFrameTimer::kCapture),
                             g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
-                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
                             app.renderer.CompositionRateHz(), capFps);
                     else if (g.n > 0)
-                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, analysis %.2f, tracking %.2f, crops+conversion %.2f], SR weave %.2f, mask %.2f, present %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, analysis %.2f, tracking %.2f, crops+conversion %.2f], SR weave %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
                             g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
                             g.Avg(GpuFrameTimer::kCapture),
                             g.Avg(GpuFrameTimer::kAnalysis), g.Avg(GpuFrameTimer::kTracking), g.Avg(GpuFrameTimer::kOurs),
-                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
                             app.renderer.CompositionRateHz(), capFps);
                     else
                         Log("  GPU ms: n/a | DWM composing at %.1f Hz", dwmHz);
@@ -7541,6 +7728,12 @@ namespace
                             Log("  Anaglyph recovery GPU ms (avg of %d): coarse search %.2f, descriptors %.2f, refine %.2f, "
                                 "occlusion fill %.2f, smoothing %.2f | full-res decode %.2f, colour pyramid %.2f, colour fill %.2f",
                                 rn, rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7]);
+                        srw::Converter::ChangeStats cs;
+                        if (rn > 0 && app.converter.TakeChangeStats(cs))
+                            Log("  Recovery frames: %d converted -- %d whole, %d with changes (%.0f%% of the picture redrawn, %.0f%% kept and moved), "
+                                "%d of them scrolls (%.0f rows a frame) | scroll reuse %s",
+                                cs.frames, cs.full, cs.changed, cs.redrawn * 100.0, cs.moved * 100.0, cs.scrolled, cs.rows,
+                                cs.reuse ? "on" : "not running");
                     }
                     // Auto Stereo: each woven picture's geometry (screen px) --
                     // where it is, what it's clipped to, the part on show, and
@@ -7625,6 +7818,14 @@ namespace
 
         switch (msg)
         {
+        // (The Custom anaglyph pair's eyedropper: the weave window shows a pipette
+        // and takes the next click; a right click gives up.)
+        case WM_SETCURSOR:
+            if (app && app->eyedrop && (HWND)wParam == app->hwnd) { SetCursor(EyedropCursor()); return TRUE; }
+            break;
+        case WM_RBUTTONDOWN:
+            if (app && app->eyedrop) { EyedropEnd(*app); return 0; }
+            break;
         case WM_APP_TRAY:
             if (app && (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
             {
@@ -7795,6 +7996,12 @@ namespace
             return 0;
 
         case WM_LBUTTONDOWN:
+            if (app && app->eyedrop && hwnd == app->hwnd)
+            {
+                app->eyedropPt = POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                app->eyedropClicked = true;
+                return 0;
+            }
             // VR viewer: record the press but don't commit to "drag" yet --
             // any movement past the threshold turns it into a drag-to-look;
             // a release within the threshold falls through to the overlay
@@ -8518,6 +8725,12 @@ static void LoopBody(AppState& app, bool frame, bool panel)
             gs.format        = app.format;
             gs.swapEyes      = app.swapEyes;
             gs.anaglyphCombo = app.anaglyphCombo;
+            for (int c = 0; c < 3; ++c) { gs.anaCustomL[c] = app.anaCustomL[c]; gs.anaCustomR[c] = app.anaCustomR[c]; }
+            gs.anaCustomChanged = false;
+            gs.anaSavedCount = app.anaSavedCount;
+            for (int k = 0; k < app.anaSavedCount; ++k) for (int c = 0; c < 6; ++c) gs.anaSaved[k][c] = app.anaSaved[k][c];
+            gs.anaSavedAdd = false; gs.anaSavedLoad = gs.anaSavedDelete = -1;
+            gs.anaPickRequest = 0; gs.anaPickActive = app.eyedrop;
             gs.anaglyphMode  = app.anaglyphMode;
             gs.convergence   = app.convergence;
             gs.pulfrichMode  = (int)app.pulfrichMode;
@@ -8635,6 +8848,30 @@ static void LoopBody(AppState& app, bool frame, bool panel)
             {
                 app.convergence   = gs.convergence;
                 app.captureRebind = true;   // re-run the conversion with the new convergence
+            }
+            // (The Custom pair's saved pairs and eyedropper: asked for in the panel.)
+            if (gs.anaSavedAdd && app.anaSavedCount < 8)
+            {
+                for (int c = 0; c < 3; ++c) { app.anaSaved[app.anaSavedCount][c] = app.anaCustomL[c]; app.anaSaved[app.anaSavedCount][3 + c] = app.anaCustomR[c]; }
+                ++app.anaSavedCount;
+                Settings::WriteAnaSaved(app.anaSaved, app.anaSavedCount);
+            }
+            if (gs.anaSavedLoad >= 0 && gs.anaSavedLoad < app.anaSavedCount)
+            {
+                for (int c = 0; c < 3; ++c) { app.anaCustomL[c] = app.anaSaved[gs.anaSavedLoad][c]; app.anaCustomR[c] = app.anaSaved[gs.anaSavedLoad][3 + c]; }
+                Settings::WriteAnaCustom(app.anaCustomL, app.anaCustomR);
+            }
+            if (gs.anaSavedDelete >= 0 && gs.anaSavedDelete < app.anaSavedCount)
+            {
+                for (int k = gs.anaSavedDelete; k + 1 < app.anaSavedCount; ++k) for (int c = 0; c < 6; ++c) app.anaSaved[k][c] = app.anaSaved[k + 1][c];
+                --app.anaSavedCount;
+                Settings::WriteAnaSaved(app.anaSaved, app.anaSavedCount);
+            }
+            if (gs.anaPickRequest) EyedropStart(app, gs.anaPickRequest);
+            if (gs.anaCustomChanged)   // (the Custom anaglyph pair's colours, picked in the panel)
+            {
+                for (int c = 0; c < 3; ++c) { app.anaCustomL[c] = gs.anaCustomL[c]; app.anaCustomR[c] = gs.anaCustomR[c]; }
+                Settings::WriteAnaCustom(app.anaCustomL, app.anaCustomR);
             }
             // VR controls.
             if (gs.vrHeadLookChanged)
@@ -9122,6 +9359,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
 
     // Set up Direct3D. The weaver/SR session is started on demand when weaving is
     // enabled; the default source is the monitor (passthrough), so no initial image.
+    app.renderer.SetPlaneMode(Settings::ReadWeavePlane());   // (an experiment: see Settings.h)
     if (!app.renderer.Initialize(app.hwnd, useDComp))
     {
         if (!useDComp) return 4;
@@ -9182,6 +9420,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
         return 7;
     }
     Log("WinMain: converter.Initialize OK");
+    app.converter.SetScrollReuse(Settings::ReadScrollReuse());
+    app.deferHeavyConvert = Settings::ReadDeferRecovered();
+    Settings::ReadAnaCustom(app.anaCustomL, app.anaCustomR);
+    app.anaSavedCount = Settings::ReadAnaSaved(app.anaSaved, 8);
+    Log("WinMain: Recovered Colour converted %s", app.deferHeavyConvert ? "after the present (woven next refresh)" : "before the weave");
+    Log("WinMain: scroll reuse %s", Settings::ReadScrollReuse() ? "on" : "off");
     if (!app.regionWeaver.Initialize(app.renderer.Device(), app.renderer.Context()))
         Log("WinMain: regionWeaver.Initialize FAILED (Auto Stereo unavailable)");
     if (!app.analyzer.Initialize(app.renderer.Device(), app.renderer.Context()))

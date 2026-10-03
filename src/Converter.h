@@ -20,6 +20,16 @@ namespace srw
 
         // anaCombo: 0..5 (see AnaglyphComboList); anaMode: 0..3 (AnaglyphModeList).
         void SetFormat(StereoFormat fmt, bool swapEyes, int anaCombo, int anaMode);
+        // The Custom anaglyph pair (anaCombo 6): Common.h AnaCustomFromColours.
+        void SetAnaCustom(const AnaCustom& k)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                m_anaMaskL[c] = k.ml[c]; m_anaMaskR[c] = k.mr[c]; m_anaWL[c] = k.wl[c]; m_anaWR[c] = k.wr[c];
+                m_anaTL[c] = k.tl[c]; m_anaTR[c] = k.tr[c];
+                m_anaChanL = k.cl; m_anaChanR = k.cr;
+            }
+        }
         // Anaglyph mode 5 (a one-colour picture under it, AnalyseAnaPicture):
         // its tint tables, AnaTint::single (256 x RGBA) and ::missing (256).
         // Null: none. Only re-uploaded when the tables change.
@@ -79,6 +89,31 @@ namespace srw
         // Redraw only what changed since the last frame (default). Off: every
         // frame in full (tools/anatest compares the two).
         void SetChangeSkip(bool on) { m_changeSkipOn = on; }
+        // Recovered Colour: a block that only scrolled since the last frame takes
+        // last frame's output, moved (PSChangeScroll). Off: every moved block redrawn.
+        void SetScrollReuse(bool on) { m_scrollReuseOn = on; }
+        // Recovered Colour is what's set: the one conversion that can take several ms.
+        bool IsRecoveredColour() const { return m_fmt == StereoFormat::Anaglyph && m_anaMode == 4; }
+        // Recovered Colour: the 1/4-size disparity passes only where a redrawn block
+        // reads them (PSChangeGrow2). Off: all of them, whenever anything changed.
+        void SetPyramidSkip(bool on) { m_pyramidSkipOn = on; }
+        // Recovered Colour: a change redraws the blocks whose own borrow reaches it
+        // (PSReach). Off: every block within the whole search range of it.
+        void SetReach(bool on) { m_reachOn = on; }
+        // Recovered Colour from an encoded source (the capture's own frame): checked
+        // for change first, copied and converted only if it did. Off: read as it is.
+        void SetPreCheck(bool on) { m_preCheckOn = on; }
+        // Recovered Colour: plain grey areas found at 1/4 size and skipped by the
+        // pair and smoothing passes. Off: each pixel pair tested on its own.
+        void SetFlatSkip(bool on) { m_flatOn = on; }
+        // Quilt resampled in two passes (rows, then columns): the same picture,
+        // a third of the reads. Off: in one.
+        void SetQuiltTwoPass(bool on) { m_quiltTwoPass = on; }
+        // Both eyes from one compute thread where they share source pixels (the
+        // anaglyph modes but Recovered, checkerboard, interleaved). Off: pixel shaders.
+        void SetComputeBothEyes(bool on) { m_csOn = on; }
+        // Whether Recovered Colour is best given the capture's own frame (above).
+        bool RecoveredWantsDirect() const { return m_preCheckOn && m_changeSkipOn; }
 
         // VR180 / VR360 viewer parameters. yaw / pitch in RADIANS. zoom: 1.0
         // is ~90° horizontal FOV; higher = zoomed in. ipdScale shifts the
@@ -170,7 +205,11 @@ namespace srw
         ID3D11PixelShader*       m_psAnaCompose = nullptr;  // ... and its compose alone (PSAnaCompose), after PSAnaPair
         // The common formats' own shaders (PSFmt*: Half SBS / Katanga, Full SBS, TAB,
         // row, column, checkerboard, frame packing, anaglyph without Recovered).
-        ID3D11PixelShader*       m_psFmt[8] = {};
+        ID3D11PixelShader*       m_psFmt[9] = {};
+        // Quilt's first pass (rows) and its result (SetQuiltTwoPass).
+        ID3D11PixelShader*       m_psQuiltH = nullptr;
+        DispTarget               m_quiltH;
+        bool                     m_quiltTwoPass = true;
         ID3D11SamplerState*      m_sampler = nullptr;
         ID3D11Buffer*            m_cbuffer = nullptr;
 
@@ -197,6 +236,7 @@ namespace srw
         ID3D11Texture2D*          m_boxTex = nullptr;
         ID3D11ShaderResourceView* m_boxSRV = nullptr;
         uint64_t                  m_tintHash = 0;   // (of the tables; 0 = none in use)
+        uint64_t                  m_wholeTintHash = 0, m_lastTintHash = 0;   // (rows 0-1 alone; m_tintHash at the last conversion)
         void UploadAnaTables();
         // Every frame, whether each box still holds what it was judged to be
         // (PSAnaBoxCheck on the 1/16 block averages): kMaxBoxes x 1, .r 1 = yes.
@@ -208,10 +248,52 @@ namespace srw
         // blocks are recovered again; the occlusion predicate skips the whole
         // recovery when nothing did. m_changeValid: the output holds a whole
         // frame for the current settings (else the next one is drawn in full).
-        DispTarget         m_change, m_changeGrow, m_boxMapPrev;
+        DispTarget         m_change, m_changeGrow, m_changeGrow2, m_boxMapPrev;   // (m_changeGrow2: what the 1/4 passes work out, PSChangeGrow2)
         ID3D11PixelShader* m_psChange = nullptr;
         ID3D11PixelShader* m_psChangeGrow = nullptr;
+        ID3D11PixelShader* m_psChangeGrow2 = nullptr;
+        // How far sideways each block borrows (PSReach), kept from frame to frame:
+        // a change redraws only the blocks that reach it (PSChangeGrow).
+        DispTarget         m_reach, m_reachNext;
+        ID3D11PixelShader* m_psReach = nullptr;
+        bool               m_reachValid = false, m_reachOn = true;
         ID3D11Predicate*   m_changePred = nullptr;
+        // The capture's own frame checked for change before it's copied (Convert):
+        // the copy the passes read (m_work), the frame averaged down undecoded this
+        // frame and last, and the predicate that skips the copy and the conversion.
+        ID3D11Texture2D*          m_workTex = nullptr;
+        ID3D11ShaderResourceView* m_workSRV = nullptr;
+        int                       m_workW = 0, m_workH = 0;
+        DXGI_FORMAT               m_workFmt = DXGI_FORMAT_UNKNOWN;
+        DispTarget                m_enc4, m_enc4Prev;
+        bool                      m_encPrevValid = false, m_preCheckOn = true;
+        ID3D11Predicate*          m_prePred = nullptr;
+        ID3D11PixelShader*        m_psDownBox = nullptr;
+        // The 1/4 level's plain grey texels (PSDownFlat), shrunk (PSFlatShrink): the
+        // pair and smoothing passes skip them (SetFlatSkip).
+        ID3D11PixelShader*        m_psDownFlat = nullptr;
+        ID3D11PixelShader*        m_psFlatShrink = nullptr;
+        DispTarget                m_flat4, m_flatS;
+        bool                      m_flatOn = true;
+        // Scroll reuse: last frame's source (full size) and output, how far the
+        // picture scrolled (PSScrollCost / PSScrollPick, 1x1), and a predicate that
+        // skips the copy of last frame's output when it didn't.
+        static constexpr int kScroll = 192;   // (Converter.hlsl)
+        ID3D11Texture2D*          m_srcPrevTex = nullptr;
+        ID3D11ShaderResourceView* m_srcPrevSRV = nullptr;
+        DXGI_FORMAT               m_srcPrevFmt = DXGI_FORMAT_UNKNOWN, m_srcPrevViewFmt = DXGI_FORMAT_UNKNOWN;
+        int                       m_srcPrevW = 0, m_srcPrevH = 0;
+        bool                      m_srcPrevValid = false;
+        ID3D11Texture2D*          m_outPrevTex = nullptr;
+        ID3D11ShaderResourceView* m_outPrevSRV = nullptr;
+        DispTarget         m_scrollRows, m_scrollCost, m_scroll, m_changeQ;   // (PSScrollCost per grid row, summed, picked; PSChangeScrollQ)
+        ID3D11PixelShader* m_psScrollCost = nullptr;
+        ID3D11PixelShader* m_psScrollPick = nullptr;
+        ID3D11PixelShader* m_psScrollSum = nullptr;
+        ID3D11PixelShader* m_psChangeScrollQ = nullptr;
+        ID3D11PixelShader* m_psChangeScroll = nullptr;
+        ID3D11Predicate*   m_scrollPred = nullptr;
+        void ReleaseScroll();
         bool               m_changeValid = false;
         DispTarget         m_snapPending, m_snapActive, m_boxShiftCost, m_boxShift;   // (RequestAnaSnapshot, PSAnaBoxShift)
         ID3D11PixelShader* m_psBoxShiftCost = nullptr;
@@ -226,6 +308,13 @@ namespace srw
         ID3D11RenderTargetView*   m_descRTV[4] = {};
         ID3D11ShaderResourceView* m_descSRV[4] = {};
         int                       m_descW = 0, m_descH = 0;
+        // ... and the same for the coarse search's candidates (PSAnaDescCoarse):
+        // worked out once per position instead of once per pixel that tries it.
+        struct DescSet { ID3D11Texture2D* tex[4] = {}; ID3D11RenderTargetView* rtv[4] = {}; ID3D11ShaderResourceView* srv[4] = {}; int w = 0, h = 0; };
+        bool EnsureDescSet(DescSet& s, int width, int height);
+        void ReleaseDescSet(DescSet& s);
+        DescSet                   m_descCoarse;
+        ID3D11PixelShader*        m_psDescCoarse = nullptr;
 
         // GPU time of the anaglyph recovery's stages, for the perf log: a small
         // ring of timestamp sets, read back a few frames later (never stalls).
@@ -242,6 +331,35 @@ namespace srw
         // descriptors, refine, occlusion fill, smoothing, full-res decode,
         // colour pyramid, colour fill); false if none ran.
         bool TakeRecoveryTimes(double ms[kTimeMarks - 1], int& count);
+        // For the perf log: what the recovery did with the frames since the last
+        // call. Counted only while on (SetChangeStats): two tiny passes and a
+        // 1 x 1 read-back per frame, never waited for.
+        struct ChangeStats
+        {
+            int    frames = 0;        // conversions run
+            int    full = 0;          // ... drawn whole (first frame, new settings, a new size)
+            int    changed = 0;       // ... where something had changed
+            int    scrolled = 0;      // ... of those, a scroll found
+            double redrawn = 0;       // changed frames: the part redrawn, 0-1 (average)
+            double moved = 0;         // ... the part taken from last frame's output, moved
+            double rows = 0;          // scrolled frames: rows per frame (average, either way)
+            bool   reuse = false;     // scroll reuse could run (else: off, or the source isn't a plain texture of the picture's size)
+        };
+        void SetChangeStats(bool on) { m_statsOn = on; }
+        bool TakeChangeStats(ChangeStats& out);
+    private:
+        bool               m_statsOn = false;
+        DispTarget         m_statRows, m_stat;
+        ID3D11PixelShader* m_psStatRows = nullptr;
+        ID3D11PixelShader* m_psStat = nullptr;
+        static constexpr int kStatRing = 4;
+        ID3D11Texture2D*   m_statStaging[kStatRing] = {};
+        bool               m_statPending[kStatRing] = {};
+        float              m_statBlocks[kStatRing] = {};   // (blocks in that frame's picture)
+        int                m_statNext = 0;
+        ChangeStats        m_statAcc;
+        void CollectStats();
+    public:
         // Diagnostics (tools/anatest): the recovery's disparity map after a stage
         // -- 0 coarse search, 1 refine, 2 occlusion fill, 3 smoothing (what the
         // compose reads) -- or null.
@@ -261,6 +379,9 @@ namespace srw
 
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;
+        ID3D11UnorderedAccessView* m_outUAV = nullptr;   // (UNORM view: the both-eyes compute shaders)
+        ID3D11ComputeShader*      m_cs[4] = {};           // (both eyes per thread: anaglyph, checkerboard, column, row)
+        bool                      m_csOn = true;
         ID3D11ShaderResourceView* m_outSRV = nullptr;
         int                       m_outWidth  = 0;     // full SBS width
         int                       m_outHeight = 0;
@@ -280,6 +401,10 @@ namespace srw
         bool         m_swap = false;
         int          m_anaCombo = 0;
         int          m_anaMode  = 0;
+        float        m_anaMaskL[3] = { 1, 0, 0 }, m_anaMaskR[3] = { 0, 1, 1 };   // (SetAnaCustom)
+        float        m_anaWL[3] = { 1, 0, 0 }, m_anaWR[3] = { 0, 0.5f, 0.5f };   // (... each eye's brightness from a pixel)
+        float        m_anaTL[3] = { 1, 0, 0 }, m_anaTR[3] = { 0, 1, 1 };         // (... and its colour)
+        int          m_anaChanL = 0, m_anaChanR = 1;                               // (... and the channel it's matched on)
         PulfrichMode m_pulfMode = PulfrichMode::TimeDelay;
         int          m_pulfEye  = 1;       // affected eye (0 left, 1 right)
         float        m_ndTrans  = 0.30f;   // ND transmission
@@ -298,6 +423,8 @@ namespace srw
         int          m_targetPaneH = 0;
         bool         m_halfWidthEyes = false;   // (Recovered Colour: full width since PSAnaPair made it affordable)
         bool         m_pairRefineOn  = true;
+        bool         m_scrollReuseOn = true;
+        bool         m_pyramidSkipOn = true;
         bool         m_changeSkipOn = true;
         float        m_vrYaw   = 0.0f;                   // VR viewer: yaw (radians)
         float        m_vrPitch = 0.0f;                   // VR viewer: pitch (radians)
