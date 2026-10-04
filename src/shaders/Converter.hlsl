@@ -377,6 +377,7 @@ float4 PSDown(VSOut i) : SV_Target
 // The same downsample, and whether the block is plain grey: every tap (each a
 // 2x2 average) neutral and all alike to within the plain-grey test's 0.01
 // (anaFlatAt). Target 1: 1 = plain.
+static const float kFlatTone = 0.02;   // (the plain-grey test on the square root of the light: see anaFlatAt)
 struct DownFlatOut { float4 avg : SV_Target0; float flat : SV_Target1; };
 DownFlatOut PSDownFlat(VSOut i)
 {
@@ -396,7 +397,10 @@ DownFlatOut PSDownFlat(VSOut i)
     }
     DownFlatOut o2;
     o2.avg = acc / 64.0;
-    o2.flat = (dev < 0.01 && all(hi - lo < 0.01)) ? 1.0 : 0.0;
+    // (... and on the eye's scale: the darkest and the lightest value of all, any
+    // channel, kFlatTone apart at most on their square roots -- as anaFlatAt.)
+    const float vLo = min(min(lo.r, lo.g), lo.b), vHi = max(max(hi.r, hi.g), hi.b);
+    o2.flat = (dev < 0.01 && all(hi - lo < 0.01) && sqrt(max(vHi, 0.0)) - sqrt(max(vLo, 0.0)) < kFlatTone) ? 1.0 : 0.0;
     return o2;
 }
 // Target 1/4: .r 1 where the 3x3 texels around are all plain (PSDownFlat at
@@ -1353,18 +1357,29 @@ void AnaRefine(float2 e, int eye, float3 c, float px, out float dRef, out float 
 // Both eyes see the same plain grey around here -- the anaglyph flat and
 // neutral: what's shown already IS each eye's colour (a page beside the
 // picture, plain grey sky), nothing to recover.
+// (Plain and neutral as the eye sees it, too: the darkest and the lightest
+// value round here -- any tap, any channel -- must also be within kFlatTone of
+// each other on the square root of the light. On the light itself alone,
+// anything dark passed -- every difference down there is under 0.01 -- so a
+// dark blue or dark red area was taken for plain grey and shown as it is,
+// while the pixels round its edge were recovered: a band round every dark
+// coloured area, a different shade from its middle. Two square roots a
+// pixel: taken per tap, the test cost 6% of a whole frame.)
+
 bool anaFlatAt(float2 e, float3 c)
 {
     const float2 pxy = 1.0 / float2(g_srcW, g_srcH);
     float dev = max(abs(c.r - c.g), abs(c.r - c.b));
+    float vLo = min(min(c.r, c.g), c.b), vHi = max(max(c.r, c.g), c.b);
     [unroll] for (int fy = -1; fy <= 1; ++fy)
     [unroll] for (int fx = -1; fx <= 1; ++fx)
     {
         const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * pxy, 0).rgb;
         dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
         dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
+        vLo = min(vLo, min(min(q.r, q.g), q.b)); vHi = max(vHi, max(max(q.r, q.g), q.b));
     }
-    return dev < 0.01;
+    return dev < 0.01 && sqrt(max(vHi, 0.0)) - sqrt(max(vLo, 0.0)) < kFlatTone;
 }
 // (For a pixel pair: 1 the first pixel plain grey, 2 the second, 3 both.)
 float anaFlatPair(float2 e, float3 c)
