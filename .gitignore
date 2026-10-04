@@ -77,3 +77,6 @@ anadebug/
 # dx12bench: shaders compiled by dxc for a run (see tools/dx12bench/dx12bench.cpp)
 tools/dx12bench/*.dxil
 tools/dx12bench/search/
+
+# Run-time logs (SR Loom writes srweaver.log beside the exe)
+*.log
