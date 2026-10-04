@@ -2459,6 +2459,20 @@ namespace
     // tray "apply" path passes nullptr -- it doesn't know which window
     // the user "meant", so it just flips the format and lets the user
     // pick the source themselves.
+    // The display's settings into a profile being saved: those not at their
+    // defaults, and those the profile already has (an update keeps them
+    // current). The weaver only where the profile already names one -- written
+    // into every profile, a later change in the panel would be undone, with a
+    // restart of the 3D, by whichever profile applied next.
+    void SnapshotDisplaySettings(Profile& p)
+    {
+        const int act = Settings::ReadWeaverActStrength(), method = Settings::ReadWeaverAct(), con = Settings::ReadWeaverContrast();
+        if (act != 100 || p.antiCrosstalk >= 0)    p.antiCrosstalk   = act;
+        if (method != 0 || p.crosstalkMethod >= 0) p.crosstalkMethod = method;
+        if (con != 100 || p.contrast >= 0)         p.contrast        = con;
+        if (p.weaver >= 0)                         p.weaver          = Settings::ReadWeaverChoice() >= 4 ? 1 : 0;
+    }
+
     void ApplyProfile(AppState& app, const Profile& p, HWND captureHwnd = nullptr,
                       const std::string& currentTitle = std::string())
     {
@@ -2496,6 +2510,14 @@ namespace
         if (p.quiltRows > 0) app.quiltRows = p.quiltRows;
         if (p.quiltLeftIdx  >= 0) app.quiltLeftIdx  = p.quiltLeftIdx;
         if (p.quiltRightIdx >= 0) app.quiltRightIdx = p.quiltRightIdx;
+        // The display's settings, where the profile gives them (-1: left as
+        // they are). Written to the panel's own settings: the render loop
+        // applies them as it does the panel's changes (a different weaver
+        // restarts the SR session), and the panel reads them back.
+        if (p.antiCrosstalk   >= 0 && Settings::ReadWeaverActStrength() != p.antiCrosstalk) Settings::WriteWeaverActStrength(p.antiCrosstalk);
+        if (p.crosstalkMethod >= 0 && Settings::ReadWeaverAct() != p.crosstalkMethod)       Settings::WriteWeaverAct(p.crosstalkMethod);
+        if (p.contrast        >= 0 && Settings::ReadWeaverContrast() != p.contrast)         Settings::WriteWeaverContrast(p.contrast);
+        if (p.weaver          >= 0 && (Settings::ReadWeaverChoice() >= 4) != (p.weaver > 0)) Settings::WriteWeaverChoice(p.weaver > 0 ? 4 : 0);
         if (p.useVisualAuto)
         {
             // (format=detect: Automatic Detection, as picked in the panel.)
@@ -3421,6 +3443,7 @@ namespace
         p.quiltRows      = app.quiltRows;
         p.quiltLeftIdx   = app.quiltLeftIdx;
         p.quiltRightIdx  = app.quiltRightIdx;
+        SnapshotDisplaySettings(p);
         // Head-tracking snapshot: stored but only applied later when the
         // user explicitly flags includeHeadTracking on this profile
         // (per-row toggle in the PROFILES list). Default false so a fresh
@@ -8087,8 +8110,8 @@ namespace
                         double rt[8] = {}; int rn = 0;
                         if (app.converter.TakeRecoveryTimes(rt, rn))
                             Log("  Anaglyph recovery GPU ms (avg of %d): coarse search %.2f, descriptors %.2f, refine %.2f, "
-                                "occlusion fill %.2f, smoothing %.2f | full-res decode %.2f, colour pyramid %.2f, colour fill %.2f",
-                                rn, rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], rt[7]);
+                                "occlusion fill %.2f, smoothing %.2f | full-res pair refine %.2f, compose %.2f",
+                                rn, rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6]);
                         srw::Converter::ChangeStats cs;
                         if (rn > 0 && app.converter.TakeChangeStats(cs))
                             Log("  Recovery frames: %d converted -- %d whole, %d with changes (%.0f%% of the picture redrawn, %.0f%% kept and moved), "
@@ -9345,6 +9368,7 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 p.quiltRows      = app.quiltRows;
                 p.quiltLeftIdx   = app.quiltLeftIdx;
                 p.quiltRightIdx  = app.quiltRightIdx;
+                SnapshotDisplaySettings(p);
                 // Refresh the HT snapshot too if the profile is
                 // currently flagged to carry HT settings -- same
                 // "you're updating the profile, capture everything"

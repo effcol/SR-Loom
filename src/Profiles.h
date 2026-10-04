@@ -63,6 +63,14 @@ namespace srw
         int          quiltLeftIdx   = -1;  // -1 = auto (centre pair from cols*rows)
         int          quiltRightIdx  = -1;
 
+        // The display's settings, where the profile gives them (-1: left as
+        // they are). They are SR Loom's own settings, the ones the panel
+        // shows: a profile that sets one changes it until something else does.
+        int          antiCrosstalk   = -1;  // Anti-Crosstalk strength, % (0-300)
+        int          crosstalkMethod = -1;  // 0 the display's default, 1 off, 2 static, 3 dynamic
+        int          contrast        = -1;  // weaving contrast, % (0-200)
+        int          weaver          = -1;  // 0 Direct3D 11, 1 Direct3D 12
+
         // Head-tracking settings -- applied only when includeHeadTracking
         // is true. Default off so legacy profiles (or freshly saved ones
         // where the user doesn't care about HT) leave HT alone on apply.

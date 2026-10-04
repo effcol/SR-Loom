@@ -401,6 +401,18 @@ namespace srw::Profiles
             else if (key == "quilt_rows")           cur.quiltRows     = toInt(val);
             else if (key == "quilt_left")           cur.quiltLeftIdx  = toInt(val);
             else if (key == "quilt_right")          cur.quiltRightIdx = toInt(val);
+            else if (key == "anti_crosstalk")       cur.antiCrosstalk = (std::min)(300, (std::max)(0, toInt(val)));
+            else if (key == "contrast")             cur.contrast      = (std::min)(200, (std::max)(0, toInt(val)));
+            else if (key == "crosstalk_method")
+            {
+                const std::string lv = ToLower(val);
+                cur.crosstalkMethod = lv == "default" ? 0 : lv == "off" ? 1 : lv == "static" ? 2 : lv == "dynamic" ? 3 : -1;
+            }
+            else if (key == "weaver")
+            {
+                const std::string lv = ToLower(val);
+                cur.weaver = lv == "dx11" ? 0 : lv == "dx12" ? 1 : -1;
+            }
             else if (key == "include_head_tracking") cur.includeHeadTracking = toBool(val);
             else if (key == "ht_opentrack")         cur.htOpenTrack   = toBool(val);
             else if (key == "ht_freetrack")         cur.htFreeTrack   = toBool(val);
@@ -477,6 +489,19 @@ namespace srw::Profiles
              "#                                  bottom-left view). Written by Save when\n"
              "#                                  they differ from the default.\n"
              "#\n"
+             "# Display keys (all optional; a profile without one leaves that setting as it\n"
+             "# is). These are the panel's own settings: once a profile has set one it\n"
+             "# stays so until you, or another profile, change it.\n"
+             "#   anti_crosstalk=0..300          the Anti-Crosstalk slider, in % (100 = the\n"
+             "#                                  display's own amount).\n"
+             "#   crosstalk_method=default|off|static|dynamic   the Crosstalk method.\n"
+             "#   contrast=0..200                the Contrast slider, in %.\n"
+             "#   weaver=dx11|dx12               which weaver draws the 3D. Changing it\n"
+             "#                                  restarts the 3D for a moment.\n"
+             "#   Saving a profile from the panel writes the first three when they are not\n"
+             "#   at their defaults, or when the profile already has them. weaver= is only\n"
+             "#   ever set here, by hand.\n"
+             "#\n"
              "# Only fields you customised are written. Unset fields use SR Loom's\n"
              "# defaults. Order inside a section doesn't matter.\n"
              "#\n"
@@ -529,6 +554,11 @@ namespace srw::Profiles
             if (p.quiltRows      != def.quiltRows)      f << "quilt_rows="      << p.quiltRows      << "\n";
             if (p.quiltLeftIdx   != def.quiltLeftIdx)   f << "quilt_left="      << p.quiltLeftIdx   << "\n";
             if (p.quiltRightIdx  != def.quiltRightIdx)  f << "quilt_right="     << p.quiltRightIdx  << "\n";
+            // (The display's settings: only where the profile has them.)
+            if (p.antiCrosstalk   >= 0) f << "anti_crosstalk=" << p.antiCrosstalk << "\n";
+            if (p.crosstalkMethod >= 0) f << "crosstalk_method=" << (p.crosstalkMethod == 1 ? "off" : p.crosstalkMethod == 2 ? "static" : p.crosstalkMethod == 3 ? "dynamic" : "default") << "\n";
+            if (p.contrast        >= 0) f << "contrast=" << p.contrast << "\n";
+            if (p.weaver          >= 0) f << "weaver=" << (p.weaver ? "dx12" : "dx11") << "\n";
             if (p.includeHeadTracking)
             {
                 f << "include_head_tracking=1\n";

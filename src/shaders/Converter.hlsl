@@ -111,14 +111,22 @@ float3 srgbDecode(float3 s) { return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) 
 // filters. The capture's own frame (zero-copy) can only be viewed as UNORM, so
 // with g_srcDecode set the same is done here: each texel decoded, then the
 // bilinear blend (clamped at the edges, like the sampler) -- the same result.
+// (SRC_PLAIN: compiled for a source that never needs it -- the "Plain" shaders,
+// CMakeLists.txt. Recovered Colour reads the source some 50 times a pixel pair,
+// and the choice alone, made at every read, was a tenth of its whole frame.)
 float4 SrcLoad(int3 p)
 {
     float4 c = srcTex.Load(p);
+#ifndef SRC_PLAIN
     if (g_srcDecode > 0.5) c.rgb = srgbDecode(saturate(c.rgb));
+#endif
     return c;
 }
 float4 SrcSampleLevel(SamplerState s, float2 uv, float lod)
 {
+#ifdef SRC_PLAIN
+    return srcTex.SampleLevel(s, uv, lod);
+#else
     if (g_srcDecode < 0.5) return srcTex.SampleLevel(s, uv, lod);
     uint W, H; srcTex.GetDimensions(W, H);
     const float2 p = uv * float2(W, H) - 0.5;
@@ -132,6 +140,7 @@ float4 SrcSampleLevel(SamplerState s, float2 uv, float lod)
     const float4 c00 = SrcLoad(int3(a.x, a.y, 0)), c10 = SrcLoad(int3(b.x, a.y, 0));
     const float4 c01 = SrcLoad(int3(a.x, b.y, 0)), c11 = SrcLoad(int3(b.x, b.y, 0));
     return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+#endif
 }
 float4 SrcSample(SamplerState s, float2 uv) { return SrcSampleLevel(s, uv, 0); }   // (one mip level)
 // Row `row` of the tint table at value v (0..1), between its 256 entries.
@@ -213,12 +222,14 @@ VSOut VSMain(uint id : SV_VertexID)
 // cyan views match by STRUCTURE despite their photometric (colour) mismatch. We
 // match red against the GREEN channel only (green carries most luminance; mixing
 // in blue adds noise). 5-tap window -> 4 adjacent differences per channel.
-void gradWindow(float2 uv, float ctx, out float gR[4], out float gG[4])
+// (c: the source at uv, which the caller has -- the middle tap, not read again.)
+void gradWindow(float2 uv, float3 c, float ctx, out float gR[4], out float gG[4])
 {
     float rr[5], gg[5];
     [unroll] for (int w = 0; w < 5; ++w)
     {
-        float3 s = SrcSampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
+        float3 s = c;
+        if (w != 2) s = SrcSampleLevel(samp, uv + float2((float)(w - 2) * ctx, 0), 0).rgb;
         rr[w] = anaChanL(s); gg[w] = anaChanR(s);   // (rr: left view's channel, gg: right's)
     }
     [unroll] for (int k = 0; k < 4; ++k) { gR[k] = rr[k + 1] - rr[k]; gG[k] = gg[k + 1] - gg[k]; }
@@ -1343,7 +1354,7 @@ void AnaSearch(float2 e, int eye, float4 dC, float rgR[4], float rgG[4], float p
 void AnaRefine(float2 e, int eye, float3 c, float px, out float dRef, out float conf)
 {
     const float4 dC = AnaDispAt(e, c);
-    float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
+    float rgR[4], rgG[4]; gradWindow(e, c, px, rgR, rgG);
     AnaSearch(e, eye, dC, rgR, rgG, px, dRef, conf);
 }
 
@@ -1370,16 +1381,24 @@ bool anaFlatAt(float2 e, float3 c)
 {
     const float2 pxy = 1.0 / float2(g_srcW, g_srcH);
     float dev = max(abs(c.r - c.g), abs(c.r - c.b));
-    float vLo = min(min(c.r, c.g), c.b), vHi = max(max(c.r, c.g), c.b);
-    [unroll] for (int fy = -1; fy <= 1; ++fy)
-    [unroll] for (int fx = -1; fx <= 1; ++fx)
+    // (A coloured pixel is not plain grey, whatever is round it: nothing more
+    // is read -- most of a picture. The middle tap is c itself: not read again.)
+    bool flat = false;
+    [branch] if (dev < 0.01)
     {
-        const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * pxy, 0).rgb;
-        dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
-        dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
-        vLo = min(vLo, min(min(q.r, q.g), q.b)); vHi = max(vHi, max(max(q.r, q.g), q.b));
+        float vLo = min(min(c.r, c.g), c.b), vHi = max(max(c.r, c.g), c.b);
+        [unroll] for (int fy = -1; fy <= 1; ++fy)
+        [unroll] for (int fx = -1; fx <= 1; ++fx)
+        {
+            if (fx == 0 && fy == 0) continue;
+            const float3 q = SrcSampleLevel(samp, e + float2(fx * 3.0, fy * 3.0) * pxy, 0).rgb;
+            dev = max(dev, max(max(abs(q.r - c.r), abs(q.g - c.g)), abs(q.b - c.b)));
+            dev = max(dev, max(abs(q.r - q.g), abs(q.r - q.b)));
+            vLo = min(vLo, min(min(q.r, q.g), q.b)); vHi = max(vHi, max(max(q.r, q.g), q.b));
+        }
+        flat = dev < 0.01 && sqrt(max(vHi, 0.0)) - sqrt(max(vLo, 0.0)) < kFlatTone;
     }
-    return dev < 0.01 && sqrt(max(vHi, 0.0)) - sqrt(max(vLo, 0.0)) < kFlatTone;
+    return flat;
 }
 // (For a pixel pair: 1 the first pixel plain grey, 2 the second, 3 both.)
 float anaFlatPair(float2 e, float3 c)
@@ -1415,7 +1434,7 @@ float4 PSAnaPair(VSOut i) : SV_Target
         const float flat = anaFlatPair(e, c);
         if (flat > 2.5) return float4(0, flat, 0, flat);
         const float4 dC = AnaDispAt(e, c);
-        float rgR[4], rgG[4]; gradWindow(e, px, rgR, rgG);
+        float rgR[4], rgG[4]; gradWindow(e, c, px, rgR, rgG);
         AnaSearch(e, 0, dC, rgR, rgG, px, dL, cL);
         AnaSearch(e, 1, dC, rgR, rgG, px, dR, cR);
         return float4(dL, flat, dR, flat);   // (.g / .a: which of the pair is plain grey)
@@ -1479,14 +1498,17 @@ float3 anaRecoverPixel(float2 e, float3 c, int eye, float dRef)
     // cross-eye colour across edges -> the persistent borrow-edge
     // marbelling. SIRA's superpixel containment serves the same purpose;
     // luminance-weighting is the shader-feasible analogue.
-    float3 centreC = SrcSampleLevel(samp, float2(e.x + dRef, e.y), 0.0).rgb;
-    float  centreY = dot(centreC, float3(0.299, 0.587, 0.114));
+    // (The nine read once: the middle one is the matched centre.)
+    float3 tap[9];
+    [unroll] for (int ty = -1; ty <= 1; ++ty)
+    [unroll] for (int tx = -1; tx <= 1; ++tx)
+        tap[(ty + 1) * 3 + tx + 1] = SrcSampleLevel(samp, float2(e.x + dRef + (float)tx * px, e.y + (float)ty * py), 0.0).rgb;
+    float  centreY = dot(tap[4], float3(0.299, 0.587, 0.114));
     float3 there = 0;
     float  tw    = 1e-4;
-    [unroll] for (int by = -1; by <= 1; ++by)
-    [unroll] for (int bx = -1; bx <= 1; ++bx)
+    [unroll] for (int bt = 0; bt < 9; ++bt)
     {
-        float3 s = SrcSampleLevel(samp, float2(e.x + dRef + (float)bx * px, e.y + (float)by * py), 0.0).rgb;
+        float3 s = tap[bt];
         float  sY = dot(s, float3(0.299, 0.587, 0.114));
         // (Brightness compared on its square root, as the eye sees it: a step
         // in a dark area counts as much as the same visible step in a bright one.)

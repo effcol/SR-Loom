@@ -18,6 +18,8 @@
 #include "Converter_PSAnaSmooth.h"
 #include "Converter_PSAnaPair.h"
 #include "Converter_PSAnaCompose.h"
+#include "Converter_PSAnaPairPlain.h"
+#include "Converter_PSAnaComposePlain.h"
 #include "Converter_PSFmtAnaglyph.h"
 #include "Converter_PSFmtQuilt.h"
 #include "Converter_CSFmtAnaglyph.h"
@@ -158,6 +160,9 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         { g_Converter_PSAnaSmooth,    sizeof(g_Converter_PSAnaSmooth),    &m_psSmooth    },
         { g_Converter_PSAnaPair,      sizeof(g_Converter_PSAnaPair),      &m_psPair      },
         { g_Converter_PSAnaCompose,   sizeof(g_Converter_PSAnaCompose),   &m_psAnaCompose },
+        // (... both again for a source that needs no decoding here: SRC_PLAIN, Converter.hlsl.)
+        { g_Converter_PSAnaPairPlain, sizeof(g_Converter_PSAnaPairPlain), &m_psPairPlain },
+        { g_Converter_PSAnaComposePlain, sizeof(g_Converter_PSAnaComposePlain), &m_psAnaComposePlain },
         { g_Converter_PSFmtAnaglyph, sizeof(g_Converter_PSFmtAnaglyph), &m_psFmt[7] },
         { g_Converter_PSFmtQuilt, sizeof(g_Converter_PSFmtQuilt), &m_psFmt[8] },
         { g_Converter_PSQuiltH, sizeof(g_Converter_PSQuiltH), &m_psQuiltH },
@@ -1053,7 +1058,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             uploadCB((float)w4, (float)h4);
             D3D11_VIEWPORT vp{};
             vp.Width = (FLOAT)pairs; vp.Height = (FLOAT)eh; vp.MaxDepth = 1.0f;
-            m_context->PSSetShader(m_psPair, nullptr, 0);
+            m_context->PSSetShader(srcDecode < 0.5f && m_psPairPlain ? m_psPairPlain : m_psPair, nullptr, 0);
             m_context->OMSetRenderTargets(1, &m_pair.rtv, nullptr);
             m_context->RSSetViewports(1, &vp);
             ID3D11ShaderResourceView* srvs[3] = { source, nullptr, m_dispF.srv };
@@ -1075,6 +1080,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         }
     }
     else ReleaseDispTarget(m_pair);
+    if (tSlot >= 0) TimeMark(tSlot, 6);   // (the pair refine's time apart from the compose's)
     uploadCB((float)w4, (float)h4);
     {
         D3D11_VIEWPORT vp{};
@@ -1122,7 +1128,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             m_context->CSSetShader(nullptr, nullptr, 0);
         }
         else {
-        ID3D11PixelShader* ps = (pairRefine > 0.5f && m_psAnaCompose) ? m_psAnaCompose
+        ID3D11PixelShader* ps = (pairRefine > 0.5f && m_psAnaCompose) ? (srcDecode < 0.5f && m_psAnaComposePlain ? m_psAnaComposePlain : m_psAnaCompose)
                               : (fi >= 0 && m_psFmt[fi]) ? m_psFmt[fi] : m_ps;
         m_context->PSSetShader(ps, nullptr, 0);
         ID3D11ShaderResourceView* pairSrv = pairRefine > 0.5f ? m_pair.srv : nullptr;   // (PSAnaPair's result)
@@ -1193,9 +1199,9 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_changeValid = true;
     }
     // (No colour-pyramid fill after it any more: see the note in
-    // Converter.hlsl -- it never changed the picture. The perf log's
-    // "colour pyramid" and "colour fill" now read 0.)
-    if (tSlot >= 0) { TimeMark(tSlot, 6); TimeMark(tSlot, 7); }
+    // Converter.hlsl -- it never changed the picture. The last two timed
+    // stages are the pair refine and the compose.)
+    if (tSlot >= 0) TimeMark(tSlot, 7);
     if (tSlot >= 0)
     {
         TimeMark(tSlot, 8);
@@ -1518,6 +1524,8 @@ void Converter::Shutdown()
     SAFE_RELEASE(m_psSmooth);
     SAFE_RELEASE(m_psPair);
     SAFE_RELEASE(m_psAnaCompose);
+    SAFE_RELEASE(m_psPairPlain);
+    SAFE_RELEASE(m_psAnaComposePlain);
     SAFE_RELEASE(m_bandRS);
     for (auto*& p : m_psFmt) SAFE_RELEASE(p);
     SAFE_RELEASE(m_tintSRV);

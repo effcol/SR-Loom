@@ -224,6 +224,7 @@ namespace srw
         ID3D11PixelShader*       m_psSmooth  = nullptr;  // edge-aware disparity smoothing
         ID3D11PixelShader*       m_psPair    = nullptr;  // Recovered Colour at full width: the refine per pixel pair (PSAnaPair)
         ID3D11PixelShader*       m_psAnaCompose = nullptr;  // ... and its compose alone (PSAnaCompose), after PSAnaPair
+        ID3D11PixelShader*       m_psPairPlain = nullptr, *m_psAnaComposePlain = nullptr;  // ... both for a source read as it is (SRC_PLAIN)
         // The common formats' own shaders (PSFmt*: Half SBS / Katanga, Full SBS, TAB,
         // row, column, checkerboard, frame packing, anaglyph without Recovered).
         ID3D11PixelShader*       m_psFmt[9] = {};
@@ -351,8 +352,8 @@ namespace srw
         void    CollectTimes();
     public:
         // Average ms per recovery stage since the last call (coarse search,
-        // descriptors, refine, occlusion fill, smoothing, full-res decode,
-        // colour pyramid, colour fill); false if none ran.
+        // descriptors, refine, occlusion fill, smoothing, the full-res pair
+        // refine, the compose; the last is unused); false if none ran.
         bool TakeRecoveryTimes(double ms[kTimeMarks - 1], int& count);
         // For the perf log: what the recovery did with the frames since the last
         // call. Counted only while on (SetChangeStats): two tiny passes and a

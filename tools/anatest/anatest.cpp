@@ -1066,8 +1066,8 @@ int wmain(int argc, wchar_t** argv)
         Sleep(100);
         conv.TakeRecoveryTimes(ms, cnt);
         double tot = 0; for (double v : ms) tot += v;
-        wprintf(L"time (%d frames): down+coarse %.2f, desc %.2f, refine %.2f, fill %.2f, smooth %.2f, compose %.2f, -, - | total %.2f ms\n",
-                cnt, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], tot);
+        wprintf(L"time (%d frames): down+coarse %.2f, desc %.2f, refine %.2f, fill %.2f, smooth %.2f, pair %.2f, compose %.2f | total %.2f ms\n",
+                cnt, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], tot);
     }
 #endif
 

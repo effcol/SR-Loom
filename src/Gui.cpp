@@ -1956,6 +1956,17 @@ bool Gui::Render(GuiState& state)
             // Anti-crosstalk strength (the weaver's own correction, scaled: Settings
             // WeaverActStrength; the method is in Settings > Advanced).
             {
+                // (A profile can set these four -- ApplyProfile, main.cpp: read
+                // back now and then, but not from under a slider being dragged.)
+                static int s_age = 0;
+                if (s_age-- <= 0 && !ImGui::IsAnyItemActive())
+                {
+                    m_actStrength = Settings::ReadWeaverActStrength();
+                    m_actContrast = Settings::ReadWeaverContrast();
+                    m_actMode     = Settings::ReadWeaverAct();
+                    m_weaverChoice = Settings::ReadWeaverChoice();
+                    s_age = 30;
+                }
                 const float startX  = ImGui::GetCursorPosX();
                 const float labelCol = ImGui::CalcTextSize("Anti-Crosstalk").x + ImGui::GetStyle().ItemSpacing.x * 2;
                 ImGui::AlignTextToFramePadding();
