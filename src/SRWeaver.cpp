@@ -27,6 +27,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include <atomic>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -100,12 +101,15 @@ class SRWeaver::SystemListenerImpl : public SR::SystemEventListener
 {
 public:
     SR::InputStream<SR::SystemEventStream> stream;
+    std::atomic<int> counts[5] = {};
     void accept(const SR::SystemEvent& e) override
     {
         static const char* kNames[] = { "Info", "ContextInvalid", "SRUnavailable", "SRRestored", "USBNotConnected", "USBNotConnectedResolved",
             "DisplayNotConnected", "DisplayNotConnectedResolved", "Duplicated", "DuplicatedResolved", "NonNativeResolution",
             "NonNativeResolutionResolved", "DeviceConnectedAndReady", "DeviceDisconnected", "LensOn", "LensOff", "UserFound", "UserLost" };
         const uint64_t t = (uint64_t)e.eventType;
+        // (Counted for the perf log: 0 viewer lost, 1 found, 2 lens on, 3 lens off, 4 the rest.)
+        counts[t == 17 ? 0 : t == 16 ? 1 : t == 14 ? 2 : t == 15 ? 3 : 4].fetch_add(1);
         Log("SR event: %s (%llu)%s%s", t < sizeof(kNames) / sizeof(kNames[0]) ? kNames[t] : "?", (unsigned long long)t,
             e.message.empty() ? "" : " -- ", e.message.c_str());
     }
@@ -206,7 +210,7 @@ void SRWeaver::SetLatencyUs(uint64_t us)
 // strength a percentage of the display's own amounts. Through the runtime's
 // weaver settings on the standard weavers; on the legacy ones the mode is the
 // weaver choice itself and only the strength applies.
-void SRWeaver::ApplyAct(int mode, int strengthPct)
+void SRWeaver::ApplyAct(int mode, int strengthPct, int contrastPct)
 {
     if (!HasWeaver()) return;
     #pragma warning(push)
@@ -229,14 +233,26 @@ void SRWeaver::ApplyAct(int mode, int strengthPct)
             m_ws->setACTMode(m);
             m_ws->setCrosstalkStaticFactor(m_actDefStatic * k);
             m_ws->setCrosstalkDynamicFactor(m_actDefDynamic * k);
-            Log("Anti-crosstalk: mode %d, static %.4f, dynamic %.4f (the display's own: mode %d, %.4f, %.4f)", (int)m_ws->getACTMode(),
-                m_ws->getCrosstalkStaticFactor(), m_ws->getCrosstalkDynamicFactor(), m_actDefMode, m_actDefStatic, m_actDefDynamic);
+            // (Contrast: the runtime's "weaving contrast", 1.0 as it comes. An
+            // experiment: what it does is to be seen.)
+            m_ws->setContrast((float)contrastPct / 100.0f);
+            Log("Anti-crosstalk: mode %d, static %.4f, dynamic %.4f, contrast %.2f (the display's own: mode %d, %.4f, %.4f)", (int)m_ws->getACTMode(),
+                m_ws->getCrosstalkStaticFactor(), m_ws->getCrosstalkDynamicFactor(), m_ws->getContrast(), m_actDefMode, m_actDefStatic, m_actDefDynamic);
         }
-        else if (m_legacy)   { m_legacy->setCrosstalkStaticFactor(m_actDefStatic * k);   m_legacy->setCrosstalkDynamicFactor(m_actDefDynamic * k); }
-        else if (m_legacy12) { m_legacy12->setCrosstalkStaticFactor(m_actDefStatic * k); m_legacy12->setCrosstalkDynamicFactor(m_actDefDynamic * k); }
+        else if (m_legacy)   { m_legacy->setCrosstalkStaticFactor(m_actDefStatic * k);   m_legacy->setCrosstalkDynamicFactor(m_actDefDynamic * k); m_legacy->setContrast((float)contrastPct / 100.0f); }
+        else if (m_legacy12) { m_legacy12->setCrosstalkStaticFactor(m_actDefStatic * k); m_legacy12->setCrosstalkDynamicFactor(m_actDefDynamic * k); m_legacy12->setContrast((float)contrastPct / 100.0f); }
     }
     catch (...) { Log("Anti-crosstalk: the weaver refused the setting"); }
     #pragma warning(pop)
+}
+
+// The SR system events since the last call, by kind (see SystemListenerImpl).
+// False: none.
+bool SRWeaver::TakeEventCounts(int out[5])
+{
+    bool any = false;
+    for (int i = 0; i < 5; ++i) { out[i] = m_sysListener ? m_sysListener->counts[i].exchange(0) : 0; any = any || out[i] != 0; }
+    return any;
 }
 
 bool SRWeaver::IsLensEnabled() const

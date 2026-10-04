@@ -94,6 +94,7 @@ namespace srw
         bool SetDX12(bool on, bool hdr = false);
         bool WeaveBounds(RECT& out) const;
         bool DisplayIsHdr(float* maxNits = nullptr);
+        void PresentBlank();   // (a see-through frame, for when the weave stops: see Renderer.cpp)
         bool BlitPicture(ID3D11Texture2D* src);   // (see Renderer.cpp)
         bool ReadBackRows(UINT y0, UINT rows, std::vector<uint8_t>& out);   // (see Renderer.cpp)
         // Weave call to picture on the display, as measured since the last call

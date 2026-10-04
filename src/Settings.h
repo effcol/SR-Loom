@@ -171,6 +171,10 @@ namespace srw::Settings
     void WriteWeaverAct(int mode);
     int  ReadWeaverActStrength();
     void WriteWeaverActStrength(int pct);
+    // ... and the weaver's contrast, % of the display's own (0-200; experimental).
+    // HKCU\Software\SRLoom\WeaverContrast.
+    int  ReadWeaverContrast();
+    void WriteWeaverContrast(int pct);
 
     // Diagnostics only (no UI): skip the SR weaver's weave call, to see
     // whether it paces the loop. HKCU\Software\SRLoom\DiagSkipWeave = 1.
@@ -202,4 +206,8 @@ namespace srw::Settings
     // AppsUseLightTheme). The panel and the Looking Glass title bar follow
     // it, and re-read it on WM_SETTINGCHANGE so a live switch is picked up.
     bool ReadSystemUsesLightTheme();
+    // The panel's theme: 0 Auto (as Windows, the default), 1 Light, 2 Dark.
+    // HKCU\Software\SRLoom\ThemeMode.
+    int  ReadThemeMode();
+    void WriteThemeMode(int mode);
 }

@@ -78,7 +78,8 @@ namespace srw
         uint64_t GetLatencyUs() const;
         void     SetLatencyUs(uint64_t us);
         void     ReadLatency();
-        void     ApplyAct(int mode, int strengthPct);   // (anti-crosstalk: see SRWeaver.cpp)
+        bool     TakeEventCounts(int out[5]);   // (SR system events, for the perf log)
+        void     ApplyAct(int mode, int strengthPct, int contrastPct);   // (anti-crosstalk: see SRWeaver.cpp)
         // The lens' slant (a coefficient) and pitch (pixels across), as the runtime
         // reports them; false: not known.
         bool     GetLens(float& slant, float& pitchPx) const;

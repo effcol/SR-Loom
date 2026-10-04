@@ -619,6 +619,31 @@ bool Renderer::BlitPicture(ID3D11Texture2D* src)
     return true;
 }
 
+// One wholly see-through frame, shown now: for when the weave stops. The window
+// is hidden straight after, but its last picture could stay on the screen --
+// seen with the swap chain put straight on the display (UpdateAutoPlane), where
+// hiding the window left the picture standing. So: back to the composed,
+// see-through swap chain if need be, and nothing visible in it. The mask as it
+// was is put back for when weaving starts again.
+void Renderer::PresentBlank()
+{
+    if (!m_dcomp || !m_swapChain) return;
+    const bool all = m_maskAll;
+    const std::vector<RECT> rects = m_maskRects;
+    const std::vector<MaskTracked> tracked = m_maskTracked;
+    const std::vector<MaskCut> excl = m_maskExcl;
+    m_maskAll = false; m_maskRects.clear(); m_maskTracked.clear(); m_maskExcl.clear();
+    for (int i = 0; i < 2; ++i)   // (both buffers of the swap chain)
+    {
+        BindAndClearBackBuffer();   // (nothing to show through any more: leaves the direct mode)
+        m_maskDone = false;
+        Present(false, false);
+    }
+    if (m_p12) m_p12->WaitIdle();
+    m_clearRun = 0;
+    m_maskAll = all; m_maskRects = rects; m_maskTracked = tracked; m_maskExcl = excl;
+}
+
 // The bounds of what the mask leaves visible (client pixels), when that is
 // less than everything: false = all of the window. An empty rect: nothing.
 bool Renderer::WeaveBounds(RECT& out) const

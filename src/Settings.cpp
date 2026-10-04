@@ -245,6 +245,12 @@ namespace srw::Settings
         return v <= 3 ? (int)v : 0;
     }
     void WriteWeaverAct(int mode) { WriteDword(kSettingsKey, L"WeaverAct", (DWORD)(mode >= 0 && mode <= 3 ? mode : 0)); }
+    int ReadWeaverContrast()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"WeaverContrast", 100);
+        return v <= 200 ? (int)v : 100;
+    }
+    void WriteWeaverContrast(int pct) { WriteDword(kSettingsKey, L"WeaverContrast", (DWORD)(pct >= 0 && pct <= 200 ? pct : 100)); }
     int ReadWeaverActStrength()
     {
         const DWORD v = ReadDword(kSettingsKey, L"WeaverActStrength", 100);
@@ -364,6 +370,13 @@ namespace srw::Settings
     {
         WriteDword(kSettingsKey, L"KatangaAutoReceive", enable ? 1u : 0u);
     }
+
+    int ReadThemeMode()
+    {
+        const DWORD v = ReadDword(kSettingsKey, L"ThemeMode", 0);
+        return v <= 2 ? (int)v : 0;
+    }
+    void WriteThemeMode(int mode) { WriteDword(kSettingsKey, L"ThemeMode", (DWORD)(mode >= 0 && mode <= 2 ? mode : 0)); }
 
     bool ReadSystemUsesLightTheme()
     {

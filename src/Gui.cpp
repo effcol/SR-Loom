@@ -250,7 +250,7 @@ namespace
         ImGui::InvisibleButton(id, ImVec2(h, h));
         const bool clicked = ImGui::IsItemClicked();
         const bool hov = ImGui::IsItemHovered();
-        if (hov) ImGui::SetTooltip("Toggle light / dark");
+        if (hov) ImGui::SetTooltip("Theme: Auto, Light or Dark");
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 c(p.x + h * 0.5f, p.y + h * 0.5f);
         const float r = h * 0.30f;
@@ -458,11 +458,14 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     m_lfCentre              = Settings::ReadLfCentre();
     m_lfSpread              = (float)Settings::ReadLfSpread();
     m_actStrength           = Settings::ReadWeaverActStrength();
+    m_actContrast           = Settings::ReadWeaverContrast();
     // Start in Windows' own light/dark app mode. The header's theme button
     // still flips it for the session; a Windows theme change re-syncs it
     // (WM_SETTINGCHANGE below).
     m_systemLightMode = Settings::ReadSystemUsesLightTheme();
-    m_lightMode       = m_systemLightMode;
+    // (... unless Light or Dark was chosen from the theme button: Settings ThemeMode.)
+    m_themeMode       = Settings::ReadThemeMode();
+    m_lightMode       = m_themeMode == 1 ? true : m_themeMode == 2 ? false : m_systemLightMode;
 
     // The GUI renders on its OWN D3D11 device, never the weaver's. The SR runtime
     // drives the weaver's immediate context (including from its own thread while
@@ -1004,7 +1007,23 @@ bool Gui::Render(GuiState& state)
                 }
             }
             ImGui::SetCursorScreenPos(ImVec2(win.x + winW - h - pad, win.y + rowY));
-            if (IconThemeButton("##theme")) { m_lightMode = !m_lightMode; m_pendingRescale = true; }
+            // The theme button: a menu of Auto (as Windows), Light, Dark; the choice is kept.
+            if (IconThemeButton("##theme")) ImGui::OpenPopup("##themeMenu");
+            // (The menu drops from just under the button.)
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y + 2.0f * m_dpiScale));
+            if (ImGui::BeginPopup("##themeMenu"))
+            {
+                static const char* const kTheme[3] = { "Auto", "Light", "Dark" };
+                for (int k = 0; k < 3; ++k)
+                    if (ImGui::MenuItem(kTheme[k], nullptr, m_themeMode == k))
+                    {
+                        m_themeMode = k;
+                        Settings::WriteThemeMode(k);
+                        const bool light = k == 1 ? true : k == 2 ? false : m_systemLightMode;
+                        if (light != m_lightMode) { m_lightMode = light; m_pendingRescale = true; }
+                    }
+                ImGui::EndPopup();
+            }
             headerH = rowY + h;
         }
 
@@ -1828,6 +1847,11 @@ bool Gui::Render(GuiState& state)
                             "it for more depth and more to look around.");
                         if (row("Offset", "lfOff", &m_lfOffset, 0.0f, 1.0f, "%.3f", 0.0f)) Settings::WriteLfOffset(m_lfOffset);
                         tip("Turns the fan of views to the left or right. 0 points its middle straight ahead.");
+                        // (A check of the lens geometry: only here, with the light field on --
+                        // the tracked 3D has no use for it.)
+                        if (ImGui::Checkbox("Alignment pattern", &m_lfPattern)) Settings::WriteLfPattern(m_lfPattern);
+                        tip("Shows red and blue in place of the picture. Sitting centred at the viewing distance, one eye "
+                            "should see the whole screen red and the other blue.");
                     }
                 }
             }
@@ -2658,10 +2682,23 @@ bool Gui::Render(GuiState& state)
                     ImGui::EndCombo();
                 }
             }
-            // The light field's alignment pattern (a check of the lens geometry).
-            if (ImGui::Checkbox("Light field alignment pattern", &m_lfPattern)) Settings::WriteLfPattern(m_lfPattern);
-            tip("With Light Field on: shows red and blue in place of the picture. Sitting centred at the viewing "
-                "distance, one eye should see the whole screen red and the other blue.");
+            // Contrast (experimental): the weaver's own "weaving contrast" (Settings WeaverContrast).
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Contrast");
+                tip("Experimental: the SR weaver's contrast setting. 100% is the display's own.");
+                ImGui::SameLine();
+                const float resetW = ImGui::CalcTextSize("Reset").x + ImGui::GetStyle().FramePadding.x * 2;
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - resetW - ImGui::GetStyle().ItemSpacing.x);
+                float con = (float)m_actContrast;
+                if (ImGui::SliderFloat("##actContrast", &con, 0.0f, 200.0f, "%.0f%%"))
+                {
+                    m_actContrast = (int)(con + 0.5f);
+                    Settings::WriteWeaverContrast(m_actContrast);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset##con", ImVec2(resetW, 0))) { m_actContrast = 100; Settings::WriteWeaverContrast(100); }
+            }
             // Second row: the presenter. Restart needed (the weave window is
             // created for one presenter or the other).
             if (pairToggle2("Fast Presenter", m_directComposition, halfW))
@@ -2892,8 +2929,8 @@ LRESULT Gui::WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (light != g_gui->m_systemLightMode)
             {
                 g_gui->m_systemLightMode = light;
-                g_gui->m_lightMode       = light;
-                g_gui->m_pendingRescale  = true;
+                // (Followed only on Auto: a chosen Light or Dark stays.)
+                if (g_gui->m_themeMode == 0) { g_gui->m_lightMode = light; g_gui->m_pendingRescale = true; }
             }
         }
         break;   // let DefWindowProc see it too

@@ -702,6 +702,8 @@ namespace
         UINT                         lfGeoW = 0;
         float                        lfDistanceCm = 60.0f;     // (Settings LfDistance: where the fans are aimed)
         bool                         lfPattern = false;        // (Settings LfPattern: the alignment pattern)
+        unsigned long long           profilesStamp = 0;        // (profiles.ini as last read: reloaded when it changes)
+        ULONGLONG                    fullscreenExitSinceMs = 0; // (a fullscreen profile's window out of fullscreen since: PollProfileFullscreenState)
         bool                         asyncConvert = true;      // DX12: Recovered Colour converted apart from the weave (Settings AsyncConvert)
         bool                         asyncMode = false;        // (the weave reads the presenter's own picture: conversion apart from the weave)
         double                       asyncWaitMs = 1.2;        // (how long the weave waits for a conversion under way: Settings AsyncWaitUs)
@@ -2494,9 +2496,20 @@ namespace
         if (p.quiltRows > 0) app.quiltRows = p.quiltRows;
         if (p.quiltLeftIdx  >= 0) app.quiltLeftIdx  = p.quiltLeftIdx;
         if (p.quiltRightIdx >= 0) app.quiltRightIdx = p.quiltRightIdx;
+        if (p.useVisualAuto)
+        {
+            // (format=detect: Automatic Detection, as picked in the panel.)
+            app.autoInput = true;
+            app.inputCtxKey = 0;
+            if (app.format == StereoFormat::Katanga) ChangeFormat(app, StereoFormat::HalfSBS);
+            UpdateInputChoice(app);
+        }
+        else
+        {
         app.autoInput = false;   // (the profile says which input)
         if (app.autoStereo) EndAutoStereo(app, "profile applied");
         ChangeFormat(app, effFormat);
+        }
         if (captureHwnd)
         {
             UseWindow(app, captureHwnd);   // sets mode = WindowOverlay
@@ -2616,8 +2629,19 @@ namespace
         if (app.activeFullscreenProfileHwnd)
         {
             HWND h = app.activeFullscreenProfileHwnd;
-            if (!::IsWindow(h) || !IsWindowFullscreen(h))
+            // (Left fullscreen for good, not for a moment: a viewer that drops out
+            // of fullscreen and straight back -- a click, a picture change -- had
+            // the weave switched off under it. It has to stay out for 700 ms.)
+            bool gone = !::IsWindow(h);
+            if (!gone)
             {
+                if (IsWindowFullscreen(h)) app.fullscreenExitSinceMs = 0;
+                else if (app.fullscreenExitSinceMs == 0) app.fullscreenExitSinceMs = GetTickCount64();
+                else if (GetTickCount64() - app.fullscreenExitSinceMs >= 700) gone = true;
+            }
+            if (gone)
+            {
+                app.fullscreenExitSinceMs = 0;
                 const bool stillOurs = app.weavingEnabled &&
                                        app.source == SourceKind::CaptureWindow &&
                                        app.sourceWindow == h;
@@ -3845,6 +3869,9 @@ namespace
             // a few seconds later (see kSrKeepAliveMs): tearing it down and
             // making it again blocked for 60-240 ms each way, so switching
             // weaving off and straight back on is instant this way.
+            // (Nothing left on the screen first: the last woven picture could stay
+            // standing after the window was hidden -- Renderer::PresentBlank.)
+            app.renderer.PresentBlank();
             ShowWindow(app.hwnd, SW_HIDE);
             HideFsCtrlOverlay();
             app.weaver.LensDisable();
@@ -6829,6 +6856,15 @@ namespace
                 app.paceOnCapture = false;   // still screen (or no time): sync to the compositor as usual this loop
             app.prof.lastCaptureWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc0).count();
         }
+        // Weaving may have been switched off meanwhile: the lock is free during the
+        // two waits above, and the window's thread can run SetWeaving(false) in
+        // them (hide the window, lens off). Carrying on from here would show the
+        // window again and present one more woven picture -- left standing on the
+        // screen, the lens off, with nothing to take it away. (Nearly every time
+        // when the weave goes straight to the display: the capture then delivers
+        // only when something changes, and this thread is almost always waiting.)
+        if (!app.weavingEnabled)
+            return;
         g_stall.Mark("render loop");
         app.prof.tWait = std::chrono::steady_clock::now();
         app.gpuTimer.Begin();
@@ -8004,6 +8040,13 @@ namespace
                                     app.weaver.SetLatencyUs((uint64_t)(app.latencyEma * 1000.0));
                                 }
                             }
+                        }
+                        {
+                            // (What the SR runtime reported meanwhile: a late-frame burst
+                            // beside a lost viewer or a lens switch explains itself.)
+                            int ev[5] = {};
+                            if (app.weaver.TakeEventCounts(ev))
+                                Log("  SR events: viewer lost %d, found %d | lens on %d, off %d | other %d", ev[0], ev[1], ev[2], ev[3], ev[4]);
                         }
                         Present12::AsyncStats as;
                         if (app.renderer.IsDX12() && app.renderer.DX12()->TakeAsyncStats(as))
@@ -9501,12 +9544,12 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 }
                 // Anti-crosstalk (panel): applied when it changes, and to a new weaver.
                 {
-                    const int act = Settings::ReadWeaverAct(), pct = Settings::ReadWeaverActStrength();
-                    const int key = app.weaver.HasWeaver() ? (act << 16 | pct) + 1 + (app.weaver.WeaverChoice() << 24) : 0;
+                    const int act = Settings::ReadWeaverAct(), pct = Settings::ReadWeaverActStrength(), con = Settings::ReadWeaverContrast();
+                    const int key = app.weaver.HasWeaver() ? ((act << 18 | pct << 9 | con) + 1 + (app.weaver.WeaverChoice() << 24)) : 0;
                     if (key != app.actApplied)
                     {
                         app.actApplied = key;
-                        if (key && (act != 0 || pct != 100 || app.actTouched)) { app.weaver.ApplyAct(act, pct); app.actTouched = true; }
+                        if (key && (act != 0 || pct != 100 || con != 100 || app.actTouched)) { app.weaver.ApplyAct(act, pct, con); app.actTouched = true; }
                     }
                 }
                 app.lfOn = Settings::ReadLightField();
@@ -9520,6 +9563,23 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 app.lfSpread = Settings::ReadLfSpread() / 100.0f;
                 app.lfDistanceCm = Settings::ReadLfDistance();
                 app.lfPattern = Settings::ReadLfPattern();
+                // profiles.ini edited outside SR Loom: read again (checked about once a second).
+                {
+                    static ULONGLONG s_profCheck = 0;
+                    if (GetTickCount64() - s_profCheck > 1000)
+                    {
+                        s_profCheck = GetTickCount64();
+                        const unsigned long long st = Profiles::FileStamp();
+                        if (app.profilesStamp == 0) app.profilesStamp = st;
+                        else if (st != 0 && st != app.profilesStamp)
+                        {
+                            app.profilesStamp = st;
+                            app.profiles = Profiles::Load();
+                            app.lastAutoAppliedTitle.clear();
+                            Log("Profiles: profiles.ini changed -- read again");
+                        }
+                    }
+                }
                 app.perfLog = Settings::ReadPerfLog();
                 app.renderer.SetLatencyStats(app.perfLog);
                 app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
@@ -10132,6 +10192,18 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // default tick -- which held the weave to ~64 frames/s on any display.
     // (Windows 10 2004+ applies this to SR Loom only, not system-wide.)
     timeBeginPeriod(1);
+    // ... and Windows told to honour it for this process whatever its windows
+    // are doing. Windows 11 ignores a process's timer resolution (and may slow
+    // it down) when it thinks its windows aren't in view -- SR Loom's panel is
+    // usually hidden in the tray -- and a 1 ms sleep then takes 15.6 ms: the
+    // render loop stalling for a refresh or two, seen in a tester's log at
+    // 165 Hz. (Not on Windows 10: the call fails, harmlessly.)
+    {
+        struct PowerThrottling { ULONG Version; ULONG ControlMask; ULONG StateMask; };
+        PowerThrottling pt{ 1, 0x1 | 0x4, 0 };   // (EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION: neither applied)
+        const BOOL ok = SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)4 /* ProcessPowerThrottling */, &pt, sizeof(pt));
+        Log("WinMain: timer resolution 1 ms, kept when out of view: %s", ok ? "yes" : "not available");
+    }
 
     // The thread that runs the render loop: ahead of normal-priority work (and
     // well ahead of the Auto Stereo scanner) so it isn't made to skip frames,

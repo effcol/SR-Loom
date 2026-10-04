@@ -183,6 +183,7 @@ namespace srw
         bool                     m_imguiReady = false;
         bool                     m_lightMode = false;   // false = warm dark, true = sepia/cream
         bool                     m_systemLightMode = false;   // Windows' app mode, last read
+        int                      m_themeMode = 0;       // Settings ThemeMode: 0 Auto (as Windows), 1 Light, 2 Dark
         // Sticky flag set if the font-atlas rebuild ever faults. Once set,
         // later ApplyScaling calls skip the font rebuild and only rescale
         // the style, keeping the built-in-font atlas RecoverFontsAfterCrash
@@ -233,6 +234,7 @@ namespace srw
         bool                     m_lfCentre = false;               // Settings LfCentre
         float                    m_lfPitch = 1.8f, m_lfSlant = 0.3f, m_lfOffset = 0.0f;
         int                      m_actStrength           = 100;    // Settings WeaverActStrength (% of the display's own amount)
+        int                      m_actContrast           = 100;    // Settings WeaverContrast (% of the display's own: experimental)
         // Inline state for the About popup's "Check for updates" link.
         // Idle by default; switches to Checking on click, then settles to
         // UpToDate / Available / Failed when WM_APP_UPDATE_RESULT lands.

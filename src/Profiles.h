@@ -42,6 +42,9 @@ namespace srw
         // in the same viewer/player.
         StereoFormat format         = StereoFormat::HalfSBS;
         bool         useAutoFormat  = false;
+        // format=detect: SR Loom's Automatic Detection (it looks at the picture
+        // itself for the layout) instead of a fixed format or the title.
+        bool         useVisualAuto  = false;
         StereoFormat defaultFormat  = StereoFormat::HalfSBS;
         bool         swapEyes     = false;
         float        convergence  = 0.0f;
@@ -81,6 +84,9 @@ namespace srw
         // Load the profile list from %LOCALAPPDATA%\SRLoom\profiles.ini.
         // Returns empty vector if the file doesn't exist or fails to parse.
         std::vector<Profile> Load();
+        // When profiles.ini was last written (0: no file): for reading it again
+        // when it is edited outside SR Loom.
+        unsigned long long FileStamp();
 
         // Persist the list back to disk. Overwrites the file. Creates the
         // directory if missing. Logs on I/O failure. SPARSE -- writes only

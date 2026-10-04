@@ -330,6 +330,14 @@ namespace srw::Profiles
         return StereoFormat::HalfSBS;   // safe default; caller sees detected=false
     }
 
+    unsigned long long FileStamp()
+    {
+        const std::wstring path = ProfilesPath();
+        WIN32_FILE_ATTRIBUTE_DATA d{};
+        if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return 0;
+        return ((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
+    }
+
     std::vector<Profile> Load()
     {
         std::vector<Profile> out;
@@ -371,8 +379,11 @@ namespace srw::Profiles
             else if (key == "fullscreen")           cur.fullscreenOnly = toBool(val);
             else if (key == "format")
             {
-                if (val == "auto" || val == "Auto" || val == "AUTO")
+                const std::string lv = ToLower(val);
+                if (lv == "auto" || lv == "title")
                     cur.useAutoFormat = true;
+                else if (lv == "detect" || lv == "visual")
+                    cur.useVisualAuto = true;
                 else
                     cur.format = FormatFromString(val);
             }
@@ -437,16 +448,34 @@ namespace srw::Profiles
              "#                 fullscreen. Default 0 = apply on any focus.\n"
              "#\n"
              "# Format keys:\n"
-             "#   format=auto                    detect from title (HSBS, HTAB, _2x1,\n"
-             "#                                  MVC, anaglyph, etc.); fall back to\n"
-             "#                                  defaultformat if nothing recognised.\n"
+             "#   format=auto                    work the format out from the window TITLE\n"
+             "#                                  (HSBS, HTAB, _2x1, MVC, anaglyph, etc.);\n"
+             "#                                  falls back to defaultformat if nothing is\n"
+             "#                                  recognised. (format=title means the same.)\n"
+             "#   format=detect                  SR Loom's Automatic Detection: it looks at\n"
+             "#                                  the PICTURE for the layout (experimental).\n"
              "#   format=<id>                    always use this format for this profile.\n"
              "#   defaultformat=<id>             only used when format=auto and no token\n"
              "#                                  is recognised in the current title.\n"
              "# Format ids: FullSBS HalfSBS FullTAB HalfTAB Anaglyph\n"
              "#   RowInterleaved ColumnInterleaved Checkerboard FrameSequential\n"
              "#   Pulfrich FramePacking Quilt VR180TAB VR180SBS VR360TAB VR360SBS\n"
-             "#   LightField\n"
+             "#   LightField RGBD\n"
+             "#\n"
+             "# Picture keys (all optional):\n"
+             "#   swap_eyes=1                    left and right eyes exchanged.\n"
+             "#   convergence=-0.150             the Convergence slider (-2 to 2).\n"
+             "#   anaglyph_combo=0..6            the anaglyph colour pair, in the order of\n"
+             "#                                  the panel's list (0 = red / cyan).\n"
+             "#   anaglyph_mode=0..5             how an anaglyph is decoded (4 = Recovered\n"
+             "#                                  Colour, the default).\n"
+             "#   pulfrich_mode= pulfrich_delay= pulfrich_nd=   the Pulfrich settings.\n"
+             "#   frame_pack_mode=               the Frame Packing preset.\n"
+             "#   quilt_cols= quilt_rows=        a Quilt's grid of views.\n"
+             "#   quilt_left= quilt_right=       which two views of the Quilt the left and\n"
+             "#                                  right eyes are shown (counted from 0, the\n"
+             "#                                  bottom-left view). Written by Save when\n"
+             "#                                  they differ from the default.\n"
              "#\n"
              "# Only fields you customised are written. Unset fields use SR Loom's\n"
              "# defaults. Order inside a section doesn't matter.\n"
@@ -454,7 +483,11 @@ namespace srw::Profiles
              "# include_head_tracking=1 makes the profile also re-apply the\n"
              "# OpenTrack / FreeTrack / TrackIR + output-mode + per-axis invert\n"
              "# state stored in the ht_* fields below. Default 0 leaves head\n"
-             "# tracking alone.\n\n";
+             "# tracking alone. The ht_ keys: ht_opentrack ht_freetrack ht_trackir (0/1),\n"
+             "# ht_output_mode, ht_invert_x ht_invert_y ht_invert_z ht_invert_yaw\n"
+             "# ht_invert_pitch ht_invert_roll (0/1).\n"
+             "#\n"
+             "# This file is read again by itself when it is changed while SR Loom runs.\n\n";
 
         // Sparse writer: emit only fields that differ from Profile{} defaults.
         // Keeps the file readable + matches NTM's compact example style. The
@@ -471,7 +504,9 @@ namespace srw::Profiles
             // only record of the user's fixed format while Auto is on (the
             // toggle seeds it from `format`, and turning Auto off restores
             // `format` from it), so keep it visible in the file.
-            if (p.useAutoFormat)
+            if (p.useVisualAuto)
+                f << "format=detect\n";
+            else if (p.useAutoFormat)
             {
                 f << "format=auto\n";
                 f << "defaultformat=" << FormatToString(p.defaultFormat) << "\n";
