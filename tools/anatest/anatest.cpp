@@ -71,6 +71,7 @@ static void RawCompare(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Textur
     ID3D11ShaderResourceView* raw = nullptr; dev->CreateShaderResourceView(tex, &vd, &raw);
     Converter a, b; a.Initialize(dev, ctx); b.Initialize(dev, ctx);
     setup(a); setup(b);
+    if (const char* cvg = getenv("ANATEST_CONV")) { a.SetConvergence((float)atof(cvg)); b.SetConvergence((float)atof(cvg)); }
     b.SetSourceEncoded(true);
     bool rs = false;
     a.Convert(srgbView, w, h, rs); a.Convert(srgbView, w, h, rs);
@@ -613,9 +614,9 @@ int wmain(int argc, wchar_t** argv)
             sd2.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; sd2.Usage = D3D11_USAGE_DEFAULT; sd2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             D3D11_SUBRESOURCE_DATA sdd{ s.data(), (UINT)c.sw * 4, 0 };
             ID3D11Texture2D* t2 = nullptr; dev->CreateTexture2D(&sd2, &sdd, &t2);
-            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = encodedSrc ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
             ID3D11ShaderResourceView* v2 = nullptr; dev->CreateShaderResourceView(t2, &vd2, &v2);
-            Converter cv; cv.Initialize(dev, ctx);
+            Converter cv; cv.Initialize(dev, ctx); cv.SetSourceEncoded(encodedSrc); if (const char* cvg = getenv("ANATEST_CONV")) cv.SetConvergence((float)atof(cvg));
             if (getenv("ANATEST_NOCS")) cv.SetComputeBothEyes(false);
             cv.SetFormat(c.f, false, 0, 4);
             if (c.f == StereoFormat::FramePacking) cv.SetFramePacking((float)h / c.sh, (float)(c.sh - 2 * (int)h) / c.sh, 0.0f);
@@ -671,14 +672,14 @@ int wmain(int argc, wchar_t** argv)
             sd2.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS; sd2.Usage = D3D11_USAGE_DEFAULT; sd2.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             D3D11_SUBRESOURCE_DATA sdd{ a.data(), w * 4, 0 };
             ID3D11Texture2D* t2 = nullptr; dev->CreateTexture2D(&sd2, &sdd, &t2);
-            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd2{}; vd2.Format = encodedSrc ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; vd2.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; vd2.Texture2D.MipLevels = 1;
             ID3D11ShaderResourceView* v2 = nullptr; dev->CreateShaderResourceView(t2, &vd2, &v2);
             struct M { const char* name; int mode; bool skip; };
             const M ms[] = { { "anaglyph DeAnaglyph", 0, false }, { "anaglyph Filtered", 1, false }, { "anaglyph Half Colour", 2, false },
                              { "anaglyph Mono", 3, false }, { "Recovered, all redrawn", 4, false }, { "Recovered, still page", 4, true } };
             for (const M& m : ms)
             {
-                Converter cv; cv.Initialize(dev, ctx);
+                Converter cv; cv.Initialize(dev, ctx); cv.SetSourceEncoded(encodedSrc); if (const char* cvg = getenv("ANATEST_CONV")) cv.SetConvergence((float)atof(cvg));
                 if (getenv("ANATEST_NOCS")) cv.SetComputeBothEyes(false);
                 cv.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
                 cv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);
@@ -701,6 +702,49 @@ int wmain(int argc, wchar_t** argv)
                         x.SetFormat(StereoFormat::Anaglyph, false, 0, m.mode);
                         x.SetChangeSkip(m.skip); });
             }
+            // The formats that had no shader of their own: their GPU time.
+            {
+                struct F { const char* name; StereoFormat f; int kind; };
+                const F fs[] = { { "Pulfrich (ND filter)", StereoFormat::Pulfrich, 1 }, { "Pulfrich (time delay)", StereoFormat::Pulfrich, 2 },
+                                 { "frame sequential", StereoFormat::FrameSequential, 0 }, { "360 (VR180 SBS)", StereoFormat::VR180SBS, 0 },
+                                 { "360 (VR360 TAB)", StereoFormat::VR360TAB, 0 }, { "RGB + depth", StereoFormat::RGBD, 3 }, { "RGB + depth, side found", StereoFormat::RGBD, 4 } };
+                for (const F& m : fs)
+                {
+                    Converter cv; cv.Initialize(dev, ctx); cv.SetSourceEncoded(encodedSrc); if (const char* cvg = getenv("ANATEST_CONV")) cv.SetConvergence((float)atof(cvg));
+                    cv.SetFormat(m.f, false, 0, 4);
+                    if (m.kind == 1) cv.SetPulfrich(PulfrichMode::NDFilter, 0, 0.25f, 1);
+                    if (m.kind == 2) cv.SetPulfrich(PulfrichMode::TimeDelay, 0, 1.0f, 2);
+                    if (m.kind == 3) { cv.SetVRView(0.0f, 0.02f, 1.0f); cv.SetFramePacking(0.5f, 1.0f, 0.0f); cv.SetQuilt(4, 1, 0, 0); }
+                    if (m.kind == 4) { cv.SetVRView(0.0f, 0.02f, 1.0f); cv.SetFramePacking(0.5f, 1.0f, 0.0f); cv.SetQuilt(8, 1, 0, 0); }
+                    bool r2 = false; cv.Convert(v2, (int)w, (int)h, r2); cv.Convert(v2, (int)w, (int)h, r2);
+                    D3D11_QUERY_DESC dq{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }, tq{ D3D11_QUERY_TIMESTAMP, 0 };
+                    ID3D11Query *dj = nullptr, *q0 = nullptr, *q1 = nullptr;
+                    dev->CreateQuery(&dq, &dj); dev->CreateQuery(&tq, &q0); dev->CreateQuery(&tq, &q1);
+                    ctx->Begin(dj); ctx->End(q0);
+                    for (int k = 0; k < 40; ++k) { cv.SetSourceVersion(0); cv.Convert(v2, (int)w, (int)h, r2); }
+                    ctx->End(q1); ctx->End(dj);
+                    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{}; UINT64 x0 = 0, x1 = 0;
+                    while (ctx->GetData(dj, &dd, sizeof(dd), 0) != S_OK) Sleep(1);
+                    ctx->GetData(q0, &x0, sizeof(x0), 0); ctx->GetData(q1, &x1, sizeof(x1), 0);
+                    if (!dd.Disjoint && dd.Frequency) wprintf(L"%-24S GPU %.3f ms per conversion\n", m.name, (double)(x1 - x0) / dd.Frequency * 1000.0 / 40.0);
+                    // (ANATEST_SUM: a checksum of the output, to tell a changed picture from the same one.)
+                    if (getenv("ANATEST_SUM"))
+                    {
+                        ID3D11Resource* r = nullptr; cv.OutputSRV()->GetResource(&r);
+                        ID3D11Texture2D* ot = nullptr; r->QueryInterface(&ot); r->Release();
+                        D3D11_TEXTURE2D_DESC od{}; ot->GetDesc(&od);
+                        od.Usage = D3D11_USAGE_STAGING; od.BindFlags = 0; od.CPUAccessFlags = D3D11_CPU_ACCESS_READ; od.MiscFlags = 0;
+                        ID3D11Texture2D* st = nullptr; dev->CreateTexture2D(&od, nullptr, &st);
+                        ctx->CopyResource(st, ot); ot->Release();
+                        D3D11_MAPPED_SUBRESOURCE mm{}; ctx->Map(st, 0, D3D11_MAP_READ, 0, &mm);
+                        uint64_t sum = 1469598103934665603ull;
+                        for (UINT y = 0; y < od.Height; ++y) { const uint8_t* p = (const uint8_t*)mm.pData + (size_t)y * mm.RowPitch; for (UINT x = 0; x < od.Width * 4; ++x) { sum ^= p[x]; sum *= 1099511628211ull; } }
+                        ctx->Unmap(st, 0); st->Release();
+                        wprintf(L"%-24S output %ux%u checksum %016llx\n", m.name, od.Width, od.Height, (unsigned long long)sum);
+                    }
+                    dj->Release(); q0->Release(); q1->Release(); cv.Shutdown();
+                }
+            }
             v2->Release(); t2->Release();
         }
         return 0;
@@ -710,6 +754,8 @@ int wmain(int argc, wchar_t** argv)
     conv.SetHalfWidthEyes(getenv("ANATEST_HALFEYES") != nullptr);   // (full-width eyes: the measurements below assume them)
     conv.SetSourceEncoded(encodedSrc);
     if (getenv("ANATEST_NOSKIP")) conv.SetChangeSkip(false);   // (every frame redrawn whole: worst-case timing)
+    if (getenv("ANATEST_NOCSREC")) conv.SetComputeRecover(false);   // (Recovered Colour's compose by the pixel shader)
+    if (getenv("ANATEST_NOVIDEO")) conv.SetVideoAuto(false);   // (block-by-block tracking kept even while the whole picture changes)
     if (getenv("ANATEST_NOPAIR")) conv.SetPairRefine(false);   // (full-width Recovered Colour: refine per pixel, not per pair)
     if (getenv("ANATEST_NOSCROLL")) conv.SetScrollReuse(false);   // (a scrolled block redrawn, not last frame's moved)
     if (getenv("ANATEST_NOPYRSKIP")) conv.SetPyramidSkip(false);   // (the 1/4 passes in full whenever anything changed)
@@ -801,7 +847,9 @@ int wmain(int argc, wchar_t** argv)
     if (const char* nt = getenv("ANATEST_NOISETEST"))
     {
         int nn = 20, amp = 2; sscanf_s(nt, "%d,%d", &nn, &amp);
-        conv.SetChangeSkip(false);
+        // (ANATEST_NOISESKIP: the change tracking left on -- with enough noise every block changes every frame, as video.)
+        if (!getenv("ANATEST_NOISESKIP")) conv.SetChangeSkip(false);
+        { double t0[8]; int c0; conv.TakeRecoveryTimes(t0, c0); }
         auto readEye = [&]() {
             ID3D11Resource* r = nullptr; conv.OutputSRV()->GetResource(&r);
             ID3D11Texture2D* t = nullptr; r->QueryInterface(&t); r->Release();
@@ -842,6 +890,12 @@ int wmain(int argc, wchar_t** argv)
                 all += (double)ca / (w * h); dark += nDark ? (double)cd / nDark : 0; ++cmp;
             }
             prev.swap(cur);
+        }
+        {
+            uint64_t sum = 1469598103934665603ull; for (uint8_t b : prev) { sum ^= b; sum *= 1099511628211ull; }
+            ctx->Flush(); Sleep(200); { bool rs4 = false; conv.Convert(srv, (int)w, (int)h, rs4); }
+            double tm[8] = {}; int tc = 0; conv.TakeRecoveryTimes(tm, tc); double tot = 0; for (double v : tm) tot += v;
+            wprintf(L"noise test: last output checksum %016llx | video mode %d | recovery %.2f ms a frame (first stage %.2f, %d timed)\n", (unsigned long long)sum, conv.IsVideoMode() ? 1 : 0, tot, tm[0], tc);
         }
         wprintf(L"noise test (%d frames, +-%d): flicker %.3f%% of pixels a frame, %.3f%% of the dark ones (%.0f%% of the picture is dark)\n",
                 nn, amp, 100.0 * all / (std::max)(cmp, 1), 100.0 * dark / (std::max)(cmp, 1), 100.0 * nDark / ((double)w * h));
@@ -886,6 +940,7 @@ int wmain(int argc, wchar_t** argv)
         bool rs = false;
         conv.SetChangeStats(true);
         double ms[8] = {}; int cnt = 0;
+        double fs[4] = {};
         conv.TakeRecoveryTimes(ms, cnt);
         for (int f = 0; f < cn; ++f)
         {
@@ -1061,13 +1116,16 @@ int wmain(int argc, wchar_t** argv)
     {
         const int n = atoi(tn);
         double ms[8] = {}; int cnt = 0;
+        double fs[4] = {};
         conv.TakeRecoveryTimes(ms, cnt);
         for (int i = 0; i < n; ++i) { conv.Convert(srv, (int)w, (int)h, resized); ctx->Flush(); if (i % 8 == 7) Sleep(20); }
         Sleep(100);
+        conv.TakeFirstStageTimes(fs);
         conv.TakeRecoveryTimes(ms, cnt);
         double tot = 0; for (double v : ms) tot += v;
         wprintf(L"time (%d frames): down+coarse %.2f, desc %.2f, refine %.2f, fill %.2f, smooth %.2f, pair %.2f, compose %.2f | total %.2f ms\n",
                 cnt, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], tot);
+        wprintf(L"  (the first stage: check for change %.2f, copies %.2f, averaging down %.2f, the rest %.2f)\n", fs[0], fs[1], fs[2], fs[3]);
     }
 #endif
 

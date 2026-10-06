@@ -20,12 +20,26 @@
 #include "Converter_PSAnaCompose.h"
 #include "Converter_PSAnaPairPlain.h"
 #include "Converter_PSAnaComposePlain.h"
+#include "Converter_PSDownPlain.h"
+#include "Converter_PSDownFlatPlain.h"
+#include "Converter_PSAnaDescPlain.h"
+#include "Converter_PSAnaDescCoarsePlain.h"
+#include "Converter_PSAnaFillPlain.h"
+#include "Converter_PSAnaSmoothPlain.h"
 #include "Converter_PSFmtAnaglyph.h"
 #include "Converter_PSFmtQuilt.h"
+#include "Converter_PSFmtPulfrich.h"
+#include "Converter_PSFmtSequential.h"
+#include "Converter_PSFmtVR.h"
+#include "Converter_PSFmtRgbd.h"
+#include "Converter_PSFmtCopy.h"
+#include "Converter_PSRgbdSide.h"
 #include "Converter_CSFmtAnaglyph.h"
 #include "Converter_CSFmtChecker.h"
 #include "Converter_CSFmtColumn.h"
 #include "Converter_CSFmtRow.h"
+#include "Converter_CSAnaCompose.h"
+#include "Converter_CSAnaComposePlain.h"
 #include "Converter_PSQuiltH.h"
 #include "Converter_PSFmtFramePack.h"
 #include "Converter_PSFmtChecker.h"
@@ -165,6 +179,12 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
         { g_Converter_PSAnaComposePlain, sizeof(g_Converter_PSAnaComposePlain), &m_psAnaComposePlain },
         { g_Converter_PSFmtAnaglyph, sizeof(g_Converter_PSFmtAnaglyph), &m_psFmt[7] },
         { g_Converter_PSFmtQuilt, sizeof(g_Converter_PSFmtQuilt), &m_psFmt[8] },
+        { g_Converter_PSFmtPulfrich, sizeof(g_Converter_PSFmtPulfrich), &m_psFmt[9] },
+        { g_Converter_PSFmtSequential, sizeof(g_Converter_PSFmtSequential), &m_psFmt[10] },
+        { g_Converter_PSFmtVR, sizeof(g_Converter_PSFmtVR), &m_psFmt[11] },
+        { g_Converter_PSFmtRgbd, sizeof(g_Converter_PSFmtRgbd), &m_psFmt[12] },
+        { g_Converter_PSFmtCopy, sizeof(g_Converter_PSFmtCopy), &m_psFmt[13] },   // (the history copy)
+        { g_Converter_PSRgbdSide, sizeof(g_Converter_PSRgbdSide), &m_psRgbdSide },
         { g_Converter_PSQuiltH, sizeof(g_Converter_PSQuiltH), &m_psQuiltH },
         { g_Converter_PSFmtFramePack, sizeof(g_Converter_PSFmtFramePack), &m_psFmt[6] },
         { g_Converter_PSFmtChecker, sizeof(g_Converter_PSFmtChecker), &m_psFmt[5] },
@@ -195,6 +215,23 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
     };
     for (const auto& p : ps)
         if (SUCCEEDED(hr)) hr = device->CreatePixelShader(p.code, p.size, nullptr, p.out);
+    // (The rest of the recovery's passes that read a source, compiled for one
+    // that needs no decoding -- SRC_PLAIN: used whenever that is so, PlainOf.)
+    {
+        struct { const void* code; size_t size; ID3D11PixelShader* base; } pl[kPlain] = {
+            { g_Converter_PSDownPlain,          sizeof(g_Converter_PSDownPlain),          m_psDown },
+            { g_Converter_PSDownFlatPlain,      sizeof(g_Converter_PSDownFlatPlain),      m_psDownFlat },
+            { g_Converter_PSAnaDescPlain,       sizeof(g_Converter_PSAnaDescPlain),       m_psDesc },
+            { g_Converter_PSAnaDescCoarsePlain, sizeof(g_Converter_PSAnaDescCoarsePlain), m_psDescCoarse },
+            { g_Converter_PSAnaFillPlain,       sizeof(g_Converter_PSAnaFillPlain),       m_psFill },
+            { g_Converter_PSAnaSmoothPlain,     sizeof(g_Converter_PSAnaSmoothPlain),     m_psSmooth },
+        };
+        if (SUCCEEDED(hr)) for (int k = 0; k < kPlain; ++k)
+        {
+            m_plain[k].base = pl[k].base;
+            if (FAILED(device->CreatePixelShader(pl[k].code, pl[k].size, nullptr, &m_plain[k].plain))) m_plain[k].plain = nullptr;
+        }
+    }
     // (The both-eyes compute shaders: optional -- without them, the pixel shaders.)
     {
         struct { const void* code; size_t size; ID3D11ComputeShader** out; } cs[] = {
@@ -202,6 +239,8 @@ bool Converter::Initialize(ID3D11Device* device, ID3D11DeviceContext* context)
             { g_Converter_CSFmtChecker,  sizeof(g_Converter_CSFmtChecker),  &m_cs[1] },
             { g_Converter_CSFmtColumn,   sizeof(g_Converter_CSFmtColumn),   &m_cs[2] },
             { g_Converter_CSFmtRow,      sizeof(g_Converter_CSFmtRow),      &m_cs[3] },
+            { g_Converter_CSAnaCompose,  sizeof(g_Converter_CSAnaCompose),  &m_cs[4] },   // (Recovered Colour's compose, both eyes)
+            { g_Converter_CSAnaComposePlain, sizeof(g_Converter_CSAnaComposePlain), &m_cs[5] },   // (... for a source read as it is)
         };
         if (SUCCEEDED(hr)) for (const auto& c : cs) if (FAILED(device->CreateComputeShader(c.code, c.size, nullptr, c.out))) *c.out = nullptr;
     }
@@ -407,7 +446,10 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     // Temporal formats need the frame-history ring: Pulfrich (delayed/ND eye) and
     // Frame-sequential (the previous frame IS the other eye).
     const bool pulfrich = (m_fmt == StereoFormat::Pulfrich);
-    const bool temporal = pulfrich || (m_fmt == StereoFormat::FrameSequential);
+    // (Pulfrich by ND filter darkens one eye of the frame as it is: no earlier
+    // frame is read, so none is kept -- it used to copy every frame into the
+    // ring all the same, and hold six frames of memory for nothing.)
+    const bool temporal = (pulfrich && m_pulfMode == PulfrichMode::TimeDelay) || (m_fmt == StereoFormat::FrameSequential);
     if (!temporal) ReleaseHistory();   // free the ring when not needed
 
     // Same picture, same settings as the last conversion: its output still
@@ -664,6 +706,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             cb.anaMaskL[c] = m_anaMaskL[c]; cb.anaMaskR[c] = m_anaMaskR[c]; cb.anaWL[c] = m_anaWL[c]; cb.anaWR[c] = m_anaWR[c];
             cb.anaTL[c] = m_anaTL[c]; cb.anaTR[c] = m_anaTR[c];
             cb.anaWL[3] = (float)m_anaChanL; cb.anaWR[3] = (float)m_anaChanR;
+        cb.anaTL[3] = (m_hdr && m_hdrScale > 1.0f) ? 1.0f / m_hdrScale : 0.0f;   // (HDR: the output brought down into 0..1 for the weave -- Opaque, Converter.hlsl)
         }
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &cb, 0, 0);
     };
@@ -706,7 +749,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
     {
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)rt.w; vp.Height = (FLOAT)rt.h; vp.MaxDepth = 1.0f;
-        m_context->PSSetShader(ps, nullptr, 0);
+        m_context->PSSetShader(decode < 0.5f ? PlainOf(ps) : ps, nullptr, 0);
         m_context->OMSetRenderTargets(1, &rt.rtv, nullptr);
         m_context->RSSetViewports(1, &vp);
         ID3D11ShaderResourceView* srvs[3] = { src, nullptr, prior };
@@ -732,7 +775,18 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         const float zero4[4] = {};
         // (For the perf log, TakeChangeStats: cleared outside any predicate -- a
         // frame where nothing changed reads all 0.)
-        statsNow = m_statsOn && m_psStatRows && m_psStat &&
+        // Video: where nearly the whole picture changes frame after frame, working
+        // out which blocks changed finds nothing to leave out -- some ten small
+        // passes for nothing. Seen from the share redrawn (CollectStats, looked at
+        // every fourth frame); then the blocks are left alone and the frame drawn
+        // whole -- what they stand in for -- with one frame in 32 still looked at
+        // to see whether it has stopped. The check of the frame as a whole stays:
+        // a frame that is the last one again is still skipped.
+        const unsigned videoTick = m_videoTick++;
+        const bool videoSkip = m_videoAuto && m_videoMode && directSrc && !scrollWanted && (videoTick % 32) != 0;
+        const bool videoWatch = m_videoAuto && directSrc && !videoSkip && (m_videoMode || (videoTick % 4) == 0);
+        bool prePredOn = false;   // (the frame is drawn under the whole-frame check's predicate)
+        statsNow = (m_statsOn || videoWatch) && m_psStatRows && m_psStat &&
                    (EnsureDispTarget(m_statRows, 1, h16, DXGI_FORMAT_R32G32B32A32_FLOAT), m_statRows.rtv) &&
                    (EnsureDispTarget(m_stat, 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT), m_stat.rtv);
         if (statsNow) m_context->ClearRenderTargetView(m_stat.rtv, zero4);
@@ -760,11 +814,15 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                 ID3D11ShaderResourceView* nul = nullptr;
                 m_context->PSSetShaderResources(8, 1, &nul);
                 m_context->SetPredication(m_prePred, FALSE);
+                prePredOn = true;
             }
+            if (tSlot >= 0) SubMark(tSlot, 0);   // (the check for change done; the copies next)
             m_context->CopyResource(m_enc4Prev.tex, m_enc4.tex);
             m_context->CopyResource(m_workTex, directTex);
+            if (tSlot >= 0) SubMark(tSlot, 1);
             m_encPrevValid = true;
         }
+        else if (tSlot >= 0) { SubMark(tSlot, 0); SubMark(tSlot, 1); }
         // The source averaged down to 1/4 and 1/16: what the passes below read.
         decode = srcDecode; uploadCB((float)w4, (float)h4);
         // (... and the 1/4 level's plain grey texels with it, shrunk: PSDownFlat /
@@ -776,7 +834,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         {
             D3D11_VIEWPORT vp{}; vp.Width = (FLOAT)w4; vp.Height = (FLOAT)h4; vp.MaxDepth = 1.0f;
             ID3D11RenderTargetView* rt[2] = { m_src4.rtv, m_flat4.rtv };
-            m_context->PSSetShader(m_psDownFlat, nullptr, 0);
+            m_context->PSSetShader(decode < 0.5f ? PlainOf(m_psDownFlat) : m_psDownFlat, nullptr, 0);
             m_context->OMSetRenderTargets(2, rt, nullptr);
             m_context->RSSetViewports(1, &vp);
             m_context->PSSetShaderResources(0, 1, &source);
@@ -790,6 +848,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         runDispPass(m_psDown, m_src4,  nullptr, source);
         decode = 0.0f; uploadCB((float)w4, (float)h4);
         runDispPass(m_psDown, m_src16, nullptr, m_src4.srv);
+        if (tSlot >= 0) SubMark(tSlot, 2);   // (averaged down, the plain grey found)
         // (The frame the check is judging: the boxes' reference, once they come.)
         if (m_snapRequested && m_snapPending.tex)
         {
@@ -837,6 +896,8 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             D3D11_QUERY_DESC pd{ D3D11_QUERY_OCCLUSION_PREDICATE, 0 };
             m_device->CreatePredicate(&pd, &m_changePred);
         }
+        if (videoSkip && prePredOn) m_outPred = m_prePred;   // (video: drawn whole, under that predicate alone)
+        else
         if (m_changeSkipOn && m_changeValid && sameSettings && !(boxesNew && !boxesNow) && !outputResized && m_dispPrevValid && m_changePred &&
             m_psChange && m_psChangeGrow && m_change.rtv && m_changeGrow.rtv)
         {
@@ -938,7 +999,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             // source px along a row (PSAnaDescCoarse), read by PSAnaDisp at t3-t6.
             D3D11_VIEWPORT vp{};
             vp.Width = (FLOAT)m_descCoarse.w; vp.Height = (FLOAT)m_descCoarse.h; vp.MaxDepth = 1.0f;
-            m_context->PSSetShader(m_psDescCoarse, nullptr, 0);
+            m_context->PSSetShader(decode < 0.5f ? PlainOf(m_psDescCoarse) : m_psDescCoarse, nullptr, 0);
             m_context->OMSetRenderTargets(4, m_descCoarse.rtv, nullptr);
             m_context->RSSetViewports(1, &vp);
             m_context->PSSetShaderResources(0, 1, &m_src16.srv);
@@ -959,7 +1020,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             // Gradient descriptors of every 1/4 pixel, once (read by the refine).
             D3D11_VIEWPORT vp{};
             vp.Width = (FLOAT)w4; vp.Height = (FLOAT)h4; vp.MaxDepth = 1.0f;
-            m_context->PSSetShader(m_psDesc, nullptr, 0);
+            m_context->PSSetShader(decode < 0.5f ? PlainOf(m_psDesc) : m_psDesc, nullptr, 0);
             m_context->OMSetRenderTargets(4, m_descRTV, nullptr);
             m_context->RSSetViewports(1, &vp);
             m_context->PSSetShaderResources(0, 1, &m_src4.srv);   // (the 1/4 copy: its pixels are the descriptor taps)
@@ -1049,6 +1110,20 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         }
     }
     else ReleaseDispTarget(m_quiltH);
+    // RGB + depth with the depth map's side to be found: found once, here (a
+    // 1x1 pass; the compose reads it at t2), not at every pixel.
+    ID3D11ShaderResourceView* rgbdSide = nullptr;
+    if (m_fmt == StereoFormat::RGBD && ((m_quiltCols - 4) & 4) && m_psRgbdSide)
+    {
+        EnsureDispTarget(m_rgbdSide, 1, 1);
+        if (m_rgbdSide.rtv)
+        {
+            uploadCB((float)w4, (float)h4);
+            runDispPass(m_psRgbdSide, m_rgbdSide, nullptr, source);
+            rgbdSide = m_rgbdSide.srv;
+        }
+    }
+    else ReleaseDispTarget(m_rgbdSide);
     if (anaRecover && m_psPair && m_pairRefineOn && ew > (srcWidth + 1) / 2)
     {
         const int pairs = (ew + 1) / 2;
@@ -1098,6 +1173,11 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         case StereoFormat::Checkerboard:                        fi = 5; break;
         case StereoFormat::FramePacking:                        fi = 6; break;
         case StereoFormat::Quilt:                               fi = 8; break;
+        case StereoFormat::Pulfrich:                            fi = 9; break;
+        case StereoFormat::FrameSequential:                     fi = 10; break;
+        case StereoFormat::VR180TAB: case StereoFormat::VR180SBS:
+        case StereoFormat::VR360TAB: case StereoFormat::VR360SBS: fi = 11; break;
+        case StereoFormat::RGBD:                                fi = 12; break;
         case StereoFormat::Anaglyph:                            fi = anaRecover ? -1 : 7; break;
         default: break;
         }
@@ -1105,10 +1185,17 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         // the anaglyph modes but Recovered Colour, checkerboard, the interleaved.
         int ci = -1;
         if (m_csOn && m_outUAV)
-            // (Checkerboard and row interleaved measured no faster -- slower, the
-            // first -- so they stay pixel shaders.)
+            // (Row interleaved measured no faster, so it stays a pixel shader.)
             ci = (m_fmt == StereoFormat::Anaglyph && !anaRecover) ? 0 :
-                 m_fmt == StereoFormat::ColumnInterleaved ? 2 : -1;
+                 m_fmt == StereoFormat::ColumnInterleaved ? 2 :
+                 // (Checkerboard by source pixel: the eyes the source's size, no shift.)
+                 (m_fmt == StereoFormat::Checkerboard && m_convergence == 0.0f && m_outWidth / 2 == srcWidth && m_outHeight == srcHeight) ? 1 : -1;
+        // Recovered Colour's compose the same way, where both eyes look at the same
+        // source pixel: no Convergence shift. (Not while blocks that only scrolled
+        // are moved, nor in bands -- the pixel shader does those.)
+        const bool csRecover = m_csOn && m_csRecoverOn && m_outUAV && anaRecover && pairRefine > 0.5f && m_convergence == 0.0f &&
+                               scrollOn < 0.5f && m_yieldBands <= 1 && m_cs[4];
+        if (csRecover) ci = (srcDecode < 0.5f && m_cs[5]) ? 5 : 4;
         if (ci >= 0 && m_cs[ci])
         {
             m_context->CSSetShader(m_cs[ci], nullptr, 0);
@@ -1118,6 +1205,22 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             m_context->CSSetShaderResources(0, 1, cs0);
             ID3D11ShaderResourceView* csAna[2] = { m_tintHash ? m_tintSRV : nullptr, m_tintHash ? m_boxSRV : nullptr };
             m_context->CSSetShaderResources(10, 2, csAna);
+            if (csRecover)
+            {
+                // (What PSAnaCompose reads: the boxes' state and map, the blocks to
+                // redraw, how far each box has moved -- as bound for the passes
+                // above -- and the pair refine.)
+                const bool boxes = m_tintHash && m_boxPx[0] > 0.0f;
+                ID3D11ShaderResourceView* bx[2] = { boxes ? m_boxValid.srv : nullptr, boxes ? m_boxMap.srv : nullptr };
+                m_context->CSSetShaderResources(12, 2, bx);
+                ID3D11ShaderResourceView* grow = changeSkip > 0.5f ? m_changeGrow.srv : nullptr;
+                m_context->CSSetShaderResources(15, 1, &grow);
+                ID3D11ShaderResourceView* shift = nullptr;
+                m_context->PSGetShaderResources(17, 1, &shift);
+                m_context->CSSetShaderResources(17, 1, &shift);
+                if (shift) shift->Release();
+                m_context->CSSetShaderResources(18, 1, &m_pair.srv);
+            }
             m_context->CSSetUnorderedAccessViews(0, 1, &m_outUAV, nullptr);
             m_context->Dispatch((UINT)(m_outWidth / 2 + 15) / 16, (UINT)(m_outHeight + 7) / 8, 1);
             ID3D11UnorderedAccessView* nu = nullptr;
@@ -1125,6 +1228,13 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
             ID3D11ShaderResourceView* ns[2] = {};
             m_context->CSSetShaderResources(0, 1, ns);
             m_context->CSSetShaderResources(10, 2, ns);
+            if (csRecover)
+            {
+                ID3D11ShaderResourceView* n9[9] = {};
+                m_context->CSSetShaderResources(10, 9, n9);
+                m_context->PSSetShaderResources(9, 7, n9);    // (as the pixel shader's path leaves them)
+                m_context->PSSetShaderResources(16, 3, n9);
+            }
             m_context->CSSetShader(nullptr, nullptr, 0);
         }
         else {
@@ -1135,7 +1245,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         m_context->PSSetShaderResources(18, 1, &pairSrv);
         m_context->OMSetRenderTargets(1, &m_outRTV, nullptr);
         m_context->RSSetViewports(1, &vp);
-        ID3D11ShaderResourceView* srvs[3] = { source, delayedSRV, anaRecover ? m_dispF.srv : quiltRows ? m_quiltH.srv : nullptr };
+        ID3D11ShaderResourceView* srvs[3] = { source, delayedSRV, anaRecover ? m_dispF.srv : quiltRows ? m_quiltH.srv : rgbdSide };
         m_context->PSSetShaderResources(0, 3, srvs);
         ID3D11ShaderResourceView* src4 = anaRecover ? m_src4.srv : nullptr;   // (the recovery's edge-aware upsampling guide)
         m_context->PSSetShaderResources(9, 1, &src4);
@@ -1171,7 +1281,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
         }
         ID3D11ShaderResourceView* nul3[3] = {};
         m_context->PSSetShaderResources(19, 3, nul3);
-        if (m_statsOn)
+        if (m_statsOn || m_videoAuto)
         {
             CollectStats();
             ++m_statAcc.frames;
@@ -1220,6 +1330,7 @@ bool Converter::Convert(ID3D11ShaderResourceView* source, int srcWidth, int srcH
                    0, 0, 0, 0, 0, 0, 0, 0,
                    0, 0, 0, 0, 0, 0, 0, 0 };
         copyCb.srcDecode = srcDecode;   // (the history stores decoded pixels either way)
+        m_context->PSSetShader(m_psFmt[13] ? m_psFmt[13] : m_ps, nullptr, 0);   // (a plain copy: its own small shader, not the all-formats one)
         m_context->UpdateSubresource(m_cbuffer, 0, nullptr, &copyCb, 0, 0);
         D3D11_VIEWPORT vp{};
         vp.Width = (FLOAT)m_histW; vp.Height = (FLOAT)m_histH; vp.MaxDepth = 1.0f;
@@ -1316,6 +1427,17 @@ void Converter::TimeMark(int slot, int mark)
     if (t.ts[mark]) m_context->End(t.ts[mark]);
 }
 
+void Converter::SubMark(int slot, int mark)
+{
+    TimeSet& t = m_times[slot];
+    if (!t.sub[mark])
+    {
+        D3D11_QUERY_DESC qd{ D3D11_QUERY_TIMESTAMP, 0 };
+        m_device->CreateQuery(&qd, &t.sub[mark]);
+    }
+    if (t.sub[mark]) m_context->End(t.sub[mark]);
+}
+
 void Converter::CollectTimes()
 {
     for (int i = 0; i < kTimeRing; ++i)
@@ -1328,11 +1450,21 @@ void Converter::CollectTimes()
         bool ok = !dj.Disjoint && dj.Frequency > 0;
         for (int k = 0; k < kTimeMarks && ok; ++k)
             ok = t.ts[k] && m_context->GetData(t.ts[k], &v[k], sizeof(v[k]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        // (The first stage's parts: the check for change, the copies, the
+        // averaging down, the rest -- the boxes, what changed, the coarse search.)
+        UINT64 s[kSubMarks] = {};
+        for (int k = 0; k < kSubMarks && ok; ++k)
+            ok = t.sub[k] && m_context->GetData(t.sub[k], &s[k], sizeof(s[k]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
         if (!ok && !dj.Disjoint) continue;   // (not all in yet)
         t.pending = false;
         if (!ok) continue;
         for (int k = 0; k + 1 < kTimeMarks; ++k)
             m_timeSum[k] += (double)(v[k + 1] - v[k]) * 1000.0 / (double)dj.Frequency;
+        {
+            const UINT64 edge[kSubMarks + 2] = { v[0], s[0], s[1], s[2], v[1] };
+            for (int k = 0; k <= kSubMarks; ++k)
+                m_subSum[k] += edge[k + 1] >= edge[k] ? (double)(edge[k + 1] - edge[k]) * 1000.0 / (double)dj.Frequency : 0.0;
+        }
         ++m_timeCount;
     }
 }
@@ -1351,6 +1483,14 @@ void Converter::CollectStats()
         if (any < 0.5f) continue;   // (nothing had changed: the passes were skipped)
         const float blocks = (std::max)(1.0f, m_statBlocks[i]);
         ++m_statAcc.changed;
+        // (Video, see Convert: three looks in a row with nine tenths redrawn.)
+        if (m_videoAuto)
+        {
+            const bool most = r / blocks >= 0.9f;
+            m_videoRun = most ? m_videoRun + 1 : 0;
+            const bool mode = most && (m_videoMode || m_videoRun >= 3);
+            if (mode != m_videoMode) { m_videoMode = mode; Log("Converter: Recovered Colour %s", mode ? "draws whole frames (the whole picture is changing: video)" : "redraws only what changed again"); }
+        }
         m_statAcc.redrawn += r / blocks; m_statAcc.moved += g / blocks;
         if (dy != 0.0f) { ++m_statAcc.scrolled; m_statAcc.rows += std::abs(dy); }
     }
@@ -1384,6 +1524,13 @@ bool Converter::TakeChangeStats(ChangeStats& out)
     if (out.scrolled > 0) out.rows /= out.scrolled;
     m_statAcc = ChangeStats{};
     return out.frames > 0;
+}
+
+// The first stage's parts (ms, averaged as TakeRecoveryTimes -- call before it:
+// that one starts the count again).
+void Converter::TakeFirstStageTimes(double ms[kSubMarks + 1])
+{
+    for (int k = 0; k <= kSubMarks; ++k) { ms[k] = m_timeCount > 0 ? m_subSum[k] / m_timeCount : 0.0; m_subSum[k] = 0; }
 }
 
 bool Converter::TakeRecoveryTimes(double ms[kTimeMarks - 1], int& count)
@@ -1444,6 +1591,8 @@ uint64_t Converter::SettingsKey(ID3D11ShaderResourceView* source, int srcWidth, 
     const bool tintsInUse = m_tintHash != 0;
     mix(&m_anaMode, sizeof(m_anaMode)); mix(&tintsInUse, sizeof(tintsInUse)); if (tintsInUse) mix(&m_wholeTintHash, sizeof(m_wholeTintHash)); mix(&m_fpEyeFrac, sizeof(m_fpEyeFrac)); mix(&m_fpGapFrac, sizeof(m_fpGapFrac));
     mix(&m_fpEyeAlign, sizeof(m_fpEyeAlign)); mix(&m_convergence, sizeof(m_convergence));
+    mix(&m_pulfMode, sizeof(m_pulfMode)); mix(&m_pulfEye, sizeof(m_pulfEye)); mix(&m_ndTrans, sizeof(m_ndTrans)); mix(&m_pulfDelay, sizeof(m_pulfDelay));
+    mix(&m_hdrScale, sizeof(m_hdrScale));
     if (m_anaCombo == 6) { mix(m_anaMaskL, sizeof(m_anaMaskL)); mix(m_anaMaskR, sizeof(m_anaMaskR)); mix(m_anaWL, sizeof(m_anaWL)); mix(m_anaWR, sizeof(m_anaWR)); mix(m_anaTL, sizeof(m_anaTL)); mix(m_anaTR, sizeof(m_anaTR)); }
     mix(&m_quiltCols, sizeof(m_quiltCols)); mix(&m_quiltRows, sizeof(m_quiltRows));
     mix(&m_quiltLeftIdx, sizeof(m_quiltLeftIdx)); mix(&m_quiltRightIdx, sizeof(m_quiltRightIdx));
@@ -1517,7 +1666,7 @@ void Converter::Shutdown()
     ReleaseDisparity();
     SAFE_RELEASE(m_cbuffer);
     SAFE_RELEASE(m_sampler);
-    for (auto& t : m_times) { SAFE_RELEASE(t.disjoint); for (auto& q : t.ts) SAFE_RELEASE(q); t.pending = false; }
+    for (auto& t : m_times) { SAFE_RELEASE(t.disjoint); for (auto& q : t.ts) SAFE_RELEASE(q); for (auto& q : t.sub) SAFE_RELEASE(q); t.pending = false; }
     SAFE_RELEASE(m_psDesc);
     SAFE_RELEASE(m_psDescCoarse);
     SAFE_RELEASE(m_psDown);
@@ -1525,6 +1674,8 @@ void Converter::Shutdown()
     SAFE_RELEASE(m_psPair);
     SAFE_RELEASE(m_psAnaCompose);
     SAFE_RELEASE(m_psPairPlain);
+    SAFE_RELEASE(m_psRgbdSide); ReleaseDispTarget(m_rgbdSide);
+    for (auto& e : m_plain) { SAFE_RELEASE(e.plain); e.base = nullptr; }
     SAFE_RELEASE(m_psAnaComposePlain);
     SAFE_RELEASE(m_bandRS);
     for (auto*& p : m_psFmt) SAFE_RELEASE(p);

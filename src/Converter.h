@@ -118,6 +118,8 @@ namespace srw
         // Both eyes from one compute thread where they share source pixels (the
         // anaglyph modes but Recovered, checkerboard, interleaved). Off: pixel shaders.
         void SetComputeBothEyes(bool on) { m_csOn = on; }
+        // ... and Recovered Colour's compose that way too (off: the pixel shader; a test switch).
+        void SetComputeRecover(bool on) { m_csRecoverOn = on; }
         // The output texture made shareable with another Direct3D device (the
         // DX12 presenter weaves from it without a copy). Remade on the next
         // Convert when this changes, which reports it as resized.
@@ -128,6 +130,10 @@ namespace srw
         // HDR: the output 16-bit float (linear, brighter-than-white values kept)
         // instead of 8-bit sRGB. Remade on the next Convert, reported as resized.
         void SetHdr(bool on) { m_hdr = on; m_format = on ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; }
+        // HDR: the output divided by this (the display's peak over 80 nits), so the
+        // weave is made in the ordinary 0..1 range; the renderer multiplies it
+        // back after (Renderer::HdrRestore). 1: as it is.
+        void SetHdrScale(float scale) { m_hdrScale = scale > 1.0f ? scale : 1.0f; }
         // Whether Recovered Colour is best given the capture's own frame (above).
         bool RecoveredWantsDirect() const { return m_preCheckOn && m_changeSkipOn; }
 
@@ -225,12 +231,23 @@ namespace srw
         ID3D11PixelShader*       m_psPair    = nullptr;  // Recovered Colour at full width: the refine per pixel pair (PSAnaPair)
         ID3D11PixelShader*       m_psAnaCompose = nullptr;  // ... and its compose alone (PSAnaCompose), after PSAnaPair
         ID3D11PixelShader*       m_psPairPlain = nullptr, *m_psAnaComposePlain = nullptr;  // ... both for a source read as it is (SRC_PLAIN)
+        // ... and the recovery's other passes: each shader and its SRC_PLAIN twin.
+        static constexpr int kPlain = 6;
+        struct PlainPair { ID3D11PixelShader* base = nullptr; ID3D11PixelShader* plain = nullptr; };
+        PlainPair                m_plain[kPlain];
+        ID3D11PixelShader* PlainOf(ID3D11PixelShader* ps) const
+        {
+            for (const auto& e : m_plain) if (e.base == ps && e.plain) return e.plain;
+            return ps;
+        }
         // The common formats' own shaders (PSFmt*: Half SBS / Katanga, Full SBS, TAB,
         // row, column, checkerboard, frame packing, anaglyph without Recovered).
-        ID3D11PixelShader*       m_psFmt[9] = {};
+        ID3D11PixelShader*       m_psFmt[14] = {};
         // Quilt's first pass (rows) and its result (SetQuiltTwoPass).
         ID3D11PixelShader*       m_psQuiltH = nullptr;
         DispTarget               m_quiltH;
+        ID3D11PixelShader*       m_psRgbdSide = nullptr;   // RGB + depth: which half is the depth map, found once (PSRgbdSide)
+        DispTarget               m_rgbdSide;               // ... its answer, 1x1
         bool                     m_quiltTwoPass = true;
         float                    m_lfPitch = 0.0f, m_lfSlant = 0.0f;   // (SetLightField)
         int                      m_lfW = 0, m_lfH = 0;
@@ -342,18 +359,22 @@ namespace srw
 
         // GPU time of the anaglyph recovery's stages, for the perf log: a small
         // ring of timestamp sets, read back a few frames later (never stalls).
-        static constexpr int kTimeRing = 4, kTimeMarks = 9;
-        struct TimeSet { ID3D11Query* disjoint = nullptr; ID3D11Query* ts[kTimeMarks] = {}; bool pending = false; };
+        static constexpr int kTimeRing = 4, kTimeMarks = 9, kSubMarks = 3;
+        struct TimeSet { ID3D11Query* disjoint = nullptr; ID3D11Query* ts[kTimeMarks] = {}; ID3D11Query* sub[kSubMarks] = {}; bool pending = false; };
         TimeSet m_times[kTimeRing];
         int     m_timeNext = 0;
         double  m_timeSum[kTimeMarks - 1] = {};
+        double  m_subSum[kSubMarks + 1] = {};   // (the first stage's parts)
         int     m_timeCount = 0;
         void    TimeMark(int slot, int mark);
+        void    SubMark(int slot, int mark);
         void    CollectTimes();
     public:
         // Average ms per recovery stage since the last call (coarse search,
         // descriptors, refine, occlusion fill, smoothing, the full-res pair
         // refine, the compose; the last is unused); false if none ran.
+        // (The first stage in parts: the check for change, the copies, averaging down, the rest. Before TakeRecoveryTimes.)
+        void TakeFirstStageTimes(double ms[kSubMarks + 1]);
         bool TakeRecoveryTimes(double ms[kTimeMarks - 1], int& count);
         // For the perf log: what the recovery did with the frames since the last
         // call. Counted only while on (SetChangeStats): two tiny passes and a
@@ -370,9 +391,16 @@ namespace srw
             bool   reuse = false;     // scroll reuse could run (else: off, or the source isn't a plain texture of the picture's size)
         };
         void SetChangeStats(bool on) { m_statsOn = on; }
+        // Recovered Colour on video: whole frames while the whole picture keeps
+        // changing, no block-by-block tracking (Convert). On by default.
+        void SetVideoAuto(bool on) { m_videoAuto = on; if (!on) { m_videoMode = false; m_videoRun = 0; } }
+        bool IsVideoMode() const { return m_videoMode; }
         bool TakeChangeStats(ChangeStats& out);
     private:
         bool               m_statsOn = false;
+        bool               m_videoAuto = true, m_videoMode = false;
+        int                m_videoRun = 0;
+        unsigned           m_videoTick = 0;
         DispTarget         m_statRows, m_stat;
         ID3D11PixelShader* m_psStatRows = nullptr;
         ID3D11PixelShader* m_psStat = nullptr;
@@ -404,7 +432,8 @@ namespace srw
         ID3D11Texture2D*          m_outTex = nullptr;  // full SBS (2*perEye wide)
         ID3D11RenderTargetView*   m_outRTV = nullptr;
         ID3D11UnorderedAccessView* m_outUAV = nullptr;   // (UNORM view: the both-eyes compute shaders)
-        ID3D11ComputeShader*      m_cs[4] = {};           // (both eyes per thread: anaglyph, checkerboard, column, row)
+        ID3D11ComputeShader*      m_cs[6] = {};           // (both eyes per thread: anaglyph, checkerboard, column, row; Recovered Colour's compose and its plain-source twin)
+        bool                      m_csRecoverOn = true;   // (SetComputeRecover)
         bool                      m_csOn = true;
         bool                      m_outShare = false, m_outShared = false;   // (SetShareableOutput: wanted / as made)
         ID3D11Predicate*          m_outPred = nullptr;   // the predicate the last Convert drew under (not owned; null: none)
@@ -438,6 +467,7 @@ namespace srw
         int          m_pulfEye  = 1;       // affected eye (0 left, 1 right)
         float        m_ndTrans  = 0.30f;   // ND transmission
         int          m_pulfDelay = 1;      // delay frames
+        float        m_hdrScale = 1.0f;    // (SetHdrScale)
         float        m_fpEyeFrac = 1080.0f / 2205.0f;  // frame-packing eye height fraction
         float        m_fpGapFrac = 45.0f / 2205.0f;    // frame-packing gap fraction
         float        m_fpEyeAlign = 0.0f;              // bottom-eye vertical alignment (source rows)

@@ -132,6 +132,11 @@ Left-click the tray icon for the control panel; right-click for a quick menu.
 - **Ctrl+Alt+F**: switch between Fullscreen ⇄ Looking Glass
 - **Ctrl+Alt+C**: make the active window 3D (press again to turn it off)
 - **Ctrl+Alt+R**: recalibrate head tracking (snap the current head pose to centre)
+- **Ctrl+Alt+[** / **Ctrl+Alt+]**: Convergence down / up a step
+- **Ctrl+Alt+-** / **Ctrl+Alt+=**: Anti-Crosstalk down / up 5%
+
+The last two pairs show the new value in the corner of the 3D picture for a
+moment, so both can be set by eye with a picture filling the screen.
 
 The panel has a compact mode (just the on/off switch and a status line) and an
 expanded mode with the display, stereo-input and depth controls (Convergence,

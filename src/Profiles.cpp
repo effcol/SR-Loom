@@ -276,6 +276,10 @@ namespace srw::Profiles
             { "redcyan",         StereoFormat::Anaglyph, false },
             { "red cyan",        StereoFormat::Anaglyph, false },
             // Interleaved / checkerboard
+            { "fieldseq",         StereoFormat::RowInterleaved, false },   // (a field-sequential video shown as it is: its rows. Right eye first -- TitleSaysFieldSequential)
+            { "field seq",        StereoFormat::RowInterleaved, false },
+            { "fieldsequential",  StereoFormat::RowInterleaved, false },
+            { "field sequential", StereoFormat::RowInterleaved, false },
             { "rowinterlaced",   StereoFormat::RowInterleaved, false },
             { "row interlaced",  StereoFormat::RowInterleaved, false },
             { "interlaced",      StereoFormat::RowInterleaved, true  },
@@ -328,6 +332,37 @@ namespace srw::Profiles
         if (HasQuiltSuffix(norm))   { detected = true; return StereoFormat::Quilt;   }
 
         return StereoFormat::HalfSBS;   // safe default; caller sees detected=false
+    }
+
+    // "fieldseq" / "field sequential" in the title: a field-sequential video
+    // (a DVD's two fields are the two eyes), shown un-deinterlaced it is row
+    // interleaved -- with the RIGHT eye's field first, by that format's custom.
+    bool TitleSaysFieldSequential(const std::string& title)
+    {
+        const std::string norm = NormaliseTitle(title);
+        return HasPhrase(norm, "fieldseq") || HasPhrase(norm, "field seq") ||
+               HasPhrase(norm, "fieldsequential") || HasPhrase(norm, "field sequential");
+    }
+
+    // Which eye comes first, from the title: 1 left (LR), 2 right (RL), 0 not
+    // said. The words spelt out count on their own; the bare "lr" / "rl" only
+    // in a title that also says it is 3D, or names a stereo layout ("..._full_
+    // tab_rl.mkv") -- two letters turn up in plenty of other names.
+    int DetectEyeOrderFromTitle(const std::string& title)
+    {
+        if (title.empty()) return 0;
+        const std::string norm = NormaliseTitle(title);
+        static const char* const kRight[] = { "right left", "rightleft", "right first", "rightfirst", "right eye first" };
+        static const char* const kLeft[]  = { "left right", "leftright", "left first", "leftfirst", "left eye first" };
+        for (const char* t : kRight) if (HasPhrase(norm, t)) return 2;
+        for (const char* t : kLeft)  if (HasPhrase(norm, t)) return 1;
+        bool layout = false;
+        DetectFormatFromTitle(title, layout);
+        const bool context = layout || HasPhrase(norm, "3d") || HasPhrase(norm, "stereo") || HasPhrase(norm, "stereoscopic");
+        if (!context) return 0;
+        if (HasPhrase(norm, "rl")) return 2;
+        if (HasPhrase(norm, "lr")) return 1;
+        return 0;
     }
 
     unsigned long long FileStamp()
@@ -389,7 +424,12 @@ namespace srw::Profiles
             }
             else if (key == "defaultformat" || key == "default_format")
                 cur.defaultFormat = FormatFromString(val);
-            else if (key == "swap_eyes")            cur.swapEyes = toBool(val);
+            else if (key == "swap_eyes")
+            {
+                // (auto: from the title -- LR / RL, DetectEyeOrderFromTitle.)
+                if (ToLower(val) == "auto") { cur.swapEyesAuto = true; cur.swapEyes = false; }
+                else cur.swapEyes = toBool(val);
+            }
             else if (key == "convergence")          cur.convergence = (float)std::atof(val.c_str());
             else if (key == "anaglyph_combo")       cur.anaglyphCombo = toInt(val);
             else if (key == "anaglyph_mode")        cur.anaglyphMode  = toInt(val);
@@ -476,6 +516,15 @@ namespace srw::Profiles
              "#\n"
              "# Picture keys (all optional):\n"
              "#   swap_eyes=1                    left and right eyes exchanged.\n"
+             "#   swap_eyes=auto                 the eye order from the window TITLE: \"RL\"\n"
+             "#                                  (or \"right left\", \"right first\") swaps the\n"
+             "#                                  eyes, \"LR\" does not. The two letters count\n"
+             "#                                  only in a title that also says 3D / stereo\n"
+             "#                                  or names a layout (movie_full_tab_rl.mkv).\n"
+             "#                                  Nothing said: not swapped.\n"
+             "#   A title saying \"fieldseq\" / \"field sequential\" (format=auto) is shown as\n"
+             "#   row interleaved with the RIGHT eye first, as those videos are made;\n"
+             "#   swap_eyes=1 turns that round, and LR / RL with swap_eyes=auto decides it.\n"
              "#   convergence=-0.150             the Convergence slider (-2 to 2).\n"
              "#   anaglyph_combo=0..6            the anaglyph colour pair, in the order of\n"
              "#                                  the panel's list (0 = red / cyan).\n"
@@ -530,7 +579,11 @@ namespace srw::Profiles
             // toggle seeds it from `format`, and turning Auto off restores
             // `format` from it), so keep it visible in the file.
             if (p.useVisualAuto)
+            {
+                // (... with the format to go back to, if the panel's toggle put it by.)
                 f << "format=detect\n";
+                if (p.defaultFormat != def.defaultFormat) f << "defaultformat=" << FormatToString(p.defaultFormat) << "\n";
+            }
             else if (p.useAutoFormat)
             {
                 f << "format=auto\n";
@@ -538,7 +591,8 @@ namespace srw::Profiles
             }
             else if (p.format != def.format)
                 f << "format=" << FormatToString(p.format) << "\n";
-            if (p.swapEyes)             f << "swap_eyes=1\n";
+            if (p.swapEyesAuto)         f << "swap_eyes=auto\n";
+            else if (p.swapEyes)        f << "swap_eyes=1\n";
             if (p.convergence != 0.0f)
             {
                 char conv[32]; std::snprintf(conv, sizeof(conv), "%.3f", p.convergence);

@@ -134,9 +134,18 @@ float4 SrcSampleLevel(SamplerState s, float2 uv, float lod)
     // On a texel's centre (1:1 layouts: Half SBS, the TAB halves...): that
     // texel alone. (The hardware's own blend weights are 1/256 steps.)
     const float2 r = round(p);
-    if (all(abs(p - r) < 1.0 / 512.0)) return SrcLoad(int3(clamp((int2)r, 0, mx), 0));
+    const bool2 on = abs(p - r) < 1.0 / 512.0;
+    if (all(on)) return SrcLoad(int3(clamp((int2)r, 0, mx), 0));
     const float2 f = frac(p);
     const int2 a = clamp((int2)floor(p), 0, mx), b = clamp((int2)floor(p) + 1, 0, mx);
+    // On a row's centre but between two of its texels (a Convergence shift,
+    // DeAnaglyph's taps), or on a column's between two rows (frame packing):
+    // those two alone -- half the texels to read and decode. Each decode is a
+    // power per channel; all four at every read made DeAnaglyph five times as
+    // slow on a captured screen as on a decoded picture.
+    const int2 rc = clamp((int2)r, 0, mx);
+    if (on.y) return lerp(SrcLoad(int3(a.x, rc.y, 0)), SrcLoad(int3(b.x, rc.y, 0)), f.x);
+    if (on.x) return lerp(SrcLoad(int3(rc.x, a.y, 0)), SrcLoad(int3(rc.x, b.y, 0)), f.y);
     const float4 c00 = SrcLoad(int3(a.x, a.y, 0)), c10 = SrcLoad(int3(b.x, a.y, 0));
     const float4 c01 = SrcLoad(int3(a.x, b.y, 0)), c11 = SrcLoad(int3(b.x, b.y, 0));
     return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
@@ -1556,10 +1565,8 @@ float3 anaRecoverPixel(float2 e, float3 c, int eye, float dRef)
 // colour in it. Eight fixed places in each half are looked at -- the same for
 // every pixel, so the whole picture decides alike. A black-and-white photo
 // beside its depth map can't be told this way: the right half is taken.
-bool rgbdDepthLeft()
+bool rgbdDepthLeftFind()
 {
-    const int rf = g_quiltCols - 4;
-    if ((rf & 4) == 0) return (rf & 1) != 0;
     float cl = 0.0, cr = 0.0;
     [unroll] for (int k = 0; k < 8; ++k)
     {
@@ -1570,6 +1577,16 @@ bool rgbdDepthLeft()
         cr += max(max(b.r, b.g), b.b) - min(min(b.r, b.g), b.b);
     }
     return cl < cr * 0.5;
+}
+// (Found once for the whole conversion -- a 1x1 pass, PSRgbdSide -- and read
+// here from t2: it used to be worked out again at every pixel, 16 reads each,
+// twice what the view itself takes.)
+float4 PSRgbdSide(VSOut i) : SV_Target { return rgbdDepthLeftFind() ? 1.0 : 0.0; }
+bool rgbdDepthLeft()
+{
+    const int rf = g_quiltCols - 4;
+    if ((rf & 4) == 0) return (rf & 1) != 0;
+    return dispTex.Load(int3(0, 0, 0)).r > 0.5;
 }
 float rgbdDepth(float2 p, bool depthLeft)
 {
@@ -1634,6 +1651,20 @@ float3 lightFieldRgbd(float2 pos, float2 e, bool depthLeft)
         o[c] = s[c];
     }
     return o;
+}
+
+// DeAnaglyph's colour: the 9 pixels round e in its row, averaged (c: the source
+// at e, which the caller has -- it was read here a second time).
+float3 anaRowBlur(float2 e, float3 c)
+{
+    const float h = 1.0 / g_srcW;
+    float3 acc = c;
+    [unroll] for (int k = 0; k < 2; ++k)
+    {
+        const float o = (1.5 + 2.0 * k) * h;   // (between pixels 1,2 then 3,4 away)
+        acc += 2.0 * (SrcSample(samp, float2(e.x - o, e.y)).rgb + SrcSample(samp, float2(e.x + o, e.y)).rgb);
+    }
+    return acc / 9.0;
 }
 
 float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRecovery = false)
@@ -1764,14 +1795,7 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
             // The 9 pixels around it in the row: the centre, and four pairs each
             // read in one go -- a sample exactly between two pixels is their
             // average (bilinear) -- the same sum from 5 reads instead of 9.
-            const float h = 1.0 / g_srcW;
-            float3 acc = SrcSample(samp, e).rgb;
-            [unroll] for (int k = 0; k < 2; ++k)
-            {
-                const float o = (1.5 + 2.0 * k) * h;   // (between pixels 1,2 then 3,4 away)
-                acc += 2.0 * (SrcSample(samp, float2(e.x - o, e.y)).rgb + SrcSample(samp, float2(e.x + o, e.y)).rgb);
-            }
-            float3 cb = acc / 9.0;                         // horizontally blurred colour
+            float3 cb = anaRowBlur(e, c);                  // horizontally blurred colour
             float anaY = max(dot(cb, float3(0.299, 0.587, 0.114)), 1e-3);
             return float4(saturate(cb * (eyeY / anaY)), 1);
         }
@@ -1966,7 +1990,10 @@ float4 ConvertCoreImpl(VSOut i, bool recoveryOnly, int forceFmt = -1, bool noRec
     return SrcSample(samp, s);
 }
 
-float4 Opaque(float4 c) { c.a = 1.0; return c; }
+// (HDR: the picture divided down into the ordinary 0..1 range for the weave --
+// g_anaTL.a, a slot the custom anaglyph colours leave free: 0 = as it is. The
+// renderer multiplies it back after the weave, Renderer::HdrRestore.)
+float4 Opaque(float4 c) { if (g_anaTL.a > 0.0) c.rgb *= g_anaTL.a; c.a = 1.0; return c; }
 
 float4 PSMain(VSOut i) : SV_Target
 {
@@ -1998,6 +2025,11 @@ float4 PSFmtChecker(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, fals
 float4 PSFmtFramePack(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 7)); }
 float4 PSFmtAnaglyph(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 2, true)); }   // (not Recovered Colour)
 float4 PSFmtQuilt(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 9)); }
+float4 PSFmtPulfrich(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 6)); }
+float4 PSFmtSequential(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 8)); }
+float4 PSFmtVR(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 10)); }
+float4 PSFmtRgbd(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 13)); }
+float4 PSFmtCopy(VSOut i) : SV_Target { return Opaque(ConvertCoreImpl(i, false, 99)); }   // (the history copy: Pulfrich's and frame sequential's earlier frames)
 
 // ----- Both eyes from one thread (compute) ---------------------------------
 // In the anaglyph modes, checkerboard and the interleaved layouts, the two
@@ -2018,7 +2050,103 @@ void csBothEyes(uint2 id, int fmt, bool noRecovery)
     outU[id] = float4(srgbEncode(saturate(l)), 1);
     outU[uint2(id.x + ew, id.y)] = float4(srgbEncode(saturate(r)), 1);
 }
-[numthreads(16, 8, 1)] void CSFmtAnaglyph(uint3 id : SV_DispatchThreadID) { csBothEyes(id.xy, 2, true); }
-[numthreads(16, 8, 1)] void CSFmtChecker(uint3 id : SV_DispatchThreadID)  { csBothEyes(id.xy, 5, false); }
+// The anaglyph modes but Recovered Colour: with no Convergence shift both eyes
+// look at the same source pixel, so it is read once for the pair -- and
+// DeAnaglyph's blurred colour, the same for both, worked out once. (Filtered,
+// Half Colour, Mono, a tinted picture, DeAnaglyph: all of them through here.)
+void csAnaBothEyes(uint2 id)
+{
+    if (g_convergence != 0.0) { csBothEyes(id, 2, true); return; }
+    uint W, H; outU.GetDimensions(W, H);
+    const uint ew = W / 2;
+    if (id.x >= ew || id.y >= H) return;
+    const float2 e = float2((id.x + 0.5) / ew, (id.y + 0.5) / H);
+    const float3 c = SrcSample(samp, e).rgb;
+    const int eyeL = g_swap ? 1 : 0, eyeR = 1 - eyeL;   // (which eye's content each half shows)
+    float3 l, r;
+    if (g_anaMode == 5 && anaTintTex.Load(int3(0, 0, 0)).a > 0.5)
+    {
+        l = tintDecode(c, eyeL, 0); r = tintDecode(c, eyeR, 0);
+    }
+    else if (g_anaMode == 0)
+    {
+        const float3 cb = anaRowBlur(e, c);
+        const float anaY = max(dot(cb, float3(0.299, 0.587, 0.114)), 1e-3);
+        l = saturate(cb * (anaEyeLuma(c, g_anaCombo, eyeL) / anaY));
+        r = saturate(cb * (anaEyeLuma(c, g_anaCombo, eyeR) / anaY));
+    }
+    else
+    {
+        l = decodeAnaglyph(c, g_anaCombo, eyeL, g_anaMode); r = decodeAnaglyph(c, g_anaCombo, eyeR, g_anaMode);
+    }
+    outU[id] = float4(srgbEncode(saturate(l)), 1);
+    outU[uint2(id.x + ew, id.y)] = float4(srgbEncode(saturate(r)), 1);
+}
+[numthreads(16, 8, 1)] void CSFmtAnaglyph(uint3 id : SV_DispatchThreadID) { csAnaBothEyes(id.xy); }
+
+// Recovered Colour's compose, both eyes from one thread (after PSAnaPair; no
+// Convergence shift, no scroll reuse -- Converter::Convert uses PSAnaCompose
+// otherwise). What the two eyes share is read once: the source pixel, whether
+// its block is redrawn at all, the box it may lie in, the pair's refine. Each
+// eye's borrow is its own. A block not redrawn is not written: it keeps last
+// frame's, as the pixel shader's discard does.
+[numthreads(16, 8, 1)] void CSAnaCompose(uint3 tid : SV_DispatchThreadID)
+{
+    const uint2 id = tid.xy;
+    uint W, H; outU.GetDimensions(W, H);
+    const uint ew = W / 2;
+    if (id.x >= ew || id.y >= H) return;
+    const float2 e = float2((id.x + 0.5) / ew, (id.y + 0.5) / H);
+    if (g_changeSkip > 0.5)
+    {
+        uint cw, chh; changeTex.GetDimensions(cw, chh);
+        if (cw > 0 && changeTex.Load(int3(clamp(int2(e * float2(g_srcW, g_srcH) / 16.0), 0, int2(cw, chh) - 1), 0)).r < 0.5) return;
+    }
+    const float3 c = SrcSample(samp, e).rgb;
+    const int eyeL = g_swap ? 1 : 0, eyeR = 1 - eyeL;   // (which eye's content each half shows)
+    float3 l, r;
+    float3 bo;
+    if (anaBoxDecode(e, c, eyeL, bo))
+    {
+        l = bo; anaBoxDecode(e, c, eyeR, r);
+    }
+    else
+    {
+        const float4 pp = pairTex.Load(int3(id.x / 2, id.y, 0));   // (.rg the left eye's dRef / plain flags, .ba the right's)
+        const int which = (id.x & 1) ? 2 : 1;
+        const float2 pl = eyeL == 0 ? pp.rg : pp.ba, pr = eyeR == 0 ? pp.rg : pp.ba;
+        l = (((int)(pl.y + 0.5) & which) != 0) ? c : anaRecoverPixel(e, c, eyeL, pl.x);
+        r = (((int)(pr.y + 0.5) & which) != 0) ? c : anaRecoverPixel(e, c, eyeR, pr.x);
+    }
+    outU[id] = float4(srgbEncode(saturate(l)), 1);
+    outU[uint2(id.x + ew, id.y)] = float4(srgbEncode(saturate(r)), 1);
+}
+// Checkerboard, both eyes from one thread, a thread per SOURCE pixel (the eyes
+// the source's size, no Convergence shift -- Converter::Convert uses
+// PSFmtChecker otherwise). Each source pixel is one eye's own, and the other
+// eye's is rebuilt there from the four round it: the same five reads in every
+// thread. As a pixel shader, every other output pixel took the other branch --
+// one read or four, in a checkerboard: the worst pattern there is for a GPU,
+// which runs both sides for all of them. (The same picture as PSFmtChecker.)
+[numthreads(16, 8, 1)] void CSFmtChecker(uint3 tid : SV_DispatchThreadID)
+{
+    uint W, H; outU.GetDimensions(W, H);
+    const uint ew = W / 2;
+    if (tid.x >= ew || tid.y >= H) return;
+    const int2 sz = int2(g_srcW, g_srcH);
+    const int x = min((int)tid.x, sz.x - 1), y = min((int)tid.y, sz.y - 1);
+    const float3 c = SrcLoad(int3(x, y, 0)).rgb;
+    const float3 l = SrcLoad(int3(x > 0 ? x - 1 : x + 1, y, 0)).rgb;
+    const float3 r = SrcLoad(int3(x < sz.x - 1 ? x + 1 : x - 1, y, 0)).rgb;
+    const float3 u = SrcLoad(int3(x, y > 0 ? y - 1 : y + 1, 0)).rgb;
+    const float3 d = SrcLoad(int3(x, y < sz.y - 1 ? y + 1 : y - 1, 0)).rgb;
+    const float dh = dot(abs(l - r), float3(1, 1, 1)), dv = dot(abs(u - d), float3(1, 1, 1));
+    const float3 o = dh < dv * 0.8 ? (l + r) * 0.5 : dv < dh * 0.8 ? (u + d) * 0.5 : (l + r + u + d) * 0.25;
+    // (The left half shows the left eye's content -- the right's with the eyes
+    // swapped -- and that eye owns the pixels where x + y + its number is even.)
+    const bool leftOwns = ((x + y + (g_swap ? 1 : 0)) & 1) == 0;
+    outU[tid.xy] = float4(srgbEncode(saturate(leftOwns ? c : o)), 1);
+    outU[uint2(tid.x + ew, tid.y)] = float4(srgbEncode(saturate(leftOwns ? o : c)), 1);
+}
 [numthreads(16, 8, 1)] void CSFmtColumn(uint3 id : SV_DispatchThreadID)   { csBothEyes(id.xy, 4, false); }
 [numthreads(16, 8, 1)] void CSFmtRow(uint3 id : SV_DispatchThreadID)      { csBothEyes(id.xy, 3, false); }

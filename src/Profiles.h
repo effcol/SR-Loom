@@ -47,6 +47,7 @@ namespace srw
         bool         useVisualAuto  = false;
         StereoFormat defaultFormat  = StereoFormat::HalfSBS;
         bool         swapEyes     = false;
+        bool         swapEyesAuto = false;   // swap_eyes=auto: the eye order from the title (LR / RL: DetectEyeOrderFromTitle)
         float        convergence  = 0.0f;
         // Format-specific sub-options. Only meaningful when `format` is
         // the matching parent (e.g. anaglyph fields only apply if format
@@ -136,6 +137,12 @@ namespace srw
         // * = common-word token; only counts when the title also contains
         //     "3D" / "stereo" (so Chrome's "New Tab" isn't read as TAB).
         StereoFormat DetectFormatFromTitle(const std::string& title, bool& detected);
+        //   FieldSeq / Field Sequential              -> RowInterleaved, right eye first
+        // Whether the title says the video is field sequential (see above).
+        bool TitleSaysFieldSequential(const std::string& title);
+        // Which eye the title says comes first: 1 left (LR), 2 right (RL), 0 not
+        // said. For swap_eyes=auto.
+        int  DetectEyeOrderFromTitle(const std::string& title);
 
         // Stable string IDs for StereoFormat (used in the on-disk file --
         // must stay stable across versions so existing profiles keep

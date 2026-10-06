@@ -122,6 +122,10 @@ namespace
     constexpr int   kHotkeyCalibrate = 6;   // Ctrl+Alt+R : recenter head tracking
     constexpr int   kHotkeyAutoRegion = 7;  // Ctrl+Alt+A : Auto Stereo -- toggle region under cursor
     constexpr int   kHotkeyAutoRegionDbg = 8; // Ctrl+Alt+Shift+A : same, and save what the finder saw (debug)
+    constexpr int   kHotkeyConvDown  = 9;   // Ctrl+Alt+[ : Convergence down a step
+    constexpr int   kHotkeyConvUp    = 10;  // Ctrl+Alt+] : Convergence up a step
+    constexpr int   kHotkeyActDown   = 11;  // Ctrl+Alt+- : Anti-Crosstalk down 5%
+    constexpr int   kHotkeyActUp     = 12;  // Ctrl+Alt+= : Anti-Crosstalk up 5%
     constexpr UINT  kRenderTimer   = 1;   // drives rendering during modal move/resize
 
     // ---- Render thread / UI thread ---------------------------------------
@@ -688,6 +692,7 @@ namespace
         double                       latencyEma = 0.0;
         int                          actApplied = 0;           // (the anti-crosstalk setting last given to the weaver)
         bool                         actTouched = false;       // (it has been changed from the display's default this run)
+        bool                         deviceLost = false;       // (the graphics device was reset or removed: said once, the weave switched off)
         bool                         lfOn = false, lfSlantSet = false;   // light field (Settings LightField...)
         float                        lfPitch = 0.0f, lfSlant = 0.0f, lfOffset = 0.0f, lfOffsetNow = 0.0f;
         int                          lfFollow = 0;             // (Settings LfFollow: the viewing distance taken from the camera)
@@ -710,6 +715,7 @@ namespace
         int                          asyncBands = 4;           // (the conversion sent to the GPU in pieces: Settings AsyncBands)
         bool                         asyncSlow = false;        // (conversions are slow at the moment: apart from the weave)
         double                       asyncEnterMs = 3.5;       // (a conversion this long is slow: Settings AsyncEnterUs)
+        bool                         weaveRaw = false;         // (Settings WeaveRaw: the weaver reads a Half SBS capture itself -- an experiment)
         int                          asyncSlowRun = 0;         // (slow conversions in a row)
         unsigned                     asyncSeenSerial = 0;
         ULONGLONG                    asyncSlowAt = 0;          // (when one last took over 2.5 ms)
@@ -2490,15 +2496,29 @@ namespace
                 currentTitle.c_str(), Profiles::FormatToString(effFormat),
                 (int)detected, Profiles::FormatToString(p.defaultFormat));
         }
+        // The eye order. swap_eyes=auto: from the title (LR / RL). A title that
+        // says field sequential (format=auto) is right eye first as those videos
+        // are made, unless the title says otherwise -- and a fixed swap_eyes=1
+        // turns that round.
+        bool effSwap = p.swapEyes;
+        {
+            const bool fieldSeq = p.useAutoFormat && effFormat == StereoFormat::RowInterleaved && Profiles::TitleSaysFieldSequential(currentTitle);
+            const int order = (p.swapEyesAuto || fieldSeq) ? Profiles::DetectEyeOrderFromTitle(currentTitle) : 0;
+            if (p.swapEyesAuto) effSwap = order == 2 || (order == 0 && fieldSeq);
+            else if (fieldSeq)  effSwap = !p.swapEyes;
+            if (p.swapEyesAuto || fieldSeq)
+                Log("Profile eye order: title says %s%s -> swap=%d", order == 2 ? "right first" : order == 1 ? "left first" : "nothing",
+                    fieldSeq ? " (field sequential: right first by default)" : "", (int)effSwap);
+        }
         Log("Profile apply: '%s' (format=%s swap=%d conv=%.2f hwnd=%p HT=%d)",
             p.name.c_str(), Profiles::FormatToString(effFormat),
-            (int)p.swapEyes, (double)p.convergence, (void*)captureHwnd,
+            (int)effSwap, (double)p.convergence, (void*)captureHwnd,
             (int)p.includeHeadTracking);
         // Format + format-specific sub-options. Set the sub-options BEFORE
         // ChangeFormat so the freshly-applied format reads the right
         // anaglyph combo / decode mode / pulfrich timing / FP preset on
         // its first frame.
-        app.swapEyes       = p.swapEyes;
+        app.swapEyes       = effSwap;
         app.convergence    = p.convergence;
         app.anaglyphCombo  = p.anaglyphCombo;
         app.anaglyphMode   = p.anaglyphMode;
@@ -2624,6 +2644,16 @@ namespace
                     Log("Profile auto-format: title changed '%s' -> %s (detected=%d)",
                         title.c_str(), Profiles::FormatToString(eff), (int)detected);
                     ChangeFormat(app, eff);
+                }
+                // (... and the eye order the new title gives, where the profile
+                // takes it from the title: swap_eyes=auto, or a field-sequential
+                // file -- as ApplyProfile.)
+                const bool fieldSeq = eff == StereoFormat::RowInterleaved && Profiles::TitleSaysFieldSequential(title);
+                if (p.swapEyesAuto || fieldSeq)
+                {
+                    const int order = Profiles::DetectEyeOrderFromTitle(title);
+                    const bool swap = p.swapEyesAuto ? (order == 2 || (order == 0 && fieldSeq)) : !p.swapEyes;
+                    if (swap != app.swapEyes) { app.swapEyes = swap; Log("Profile eye order: title changed -> swap=%d", (int)swap); }
                 }
             }
             return;
@@ -3814,6 +3844,13 @@ namespace
         // (HDR: the capture, the conversion and the output all 16-bit float.)
         app.capture.SetHdr(hdrOut);
         app.converter.SetHdr(hdrOut);
+        // (... and the weave made in the ordinary range: the conversion divides by
+        // the display's peak over 80 nits -- what 1.0 means in a float picture --
+        // and the renderer multiplies it back after the weave. 1000 nits where the
+        // display does not say.)
+        const float hdrScale = hdrOut ? (std::max)(1.0f, (std::min)(125.0f, (hdrNits > 0.0f ? hdrNits : 1000.0f) / 80.0f)) : 1.0f;
+        app.converter.SetHdrScale(hdrScale);
+        app.renderer.SetHdrScale(hdrScale);
         app.captureRebind = true;   // (the weaver needs its input again)
         return ok;
     }
@@ -5491,6 +5528,20 @@ namespace
         }
         RECT cur{};
         GetWindowRect(app.hwnd, &cur);
+        // (For reports of a Katanga picture in the wrong place or at the wrong
+        // size: where it went and why, each time that changes.)
+        if (!EqualRect(&target, &app.katangaPlacedRect))
+        {
+            app.katangaPlacedRect = target;
+            RECT wr{}, cr{}; if (pub && IsWindow(pub)) { GetWindowRect(pub, &wr); GetClientRect(pub, &cr); }
+            Log("Katanga: weave placed at (%ld,%ld) %ldx%ld -- picture %dx%d, sender window (%ld,%ld) %ldx%ld client %ldx%ld %s, SR display (%ld,%ld) %ldx%ld",
+                target.left, target.top, target.right - target.left, target.bottom - target.top,
+                app.katanga.Width(), app.katanga.Height(),
+                wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top, cr.right, cr.bottom,
+                (pub && IsWindow(pub)) ? (IsWindowFullscreen(pub) ? "fullscreen" : "windowed") : "not found",
+                app.srDisplayRect.left, app.srDisplayRect.top,
+                app.srDisplayRect.right - app.srDisplayRect.left, app.srDisplayRect.bottom - app.srDisplayRect.top);
+        }
         if (!EqualRect(&cur, &target))
             SetWindowPos(app.hwnd, nullptr, target.left, target.top,
                          target.right - target.left, target.bottom - target.top,
@@ -7045,6 +7096,7 @@ namespace
         {
             const bool wasReceiving = (app.katanga.SRV() != nullptr);
             const bool nowReceiving = app.katanga.Update();
+            if (nowReceiving) app.katanga.PrepareFrame();   // (a sender filling only part of its texture: that part)
             // Publisher swapped to a new texture (resize) while still
             // receiving: re-bind the weaver's input, or it keeps sampling
             // the released texture (frozen picture / use-after-free).
@@ -7421,16 +7473,27 @@ namespace
         const bool swapNow = (app.swapEyes != ((app.autoEyeSwap && app.fsAutoWindow) || app.manualEyeSwap)) != katangaRightFirst;
         // (Not the capture's own frame -- zero-copy: that goes through the
         // converter, which decodes it.)
-        const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !swapNow && noConv && !srcEncoded;
+        // (Settings WeaveRaw, an experiment: the capture's own frame too, with the
+        // Direct3D 11 weaver. Its pixels are sRGB-encoded and cannot be viewed
+        // decoded, so the weave is drawn on them as they are, into a view of the
+        // back buffer that does not encode -- no conversion pass at all, one whole
+        // read and write of the screen less a frame. The weave then mixes encoded
+        // values where it used to mix light: to be judged by eye.)
+        const bool rawSBS = app.weaveRaw && srcEncoded && !app.weaver.IsDX12() && !app.renderer.IsDX12() && app.renderer.IsDComp();
+        // (Not in HDR: the conversion is where the picture is brought into the weave's range.)
+        const bool identitySBS = liveSource && (halfSbsFmt || katangaFmt) && !swapNow && noConv && (!srcEncoded || rawSBS) && !app.hdrActive;
+        app.renderer.SetRawWeave(identitySBS && srcEncoded);
 
         if (identitySBS)
         {
-            if (srcSRV && srcW > 0 && srcH > 0 && (app.captureRebind || capSizeChanged))
+            // (The capture's own frame is another texture every time: named each frame.)
+            if (srcSRV && srcW > 0 && srcH > 0 && (app.captureRebind || capSizeChanged || srcEncoded))
             {
                 DXGI_FORMAT srvFmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
                 if      (katangaFmt)     srvFmt = app.katanga.Format();
                 else if (app.dxgiActive) srvFmt = app.captureDxgi.SRVFormat();
                 else                     srvFmt = app.capture.SRVFormat();
+                if (srcEncoded) { D3D11_SHADER_RESOURCE_VIEW_DESC vd{}; srcSRV->GetDesc(&vd); srvFmt = vd.Format; }   // (as it is viewed: undecoded)
                 app.weaver.SetInputView(srcSRV, srcW / 2, srcH, srvFmt);
                 app.captureRebind = false;
             }
@@ -7839,7 +7902,10 @@ namespace
                     if (c > app.asyncEnterMs * 0.7) app.asyncSlowAt = nowMs;
                 }
                 if (!app.asyncSlow && app.asyncSlowRun >= 3) { app.asyncSlow = true; Log("Conversion apart from the weave: on (conversions taking %.1f ms)", c); }
-                else if (app.asyncSlow && nowMs - app.asyncSlowAt > 2000) { app.asyncSlow = false; Log("Conversion apart from the weave: off (conversions quick again)"); }
+                // (The count starts again with it off: left at 3, the very next loop
+                // switched it back on -- on, off, on every few seconds over a still
+                // picture, the weave's own 7680x2160 picture made anew each time.)
+                else if (app.asyncSlow && nowMs - app.asyncSlowAt > 2000) { app.asyncSlow = false; app.asyncSlowRun = 0; Log("Conversion apart from the weave: off (conversions quick again)"); }
             }
             else { app.asyncSlow = false; app.asyncSlowRun = 0; }
             const bool asyncConv = asyncAble && app.asyncSlow;
@@ -7932,8 +7998,12 @@ namespace
                 // (Lens only: the light field's picture is already interlaced --
                 // drawn as it is, no weave.)
                 if (app.weaver.IsLensOnly()) app.renderer.BlitPicture(app.converter.OutputTexture());
+                // (No Direct3D 12 frame begun -- the GPU has not finished the last
+                // one, Present12::BeginFrame: nothing to weave into.)
+                else if (app.renderer.DX12() && !app.renderer.DX12()->InFrame()) {}
                 else if (!app.diagSkipWeave) app.weaver.Weave();   // (DiagSkipWeave: see Settings.h)
             }
+            app.renderer.HdrRestore();   // (HDR: the picture back up to its brightness -- the weave was made in 0..1)
             const clk::time_point tWeave = clk::now();
             app.gpuTimer.Stamp(GpuFrameTimer::kWeave);
             if (app.renderer.IsDComp()) app.renderer.ApplyMask();   // (timed apart from the present)
@@ -8087,31 +8157,35 @@ namespace
                             Log("  capture: %llu frames taken -- Windows reported nothing changed in %llu, no information for %llu, else %.0f%% of the screen changed (average)",
                                 du, dnone, dunk, darea * 100.0);
                     }
+                    // (With the Direct3D 12 weaver the weave itself is timed in the
+                    // "DX12 presenter" line; what Direct3D 11 measures there is its wait.)
+                    const char* weaveLabel = app.weaver.WeaverChoice() >= 4 ? "D3D11 waiting on the D3D12 weave" : "SR weave";
                     // (Outside Auto Stereo the analysis/tracking marks are never
                     // reached: everything after the capture copy is conversion.)
                     if (g.n > 0 && !app.autoStereo)
-                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, conversion %.2f], SR weave %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, conversion %.2f], %s %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
                             g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
                             g.Avg(GpuFrameTimer::kCapture),
                             g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
-                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            weaveLabel, g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
                             app.renderer.CompositionRateHz(), capFps);
                     else if (g.n > 0)
-                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, analysis %.2f, tracking %.2f, crops+conversion %.2f], SR weave %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
+                        Log("  GPU ms (avg of %d): ours %.2f [capture copy %.2f, analysis %.2f, tracking %.2f, crops+conversion %.2f], %s %.2f, mask %.2f, present %.2f, conversion after it %.2f | DWM composing at %.1f Hz (our window %.1f Hz) | capture delivered %.1f frames/s",
                             g.n, g.Avg(GpuFrameTimer::kCapture) + g.Avg(GpuFrameTimer::kAnalysis) + g.Avg(GpuFrameTimer::kTracking) + g.Avg(GpuFrameTimer::kOurs),
                             g.Avg(GpuFrameTimer::kCapture),
                             g.Avg(GpuFrameTimer::kAnalysis), g.Avg(GpuFrameTimer::kTracking), g.Avg(GpuFrameTimer::kOurs),
-                            g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
+                            weaveLabel, g.Avg(GpuFrameTimer::kWeave), g.Avg(GpuFrameTimer::kMask), g.Avg(GpuFrameTimer::kPresent), g.Avg(GpuFrameTimer::kEnd), dwmHz,
                             app.renderer.CompositionRateHz(), capFps);
                     else
                         Log("  GPU ms: n/a | DWM composing at %.1f Hz", dwmHz);
                     g.Reset();
                     {
                         double rt[8] = {}; int rn = 0;
+                        double fs[4] = {}; app.converter.TakeFirstStageTimes(fs);   // (before the next: it starts the count again)
                         if (app.converter.TakeRecoveryTimes(rt, rn))
                             Log("  Anaglyph recovery GPU ms (avg of %d): coarse search %.2f, descriptors %.2f, refine %.2f, "
-                                "occlusion fill %.2f, smoothing %.2f | full-res pair refine %.2f, compose %.2f",
-                                rn, rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6]);
+                                "occlusion fill %.2f, smoothing %.2f | full-res pair refine %.2f, compose %.2f | the first in parts: check for change %.2f, copies %.2f, averaging down %.2f, the rest %.2f",
+                                rn, rt[0], rt[1], rt[2], rt[3], rt[4], rt[5], rt[6], fs[0], fs[1], fs[2], fs[3]);
                         srw::Converter::ChangeStats cs;
                         if (rn > 0 && app.converter.TakeChangeStats(cs))
                             Log("  Recovery frames: %d converted -- %d whole, %d with changes (%.0f%% of the picture redrawn, %.0f%% kept and moved), "
@@ -8186,6 +8260,118 @@ namespace
 
     // Every message to the weave window, timed: a slow one is logged with
     // who sent it (see LogSlowMessage).
+    // --- A small readout over the 3D picture for a moment --------------------
+    // What a hotkey just changed (Convergence, Anti-Crosstalk), so they can be
+    // set by eye with the picture filling the screen. In SR Loom's own colours
+    // (dark or light, as the panel), small, in the top-right corner of the
+    // picture -- the SR display in Fullscreen, the woven window or the Looking
+    // Glass otherwise -- mostly see-through, and soon faded away: a name, the
+    // value, and a thin line showing where the value is in its range. A window
+    // of its own above the weave: left out of the capture (it would be woven as
+    // part of the picture), and it never takes the focus or the mouse.
+    HWND         g_osdWnd = nullptr;
+    std::wstring g_osdLabel, g_osdValue;
+    float        g_osdFrac = -1.0f;   // (0..1: where the value is in its range; < 0: no line)
+    bool         g_osdLight = false;  // (the light theme's colours)
+    ULONGLONG    g_osdShownAt = 0;
+    constexpr BYTE      kOsdAlpha  = 150;   // (of 255: mostly see-through)
+    constexpr ULONGLONG kOsdHoldMs = 650, kOsdFadeMs = 250;
+    LRESULT CALLBACK OsdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+    {
+        switch (m)
+        {
+        case WM_PAINT:
+        {
+            // (The panel's themes: Gui.cpp, warm dark / cream.)
+            const COLORREF cBg    = g_osdLight ? RGB(242, 235, 221) : RGB(28, 27, 25);
+            const COLORREF cText  = g_osdLight ? RGB(74, 68, 58)    : RGB(232, 228, 220);
+            const COLORREF cDim   = g_osdLight ? RGB(146, 134, 114) : RGB(138, 132, 122);
+            const COLORREF cTrack = g_osdLight ? RGB(214, 202, 180) : RGB(54, 50, 45);
+            const COLORREF cAcc   = g_osdLight ? RGB(178, 94, 59)   : RGB(210, 105, 74);
+            PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+            RECT r{}; GetClientRect(h, &r);
+            HBRUSH bg = CreateSolidBrush(cBg); FillRect(dc, &r, bg); DeleteObject(bg);
+            SetBkMode(dc, TRANSPARENT);
+            const int fh = r.bottom * 46 / 100;
+            HFONT fLabel = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HFONT fValue = CreateFontW(-fh, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            // (The name in the dim colour on the left, the value in the text colour on the right.)
+            const int pad = r.bottom * 55 / 100;
+            RECT tl{ pad, 0, r.right - pad, r.bottom - 2 };
+            HGDIOBJ old = SelectObject(dc, fLabel);
+            SetTextColor(dc, cDim);
+            DrawTextW(dc, g_osdLabel.c_str(), -1, &tl, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dc, fValue);
+            SetTextColor(dc, cText);
+            DrawTextW(dc, g_osdValue.c_str(), -1, &tl, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dc, old); DeleteObject(fLabel); DeleteObject(fValue);
+            // (The line: the range in the separator colour, the value in the accent.)
+            if (g_osdFrac >= 0.0f)
+            {
+                const int y0 = r.bottom - (std::max)(2, (int)r.bottom / 14), x0 = pad, x1 = r.right - pad;
+                RECT track{ x0, y0, x1, r.bottom }, fill{ x0, y0, x0 + (int)((x1 - x0) * (std::min)(1.0f, g_osdFrac) + 0.5f), r.bottom };
+                HBRUSH bt = CreateSolidBrush(cTrack); FillRect(dc, &track, bt); DeleteObject(bt);
+                HBRUSH bf = CreateSolidBrush(cAcc); FillRect(dc, &fill, bf); DeleteObject(bf);
+            }
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_TIMER:
+        {
+            // (Held, then faded out; a new press while it shows starts the hold again.)
+            const ULONGLONG age = GetTickCount64() - g_osdShownAt;
+            if (age <= kOsdHoldMs) return 0;
+            if (age >= kOsdHoldMs + kOsdFadeMs) { KillTimer(h, 1); ShowWindow(h, SW_HIDE); return 0; }
+            SetLayeredWindowAttributes(h, 0, (BYTE)(kOsdAlpha - kOsdAlpha * (age - kOsdHoldMs) / kOsdFadeMs), LWA_ALPHA);
+            return 0;
+        }
+        case WM_NCHITTEST: return HTTRANSPARENT;
+        }
+        return DefWindowProcW(h, m, w, l);
+    }
+    // area: the picture's place on the desktop (the display, or the woven window).
+    void ShowOsd(const RECT& area, const RECT& display, const std::wstring& label, const std::wstring& value, float frac)
+    {
+        if (!g_osdWnd)
+        {
+            WNDCLASSEXW wc{ sizeof(wc) };
+            wc.lpfnWndProc = OsdProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"SRLoomOsd";
+            RegisterClassExW(&wc);
+            g_osdWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                       L"SRLoomOsd", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, wc.hInstance, nullptr);
+            if (!g_osdWnd) return;
+            SetWindowDisplayAffinity(g_osdWnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+        g_osdLabel = label; g_osdValue = value; g_osdFrac = frac;
+        const int tm = Settings::ReadThemeMode();
+        g_osdLight = tm == 1 ? true : tm == 2 ? false : Settings::ReadSystemUsesLightTheme();
+        // (Sized by the display -- a ninth of its width, a forty-fifth of its
+        // height: about 430 x 48 px on a 4K panel -- but never wider than half
+        // the picture; a margin's breadth in from the picture's top-right corner.)
+        const int dw = display.right - display.left, dh = display.bottom - display.top;
+        const int aw = area.right - area.left;
+        const int h = (std::max)(26, dh / 45);
+        const int w = (std::max)(h * 5, (std::min)(dw / 9, aw / 2));
+        const int margin = h * 2 / 3;
+        SetLayeredWindowAttributes(g_osdWnd, 0, kOsdAlpha, LWA_ALPHA);
+        SetWindowPos(g_osdWnd, HWND_TOPMOST, area.right - w - margin, area.top + margin, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowRgn(g_osdWnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, h / 2, h / 2), TRUE);
+        InvalidateRect(g_osdWnd, nullptr, TRUE);
+        g_osdShownAt = GetTickCount64();
+        SetTimer(g_osdWnd, 1, 30, nullptr);
+    }
+    // Where the 3D picture is: the weave window while it is showing (the whole
+    // SR display in Fullscreen, the window or the Looking Glass otherwise).
+    RECT OsdArea(const AppState& app)
+    {
+        RECT r = app.srDisplayRect;
+        RECT wr{};
+        if (app.weavingEnabled && IsWindowVisible(app.hwnd) && GetWindowRect(app.hwnd, &wr) && wr.right > wr.left && wr.bottom > wr.top) r = wr;
+        return r;
+    }
+
     LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         AppLock appLock;   // (never while the render thread runs the loop body: see g_appLock)
@@ -8817,6 +9003,26 @@ namespace
                 app->pickDebug = (wParam == kHotkeyAutoRegionDbg);
                 ToggleAutoRegionUnderCursor(*app);
             }
+            else if (wParam == kHotkeyConvDown || wParam == kHotkeyConvUp)
+            {
+                // Convergence by the keyboard, a hundredth of the slider a press
+                // (held: it repeats), shown on the display for a moment.
+                float c = app->convergence + (wParam == kHotkeyConvUp ? 0.01f : -0.01f);
+                c = (std::max)(-2.0f, (std::min)(2.0f, std::round(c * 100.0f) / 100.0f));
+                app->convergence = c;
+                wchar_t t[32]; swprintf_s(t, L"%+.2f", (double)c);
+                ShowOsd(OsdArea(*app), app->srDisplayRect, L"Convergence", t, (c + 2.0f) / 4.0f);
+            }
+            else if (wParam == kHotkeyActDown || wParam == kHotkeyActUp)
+            {
+                // Anti-Crosstalk strength, 5% a press: the panel's own setting (the
+                // render loop applies it within half a second, the panel shows it).
+                int v = Settings::ReadWeaverActStrength() + (wParam == kHotkeyActUp ? 5 : -5);
+                v = (std::max)(0, (std::min)(300, v));
+                Settings::WriteWeaverActStrength(v);
+                wchar_t t[32]; swprintf_s(t, L"%d%%", v);
+                ShowOsd(OsdArea(*app), app->srDisplayRect, L"Anti-Crosstalk", t, (float)v / 300.0f);
+            }
             else if (wParam == kHotkeyCalibrate)
             {
                 // Recenter head tracking: snap the current head pose to
@@ -9195,6 +9401,7 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                     e.includeHT      = p.includeHeadTracking;
                     e.fullscreenOnly = p.fullscreenOnly;
                     e.useAutoFormat  = p.useAutoFormat;
+                    e.useVisualAuto  = p.useVisualAuto;
                     gs.profileEntries.push_back(std::move(e));
                 }
                 gs.profilesAutoApply        = app.profilesAutoApply;
@@ -9472,16 +9679,18 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                 (size_t)gs.profileToggleAutoFormatIndex < app.profiles.size())
             {
                 Profile& p = app.profiles[(size_t)gs.profileToggleAutoFormatIndex];
-                p.useAutoFormat = !p.useAutoFormat;
+                // Three states in turn: the saved format, the format from the
+                // title, Automatic Detection (format=detect).
                 // When flipping auto-format ON, seed defaultFormat with
                 // the current saved format so "detection fails" still
                 // yields something sensible (rather than the enum's
                 // default HalfSBS regardless of what the user had set).
-                // Flipping it OFF restores the fixed format from that
+                // Back at the saved format, it is restored from that
                 // fallback (which is what the file actually persists
-                // while Auto is on).
-                if (p.useAutoFormat) p.defaultFormat = p.format;
-                else                 p.format = p.defaultFormat;
+                // while either is on).
+                if (p.useVisualAuto)      { p.useVisualAuto = false; p.format = p.defaultFormat; }
+                else if (p.useAutoFormat) { p.useAutoFormat = false; p.useVisualAuto = true; }
+                else                      { p.useAutoFormat = true; p.defaultFormat = p.format; }
                 Profiles::Save(app.profiles);
             }
             if (gs.profilesOpenIni)
@@ -9541,6 +9750,30 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                     app.srStopAtMs = 0;
                     app.weaver.StopSR();
                     Log("SR session released (weaving off for %llu s)", kSrKeepAliveMs / 1000);
+                }
+                // The graphics device lost (the driver reset the GPU, or it was
+                // removed): nothing draws with it again. Said once, with Windows'
+                // reason, and the weave switched off -- it used to carry on,
+                // failing every frame and filling the log.
+                if (!app.deviceLost)
+                {
+                    const HRESULT r11 = app.renderer.Device() ? app.renderer.Device()->GetDeviceRemovedReason() : S_OK;
+                    Present12* lost12 = app.renderer.DX12();
+                    const HRESULT r12 = (lost12 && lost12->Device()) ? lost12->Device()->GetDeviceRemovedReason() : S_OK;
+                    if (FAILED(r11) || FAILED(r12))
+                    {
+                        app.deviceLost = true;
+                        Log("Graphics device lost: Direct3D 11 0x%08X, Direct3D 12 0x%08X (0x887A0006: the GPU hung on SR Loom's own commands; "
+                            "0x887A0007: it was reset over another program's; 0x887A0005: removed; 0x887A0020: a driver error). "
+                            "Weaving is switched off -- SR Loom has to be started again.", (unsigned)r11, (unsigned)r12);
+                        // (What SR Loom was doing, and what Direct3D 12 recorded of
+                        // the GPU's last work: to find what the GPU hung on.)
+                        Log("  at the time: format %s, anaglyph mode %d, weaver %s, conversion apart from the weave %s, last conversion %.2f ms, source %dx%d, light field %s",
+                            Profiles::FormatToString(app.format), app.anaglyphMode, app.weaver.WeaverChoice() >= 4 ? "DX12" : "DX11",
+                            app.asyncMode ? "on" : "off", app.gpuTimer.lastConvMs, app.capture.Width(), app.capture.Height(), app.lfOn ? "on" : "off");
+                        if (lost12) lost12->LogDeviceLoss();
+                        if (app.weavingEnabled) PostMessageW(app.hwnd, WM_COMMAND, ID_TRAY_TOGGLE_WEAVE, 0);
+                    }
                 }
                 // Weaver choice (panel): a different weaver needs a new SR session.
                 const int wantWeaver = Settings::ReadWeaverChoice();
@@ -9605,6 +9838,7 @@ static void LoopBody(AppState& app, bool frame, bool panel)
                     }
                 }
                 app.perfLog = Settings::ReadPerfLog();
+                app.renderer.SetAutoPlane(Settings::ReadAutoPlane(), Settings::ReadAutoPlaneDX12(), Settings::ReadAutoPlaneHold());   // (the panel's Straight to Display toggle)
                 app.renderer.SetLatencyStats(app.perfLog);
                 app.eyeOrderDetect = Settings::ReadEyeOrderDetect();
                 const bool skip = Settings::ReadDiagSkipWeave();
@@ -9788,7 +10022,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     // Set up Direct3D. The weaver/SR session is started on demand when weaving is
     // enabled; the default source is the monitor (passthrough), so no initial image.
     app.renderer.SetPlaneMode(Settings::ReadWeavePlane());   // (an experiment: see Settings.h)
-    app.renderer.SetAutoPlane(Settings::ReadAutoPlane());
+    app.renderer.SetAutoPlane(Settings::ReadAutoPlane(), Settings::ReadAutoPlaneDX12(), Settings::ReadAutoPlaneHold());
+    if (Settings::ReadAutoPlaneHold()) Log("WinMain: AutoPlane = 3 -- straight to the display is held once reached (an experiment: cut-outs show black)");
     if (!app.renderer.Initialize(app.hwnd, useDComp))
     {
         if (!useDComp) return 4;
@@ -9856,6 +10091,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     app.asyncWaitMs = Settings::ReadAsyncWaitUs() / 1000.0;
     app.asyncBands = Settings::ReadAsyncBands();
     app.asyncEnterMs = Settings::ReadAsyncEnterUs() / 1000.0;
+    app.weaveRaw = Settings::ReadWeaveRaw();
     Settings::ReadAnaCustom(app.anaCustomL, app.anaCustomR);
     app.anaSavedCount = Settings::ReadAnaSaved(app.anaSaved, 8);
     Log("WinMain: Recovered Colour converted %s", app.deferHeavyConvert ? "after the present (woven next refresh)" : "before the weave");
@@ -10162,6 +10398,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     const int hk4 = RegisterHotKey(app.hwnd, kHotkeyCalibrate, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'R');
     const int hk5 = RegisterHotKey(app.hwnd, kHotkeyAutoRegion, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'A');
     const int hk6 = RegisterHotKey(app.hwnd, kHotkeyAutoRegionDbg, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'A');
+    // (Convergence and Anti-Crosstalk by the keyboard: these repeat while held.)
+    RegisterHotKey(app.hwnd, kHotkeyConvDown, MOD_CONTROL | MOD_ALT, VK_OEM_4);      // [   (keys of the main keyboard)
+    RegisterHotKey(app.hwnd, kHotkeyConvUp,   MOD_CONTROL | MOD_ALT, VK_OEM_6);      // ]
+    RegisterHotKey(app.hwnd, kHotkeyActDown,  MOD_CONTROL | MOD_ALT, VK_OEM_MINUS);  // -
+    RegisterHotKey(app.hwnd, kHotkeyActUp,    MOD_CONTROL | MOD_ALT, VK_OEM_PLUS);   // =
     Log("WinMain: hotkeys W=%d F=%d C=%d R=%d A=%d ShiftA=%d", hk1, hk2, hk3, hk4, hk5, hk6);
 
     // Profiles: load list + master enable. Install the foreground-watch
@@ -10369,6 +10610,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int)
     FlushMediaProfileIfDirty(app);
 
     UnregisterHotKey(app.hwnd, kHotkeyToggle);
+    for (int id = kHotkeyConvDown; id <= kHotkeyActUp; ++id) UnregisterHotKey(app.hwnd, id);
     UnregisterHotKey(app.hwnd, kHotkeyMode);
     UnregisterHotKey(app.hwnd, kHotkeyCapture);
     UnregisterHotKey(app.hwnd, kHotkeyCalibrate);

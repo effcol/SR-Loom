@@ -39,6 +39,10 @@ namespace srw
 
         IDXGISwapChain1*           SwapChain() const { return m_swapChain; }
         ID3D12Device*              Device() const    { return m_device; }
+        void                       LogDeviceLoss();   // (what Direct3D 12 recorded about a lost device, into the log)
+        void                       SetHdrScale(float scale);   // (HDR: see Renderer::HdrRestore)
+        void                       DrawHdrRestore();
+        bool                       GateFailed() const { return m_gateFailed; }   // (straight to the display cannot be made safe here: BeginFrame)
         ID3D12GraphicsCommandList* List() const      { return m_list; }
         ID3D12CommandQueue*        Queue() const     { return m_queue; }
         ID3D12Resource*            BackBuffer() const { return m_back[m_index]; }   // (this frame's)
@@ -113,7 +117,10 @@ namespace srw
         void ReleaseShared();
         void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
 
-        static constexpr UINT kBuffers = 2;
+        static constexpr UINT kBuffers = 3;   // (three: see BeginFrame -- one may still be on screen, one waiting its turn)
+        unsigned                   m_heldBack = 0;   // (frames not begun: the display had not released a buffer)
+        int                        m_heldRun = 0;    // (... in a row)
+        bool                       m_gateFailed = false;   // (the display's present count is not to be had: GateFailed)
         static constexpr UINT kCbBytes = 4096, kTilesAt = 4096, kTilesBytes = 20480, kUploadBytes = 4096 + 20480 + 256;
 
         ID3D11Device*              m_d11 = nullptr;     // not owned
@@ -143,6 +150,9 @@ namespace srw
         // The mask pass.
         ID3D12RootSignature*       m_maskRoot = nullptr;
         ID3D12PipelineState*       m_maskPSO = nullptr;
+        ID3D12PipelineState*       m_scalePSO = nullptr;     // (HDR: the back buffer times m_hdrScale, DrawHdrRestore)
+        ID3DBlob*                  m_maskVsBlob = nullptr;   // (the full-screen vertex shader's code, kept for it)
+        float                      m_hdrScale = 1.0f;
         ID3D12DescriptorHeap*      m_gpuHeap = nullptr;      // the mask's t0: the GPU tracker's results
         ID3D12Resource*            m_rowsBuf = nullptr;      // (CopyRows / FetchRows)
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_rowsFp{};

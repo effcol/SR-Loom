@@ -85,7 +85,10 @@ namespace srw
         void SetPlaneMode(bool on) { m_planeMode = on; }
         // ... chosen by itself: opaque (straight to the display) while nothing has to
         // show through, see-through otherwise. See UpdateAutoPlane.
-        void SetAutoPlane(bool on) { m_autoPlane = on; }
+        void SetAutoPlane(bool on, bool withDX12 = false, bool hold = false) { m_autoPlane = on; m_autoPlane12 = withDX12; m_planeHold = hold; }
+        // The weave drawn into a view of the back buffer that does not encode (its
+        // input is the capture's own, still encoded, frame: main.cpp, WeaveRaw).
+        void SetRawWeave(bool on) { m_rawWeave = on; }
         bool IsPlane() const { return m_planeMode; }
         // The Direct3D 12 presenter (the DX12 weaver choice) in place of the
         // Direct3D 11 one, or back: DirectComposition only. False when it could
@@ -104,6 +107,9 @@ namespace srw
         void SetLatencyStats(bool on) { m_latencyStats = on; }
         // The Direct3D 11 presenter drawing 16-bit float scRGB (Settings HdrOutput).
         void SetHdrOutput(bool on);
+        // HDR: the weave made in the ordinary range and brought back after (Renderer.cpp).
+        void SetHdrScale(float scale);
+        void HdrRestore();
         bool IsDX12() const { return m_p12 != nullptr; }
         Present12* DX12() const { return m_p12; }
         // Loops since the last call, and those that began with the frame before
@@ -175,6 +181,9 @@ namespace srw
         ID3D11VertexShader*     m_maskVS    = nullptr;
         ID3D11PixelShader*      m_maskPS    = nullptr;
         ID3D11BlendState*       m_maskBlend = nullptr;
+        ID3D11PixelShader*      m_hdrPS     = nullptr;   // (HdrRestore)
+        ID3D11BlendState*       m_hdrBlend  = nullptr;
+        float                   m_hdrScale  = 1.0f;
         ID3D11Buffer*           m_maskCB    = nullptr;
         ID3D11Buffer*           m_maskTiles = nullptr;   // which rects touch each screen tile (the mask shader's t1)
         ID3D11ShaderResourceView* m_maskTilesSRV = nullptr;
@@ -192,6 +201,8 @@ namespace srw
         IDXGIFactory2*          m_factory   = nullptr;   // kept for swap-chain recreation
         IDXGISwapChain1*        m_swapChain = nullptr;
         ID3D11RenderTargetView* m_rtv       = nullptr;
+        ID3D11RenderTargetView* m_rtvRaw    = nullptr;   // (the back buffer viewed without sRGB encoding: SetRawWeave)
+        bool                    m_rawWeave  = false;
         UINT                    m_width     = 0;
         UINT                    m_height    = 0;
         // The weaver writes sRGB. Flip swap chains can't be created with an _SRGB
@@ -206,6 +217,8 @@ namespace srw
         bool                    m_allowTearing = false; // GPU/OS supports tearing (VRR)
         bool                    m_planeMode = false;    // (SetPlaneMode)
         bool                    m_autoPlane = false;    // (SetAutoPlane)
+        bool                    m_autoPlane12 = false;  // (... with the Direct3D 12 presenter too: see UpdateAutoPlane)
+        bool                    m_planeHold = false;    // (... kept once reached, whatever comes up: an experiment, UpdateAutoPlane)
         int                     m_clearRun = 0;         // frames in a row with nothing to show through
         void UpdateAutoPlane();
         bool                    m_flip       = true;    // current model: true=flip, false=bit-blt

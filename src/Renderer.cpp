@@ -1,5 +1,6 @@
 #include "Renderer.h"
 #include "Present12.h"
+#include "Settings.h"
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>   // IDXGISwapChain2, FRAME_LATENCY_WAITABLE_OBJECT
 #include <dxgi1_5.h>   // IDXGIFactory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING
@@ -135,10 +136,14 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
                 typedef LONG (WINAPI* SetClassFn)(HANDLE, int);   // (D3DKMTSetProcessSchedulingPriorityClass)
                 if (auto fn = (SetClassFn)GetProcAddress(gdi, "D3DKMTSetProcessSchedulingPriorityClass"))
                 {
-                    LONG st = fn(GetCurrentProcess(), 4);          // (D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH)
-                    int cls = 4;
+                    // (Settings GpuRealtime = 1: the realtime class first -- what
+                    // VRScreenCap asks of its Vulkan queue. Windows grants it only to
+                    // a process run as administrator; refused, High as before.)
+                    LONG st = -1; int cls = 4;
+                    if (Settings::ReadGpuRealtime()) { st = fn(GetCurrentProcess(), 5); cls = 5; }   // (..._REALTIME)
+                    if (st != 0) { st = fn(GetCurrentProcess(), 4); cls = 4; }   // (D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH)
                     if (st != 0) { st = fn(GetCurrentProcess(), 3); cls = 3; }   // (..._ABOVE_NORMAL)
-                    Log("Renderer: GPU scheduling class %s %s (0x%08lX)", cls == 4 ? "high" : "above normal",
+                    Log("Renderer: GPU scheduling class %s %s (0x%08lX)", cls == 5 ? "realtime" : cls == 4 ? "high" : "above normal",
                         st == 0 ? "set" : "refused", (unsigned long)st);
                 }
             }
@@ -194,7 +199,7 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
             return true;
         }
         Log("Renderer: DirectComposition setup failed (hr=0x%08X)", (unsigned)hr);
-        SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_swapChain);
+        SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw); SAFE_RELEASE(m_swapChain);
         SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
         return false;   // the caller recreates the window for the classic presenter
     }
@@ -212,7 +217,7 @@ bool Renderer::Initialize(HWND hwnd, bool useDComp)
 // (non-layered windows), else bit-blt (works on layered click-through windows).
 bool Renderer::CreateDCompSwapChain()
 {
-    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
     SAFE_RELEASE(m_swapChain);
     m_waitable = nullptr;
     m_flip       = true;
@@ -726,7 +731,7 @@ bool Renderer::SetDX12(bool on, bool hdr)
             delete m_p12; m_p12 = nullptr;
             return false;
         }
-        SAFE_RELEASE(m_rtv);
+        SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
         SAFE_RELEASE(m_swapChain);
         m_context->Flush();
         m_swapChain = m_p12->SwapChain(); m_swapChain->AddRef();
@@ -865,7 +870,7 @@ void Renderer::ApplyMask()
 bool Renderer::CreateSwapChain(bool flip)
 {
     if (m_dcomp) return CreateDCompSwapChain();   // one model for every mode
-    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
     const bool replacing = (m_swapChain != nullptr);
     SAFE_RELEASE(m_swapChain);
     m_waitable = nullptr;   // owned by the swap chain; invalidated on release
@@ -929,7 +934,7 @@ bool Renderer::CreateSwapChain(bool flip)
 
 bool Renderer::CreateBackBufferView()
 {
-    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
 
     ID3D11Texture2D* backBuffer = nullptr;
     HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
@@ -980,7 +985,7 @@ bool Renderer::Resize(UINT width, UINT height)
         return true;
     }
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
-    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
 
     HRESULT hr = m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, m_swapFlags);
     if (FAILED(hr))
@@ -1004,10 +1009,25 @@ bool Renderer::Resize(UINT width, UINT height)
 // to show through again (the taskbar, a window in front), see-through.
 void Renderer::UpdateAutoPlane()
 {
-    if (!m_autoPlane || !m_dcomp) return;
+    // (Switched off while straight to the display -- the panel's toggle: back
+    // through the compositor, below.)
+    const bool allowed = m_autoPlane && !(m_p12 && !m_autoPlane12);
+    if (!m_dcomp || (!allowed && !m_planeMode)) return;
+    // (Settings AutoPlane = 2 keeps the Direct3D 12 presenter out of it. Three
+    // times on 2026-10-04 the GPU hung there -- the driver timed out and reset
+    // it, device removed reason DEVICE_HUNG -- at the moment something came up
+    // over the straight-to-display picture (the taskbar): the frame in flight
+    // stopped at its first write to the back buffer and never finished. What
+    // is done about it: Present12::BeginFrame. The Direct3D 11 presenter makes
+    // the same switch without it.)
     const bool clear = m_maskAll && m_maskRects.empty() && m_maskTracked.empty() && m_maskExcl.empty();
     m_clearRun = clear ? m_clearRun + 1 : 0;
-    const bool want = clear && m_clearRun > 160;
+    // (m_planeHold, an experiment -- Settings AutoPlane = 3: once straight to the
+    // display, it stays so whatever comes up. What Windows shows above the
+    // picture then either gets a hardware layer of its own -- the weave-to-
+    // display time in the perf log stays about 1 ms -- or everything is composed
+    // again, about 6 ms. Cut-outs show black meanwhile: for measuring only.)
+    const bool want = allowed && ((clear && m_clearRun > 160) || (m_planeHold && m_planeMode)) && !(m_p12 && m_p12->GateFailed());
     if (want == m_planeMode) return;
     m_planeMode = want;
     m_context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1060,7 +1080,20 @@ void Renderer::BindAndClearBackBuffer()
     }
     else
         m_context->RSSetState(nullptr);
-    m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+    // (The weave on the capture's pixels as they are -- SetRawWeave: into a view
+    // of the back buffer that does not encode them again.)
+    ID3D11RenderTargetView* weaveRtv = m_rtv;
+    if (m_rawWeave && !m_hdrOut && m_swapFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
+    {
+        if (!m_rtvRaw)
+        {
+            ID3D11Resource* bb = nullptr; m_rtv->GetResource(&bb);
+            D3D11_RENDER_TARGET_VIEW_DESC rd{}; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (bb) { m_device->CreateRenderTargetView(bb, &rd, &m_rtvRaw); bb->Release(); }
+        }
+        if (m_rtvRaw) weaveRtv = m_rtvRaw;
+    }
+    m_context->OMSetRenderTargets(1, &weaveRtv, nullptr);
 
     D3D11_VIEWPORT vp{};
     vp.Width    = (FLOAT)m_width;
@@ -1206,6 +1239,9 @@ void Renderer::Present(bool vsync, bool flushDwm)
         // waitable object (WaitForFrame) paces the loop.
         if (!m_maskDone) ApplyMask();
         m_maskDone = false;
+        // (No Direct3D 12 frame begun this loop -- Present12::BeginFrame held it
+        // back: nothing to show; the last frame stays up.)
+        if (m_p12 && !m_p12->InFrame()) { m_lastPresentEnd = std::chrono::steady_clock::now(); return; }
         if (m_p12) m_p12->EndFrame();   // (sent to its queue, behind Direct3D 11's drawing)
         m_swapChain->Present(0, (m_swapFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (m_latencyStats) NotePresent();
@@ -1260,13 +1296,14 @@ bool Renderer::TakeDisplayLatency(double& avgMs, double& minMs, double& maxMs, i
 
 void Renderer::Shutdown()
 {
-    SAFE_RELEASE(m_rtv);
+    SAFE_RELEASE(m_rtv); SAFE_RELEASE(m_rtvRaw);
     if (m_p12) { SAFE_RELEASE(m_swapChain); delete m_p12; m_p12 = nullptr; }
     SAFE_RELEASE(m_swapChain);
     SAFE_RELEASE(m_maskTilesSRV); SAFE_RELEASE(m_maskTiles);
     SAFE_RELEASE(m_scissorRS); SAFE_RELEASE(m_alphaProbeTex); m_alphaProbe = 0;
     SAFE_RELEASE(m_gpuShareRTV); SAFE_RELEASE(m_gpuShareTex); SAFE_RELEASE(m_gpuSharePS);
     SAFE_RELEASE(m_maskCB); SAFE_RELEASE(m_maskBlend); SAFE_RELEASE(m_maskPS); SAFE_RELEASE(m_maskVS);
+    SAFE_RELEASE(m_hdrPS); SAFE_RELEASE(m_hdrBlend);
     SAFE_RELEASE(m_dcVisual); SAFE_RELEASE(m_dcTarget); SAFE_RELEASE(m_dcomp);
     { std::lock_guard<std::mutex> g(m_vblankMutex); SAFE_RELEASE(m_vblankOutput); }
     SAFE_RELEASE(m_factory);
@@ -1323,4 +1360,59 @@ void Renderer::SetVBlankMonitor(HMONITOR target)
     m_lastVBlank = {};        // (the old display's phase means nothing now)
     m_clockCheckMs = 0;       // (compare the clocks again straight away)
     Log("Renderer: waiting for refreshes on %s", found ? "the SR display's new output" : "nothing (the SR display isn't on this adapter)");
+}
+
+// HDR: the weave is made on a picture brought down into the ordinary 0..1 range
+// (the converter divides by this scale -- Converter::SetHdrScale), and brought
+// back up here, after the weave: the weaver is built for that range (advice
+// from one of its original developers, 2026-10-05: "convert HDR to non-HDR,
+// weave, convert it back"). The scale: the display's peak brightness over the
+// 80 nits that 1.0 means in a float (scRGB) picture.
+void Renderer::SetHdrScale(float scale)
+{
+    scale = (std::max)(1.0f, (std::min)(125.0f, scale));
+    if (scale == m_hdrScale) return;
+    m_hdrScale = scale;
+    SAFE_RELEASE(m_hdrPS);   // (the scale is written into the shader: made again)
+    if (m_p12) m_p12->SetHdrScale(scale);
+}
+
+// After the weave, before the mask: every pixel of the back buffer times the
+// scale -- one pass with nothing read (the blend does the multiplying).
+void Renderer::HdrRestore()
+{
+    if (m_hdrScale <= 1.0f) return;
+    if (m_p12) { m_p12->SetHdrScale(m_hdrScale); m_p12->DrawHdrRestore(); return; }
+    if (!m_hdrOut || !m_rtv || !m_maskVS) return;
+    if (!m_hdrPS)
+    {
+        char src[160];
+        snprintf(src, sizeof(src), "float4 PSMain() : SV_Target { return float4(%.6f, %.6f, %.6f, 1.0); }", m_hdrScale, m_hdrScale, m_hdrScale);
+        ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
+        if (SUCCEEDED(D3DCompile(src, strlen(src), "HdrRestore", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err)))
+            m_device->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &m_hdrPS);
+        SAFE_RELEASE(psb); SAFE_RELEASE(err);
+        if (m_hdrPS) Log("Renderer: HDR -- the weave is made at 1/%.2f of the picture's brightness and brought back after", m_hdrScale);
+    }
+    if (!m_hdrBlend)
+    {
+        D3D11_BLEND_DESC bd{};
+        auto& b = bd.RenderTarget[0];
+        b.BlendEnable = TRUE; b.SrcBlend = D3D11_BLEND_ZERO; b.DestBlend = D3D11_BLEND_SRC_COLOR; b.BlendOp = D3D11_BLEND_OP_ADD;
+        b.SrcBlendAlpha = D3D11_BLEND_ZERO; b.DestBlendAlpha = D3D11_BLEND_ONE; b.BlendOpAlpha = D3D11_BLEND_OP_ADD;   // (alpha as the weave left it)
+        b.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        m_device->CreateBlendState(&bd, &m_hdrBlend);
+    }
+    if (!m_hdrPS || !m_hdrBlend) return;
+    m_context->OMSetRenderTargets(1, &m_rtv, nullptr);
+    D3D11_VIEWPORT vp{ 0, 0, (FLOAT)m_width, (FLOAT)m_height, 0, 1 };
+    m_context->RSSetViewports(1, &vp);
+    m_context->RSSetState(nullptr);
+    m_context->OMSetBlendState(m_hdrBlend, nullptr, 0xFFFFFFFF);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_context->IASetInputLayout(nullptr);
+    m_context->VSSetShader(m_maskVS, nullptr, 0);
+    m_context->PSSetShader(m_hdrPS, nullptr, 0);
+    m_context->Draw(3, 0);
+    m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 }

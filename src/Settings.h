@@ -100,6 +100,14 @@ namespace srw::Settings
     // ON). About 5 ms less from the weave to the display, and the screen capture
     // then only reports what really changed. HKCUSoftwareSRLoomAutoPlane.
     bool ReadAutoPlane();
+    void WriteAutoPlane(bool on);   // (the panel's toggle: 1 / 0)
+    bool ReadAutoPlaneDX12();   // (AutoPlane = 2: not with the Direct3D 12 presenter -- it hung the GPU there once, Renderer::UpdateAutoPlane)
+    bool ReadAutoPlaneHold();   // (AutoPlane = 3: an experiment -- straight to the display kept whatever comes up over it)
+    // 1: ask for the GPU scheduler's realtime class (needs SR Loom run as administrator; else High as usual). Default 0. HKCU\Software\SRLoom\GpuRealtime.
+    bool ReadGpuRealtime();
+    void WriteGpuRealtime(bool on);
+    // 1: with the Direct3D 11 weaver, a Half SBS capture (no Convergence, no swap) goes to the weaver as it is -- no conversion pass. An experiment: default 0. WeaveRaw.
+    bool ReadWeaveRaw();
     // HDR (no UI yet): capture, conversion and the weave's swap chain 16-bit float
     // (scRGB) instead of 8-bit, so brighter-than-white picture is kept, with
     // either weaver. 1 (default): when Windows has HDR switched on for the SR

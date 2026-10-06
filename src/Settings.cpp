@@ -184,6 +184,12 @@ namespace srw::Settings
         }
     }
 
+    void WriteAutoPlane(bool on) { WriteDword(kSettingsKey, L"AutoPlane", on ? 1 : 0); }
+    bool ReadAutoPlaneDX12() { const DWORD v = ReadDword(kSettingsKey, L"AutoPlane", 1); return v != 0 && v != 2; }   // (2: the Direct3D 11 presenter only)
+    bool ReadAutoPlaneHold() { return ReadDword(kSettingsKey, L"AutoPlane", 1) == 3; }   // (3: held once reached -- an experiment, Renderer::UpdateAutoPlane)
+    bool ReadWeaveRaw() { return ReadDword(kSettingsKey, L"WeaveRaw", 0) != 0; }
+    bool ReadGpuRealtime() { return ReadDword(kSettingsKey, L"GpuRealtime", 0) != 0; }
+    void WriteGpuRealtime(bool on) { WriteDword(kSettingsKey, L"GpuRealtime", on ? 1 : 0); }
     bool ReadAutoPlane()
     {
         return ReadDword(kSettingsKey, L"AutoPlane", 1) != 0;   // default ON

@@ -134,7 +134,7 @@ file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
 set(CONVERTER_HLSL "${CMAKE_SOURCE_DIR}/src/shaders/Converter.hlsl")
 set(CONVERTER_ENTRIES
     VSMain:vs_5_0 PSMain:ps_5_0 PSAnaDisp:ps_5_0 PSAnaDesc:ps_5_0 PSAnaDescCoarse:ps_5_0 PSDown:ps_5_0 PSAnaRefine:ps_5_0
-    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSAnaPair:ps_5_0 PSAnaCompose:ps_5_0 PSAnaPair:ps_5_0:Plain PSAnaCompose:ps_5_0:Plain PSFmtHalfSBS:ps_5_0 PSFmtFullSBS:ps_5_0 PSFmtTAB:ps_5_0 PSFmtRow:ps_5_0 PSFmtColumn:ps_5_0 PSFmtChecker:ps_5_0 PSFmtFramePack:ps_5_0 PSFmtAnaglyph:ps_5_0 PSFmtQuilt:ps_5_0 CSFmtAnaglyph:cs_5_0 CSFmtChecker:cs_5_0 CSFmtColumn:cs_5_0 CSFmtRow:cs_5_0 PSQuiltH:ps_5_0 PSAnaBoxCheck:ps_5_0 PSAnaBoxRows:ps_5_0 PSAnaBoxMap:ps_5_0 PSChange:ps_5_0 PSChangeGrow:ps_5_0 PSChangeGrow2:ps_5_0 PSDownBox:ps_5_0 PSDownFlat:ps_5_0 PSFlatShrink:ps_5_0 PSReach:ps_5_0 PSChangeStatRows:ps_5_0 PSChangeStat:ps_5_0 PSScrollCost:ps_5_0 PSScrollSum:ps_5_0 PSScrollPick:ps_5_0 PSChangeScrollQ:ps_5_0 PSChangeScroll:ps_5_0 PSAnaBoxShiftCost:ps_5_0 PSAnaBoxShift:ps_5_0)
+    PSAnaFill:ps_5_0 PSAnaSmooth:ps_5_0 PSAnaPair:ps_5_0 PSAnaCompose:ps_5_0 PSAnaPair:ps_5_0:Plain PSAnaCompose:ps_5_0:Plain PSDown:ps_5_0:Plain PSDownFlat:ps_5_0:Plain PSAnaDesc:ps_5_0:Plain PSAnaDescCoarse:ps_5_0:Plain PSAnaFill:ps_5_0:Plain PSAnaSmooth:ps_5_0:Plain PSFmtHalfSBS:ps_5_0 PSFmtFullSBS:ps_5_0 PSFmtTAB:ps_5_0 PSFmtRow:ps_5_0 PSFmtColumn:ps_5_0 PSFmtChecker:ps_5_0 PSFmtFramePack:ps_5_0 PSFmtAnaglyph:ps_5_0 PSFmtQuilt:ps_5_0 PSFmtPulfrich:ps_5_0 PSFmtSequential:ps_5_0 PSFmtVR:ps_5_0 PSFmtRgbd:ps_5_0 PSFmtCopy:ps_5_0 PSRgbdSide:ps_5_0 CSFmtAnaglyph:cs_5_0 CSFmtChecker:cs_5_0 CSFmtColumn:cs_5_0 CSFmtRow:cs_5_0 CSAnaCompose:cs_5_0 CSAnaCompose:cs_5_0:Plain PSQuiltH:ps_5_0 PSAnaBoxCheck:ps_5_0 PSAnaBoxRows:ps_5_0 PSAnaBoxMap:ps_5_0 PSChange:ps_5_0 PSChangeGrow:ps_5_0 PSChangeGrow2:ps_5_0 PSDownBox:ps_5_0 PSDownFlat:ps_5_0 PSFlatShrink:ps_5_0 PSReach:ps_5_0 PSChangeStatRows:ps_5_0 PSChangeStat:ps_5_0 PSScrollCost:ps_5_0 PSScrollSum:ps_5_0 PSScrollPick:ps_5_0 PSChangeScrollQ:ps_5_0 PSChangeScroll:ps_5_0 PSAnaBoxShiftCost:ps_5_0 PSAnaBoxShift:ps_5_0)
 set(CONVERTER_SHADER_HEADERS)
 foreach(E ${CONVERTER_ENTRIES})
     string(REPLACE ":" ";" P "${E}")
@@ -310,3 +310,15 @@ target_include_directories(lensprobe PRIVATE "${SR_SDK_DIR}/include")
 target_compile_definitions(lensprobe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(lensprobe PRIVATE ${SR_IMPORT_LIBS} ${SR_THIRD_PARTY_LIBS})
 set_target_properties(lensprobe PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release)
+
+# katsend: a Katanga test sender (a shared side-by-side texture, optionally
+# drawn only in its top-left part). Not part of the app:
+#   cmake --build build/x64 --config Release --target katsend
+add_executable(katsend EXCLUDE_FROM_ALL tools/katsend/katsend.cpp)
+target_link_libraries(katsend PRIVATE d3d11 dxgi)
+
+# copybench: does a large texture copy on a Direct3D 12 copy queue run at the
+# same time as shader work on the main queue? Not part of the app:
+#   cmake --build build/x64 --config Release --target copybench
+add_executable(copybench EXCLUDE_FROM_ALL tools/copybench/copybench.cpp)
+target_link_libraries(copybench PRIVATE d3d12 dxgi d3dcompiler)

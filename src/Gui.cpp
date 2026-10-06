@@ -241,6 +241,19 @@ namespace
         return ToggleSwitch(label, on);
     }
 
+    // A tooltip that wraps: ImGui's own SetTooltip is one line, cut off at the
+    // panel's edge when the text is longer than the panel is wide.
+    void WrapTooltip(const char* text, float dpiScale)
+    {
+        const float maxW = 320.0f * dpiScale;
+        ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(maxW - 14.0f * dpiScale);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+
     // A single icon button that toggles light/dark: a half-filled circle (the
     // classic day/night glyph), custom-drawn so it needs no icon font. Returns clicked.
     bool IconThemeButton(const char* id)
@@ -438,6 +451,8 @@ bool Gui::Init(HWND mainHwnd, ID3D11Device* device, ID3D11DeviceContext* context
     m_directComposition     = Settings::ReadDirectComposition();
     m_lateLatching          = Settings::ReadLateLatching();
     m_perfLog               = Settings::ReadPerfLog();
+    m_gpuRealtime           = Settings::ReadGpuRealtime();
+    m_autoPlaneOn           = Settings::ReadAutoPlane();
     m_eyeOrder              = Settings::ReadEyeOrderDetect();
     // The weave-skip test never survives a restart (a black 3D screen at
     // launch would look broken).
@@ -930,6 +945,8 @@ bool Gui::Render(GuiState& state)
                     sc("Ctrl+Alt+F", "Fullscreen / Windowed");
                     sc("Ctrl+Alt+C", "Make Active Window 3D");
                     sc("Ctrl+Alt+R", "Recentre Head Tracking");
+                    sc("Ctrl+Alt+[  ]", "Convergence Down / Up");
+                    sc("Ctrl+Alt+-  =", "Anti-Crosstalk Down / Up");
 
                     ImGui::Dummy(ImVec2(0, 6 * m_dpiScale));
                     // "Check for updates" link. Posts the result directly
@@ -1010,7 +1027,9 @@ bool Gui::Render(GuiState& state)
             // The theme button: a menu of Auto (as Windows), Light, Dark; the choice is kept.
             if (IconThemeButton("##theme")) ImGui::OpenPopup("##themeMenu");
             // (The menu drops from just under the button.)
-            ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y + 2.0f * m_dpiScale));
+            // (Its right edge under the button's: the button sits at the panel's right
+            // edge, and a menu dropped from its left ran off the panel, cut off.)
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMax().x, ImGui::GetItemRectMax().y + 2.0f * m_dpiScale), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
             if (ImGui::BeginPopup("##themeMenu"))
             {
                 static const char* const kTheme[3] = { "Auto", "Light", "Dark" };
@@ -1249,8 +1268,16 @@ bool Gui::Render(GuiState& state)
     }
     const float want = (m_sectionsH > 1.0f) ? m_sectionsH : (400.0f * m_dpiScale);
     const float childH = (want < maxChild) ? want : maxChild;
+    // (Never sideways: a row a few pixels wider than the panel let a touchpad or
+    // Shift + wheel slide the whole panel left and right.)
+    if (ImGui::GetScrollX() != 0.0f) ImGui::SetScrollX(0.0f);
     ImGui::BeginChild("opts", ImVec2(0, childH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground);   // no box/border around the options
+    if (ImGui::GetScrollX() != 0.0f) ImGui::SetScrollX(0.0f);
+    {
+        static bool s_said = false;
+        if (!s_said && ImGui::GetScrollMaxX() > 0.5f) { s_said = true; Log("Gui: the panel's rows are %.0f px wider than the panel", ImGui::GetScrollMaxX()); }
+    }
     {
         // What to weave. The source choice implies the output: Monitor = fullscreen,
         // a picked Window = windowed overlay; Looking Glass is the floating loupe.
@@ -1327,6 +1354,10 @@ bool Gui::Render(GuiState& state)
             ImGui::SetNextItemWidth(half);
             if (ImGui::BeginCombo("##srcdisp", dispLabel, ImGuiComboFlags_HeightLargest))
             {
+                // (The list in the theme's own text colour: with this source in use the
+                // box is drawn in the accent colour with near-white text, and the list
+                // took that text too -- white on the light theme's cream.)
+                ImGui::PushStyleColor(ImGuiCol_Text, g_text);
                 int shown = 0;
                 for (int i = 0; i < (int)mons.size(); ++i)
                 {
@@ -1339,6 +1370,7 @@ bool Gui::Render(GuiState& state)
                     ++shown;
                 }
                 if (shown == 0) ImGui::TextDisabled("No other displays");
+                ImGui::PopStyleColor();
                 ImGui::EndCombo();
             }
             if (dispActive) popAccent();
@@ -1349,6 +1381,10 @@ bool Gui::Render(GuiState& state)
             ImGui::SetNextItemWidth(half);
             if (ImGui::BeginCombo("##srcwin", winLabel, ImGuiComboFlags_HeightLargest))
             {
+                // (The list in the theme's own text colour: with this source in use the
+                // box is drawn in the accent colour with near-white text, and the list
+                // took that text too -- white on the light theme's cream.)
+                ImGui::PushStyleColor(ImGuiCol_Text, g_text);
                 std::vector<WinEntry> wins;
                 EnumWindows(EnumProc, reinterpret_cast<LPARAM>(&wins));
                 for (int i = 0; i < (int)wins.size(); ++i)
@@ -1359,6 +1395,7 @@ bool Gui::Render(GuiState& state)
                     ImGui::PopID();
                 }
                 if (wins.empty()) ImGui::TextDisabled("No windows");
+                ImGui::PopStyleColor();
                 ImGui::EndCombo();
             }
             if (winActive) popAccent();
@@ -1450,7 +1487,7 @@ bool Gui::Render(GuiState& state)
                     PostMessageA(m_mainHwnd, WM_APP_PIN_INPUT, (WPARAM)value, 0);
                 const bool hov = ImGui::IsItemHovered();
                 if (hov)
-                    ImGui::SetTooltip(pinned ? "Default input at start-up" : "Make this the default input at start-up");
+                    WrapTooltip(pinned ? "Default input at start-up" : "Make this the default input at start-up", m_dpiScale);
                 const ImU32 col = pinned ? ImGui::GetColorU32(g_accent)
                                          : ImGui::GetColorU32(hov ? g_text : g_dim);
                 ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1639,7 +1676,7 @@ bool Gui::Render(GuiState& state)
                         ImGui::SameLine(0, 0);
                         use |= ImGui::ColorButton("##sr", ImVec4(s[3], s[4], s[5], 1), bf, ImVec2(sz, sz));
                         const bool rr = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to use this pair, right-click to remove it");
+                        if (ImGui::IsItemHovered()) WrapTooltip("Click to use this pair, right-click to remove it", m_dpiScale);
                         if (use) state.anaSavedLoad = k;
                         if (rl || rr) state.anaSavedDelete = k;
                         ImGui::PopID();
@@ -1740,9 +1777,9 @@ bool Gui::Render(GuiState& state)
                     static const char* const kNear[2] = { "White (lighter is closer)", "Black (darker is closer)" };
                     const int side = m_rgbdAuto ? 0 : (m_rgbdLeft ? 2 : 1);
                     const int side2 = lcombo("Depth map", "##rgbdSide", kSide, 3, side);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The depth map is the grey picture beside the colour one: it says how far away each part is.");
+                    if (ImGui::IsItemHovered()) WrapTooltip("The depth map is the grey picture beside the colour one: it says how far away each part is.", m_dpiScale);
                     const int near2 = lcombo("Near is", "##rgbdNear", kNear, 2, m_rgbdInvert ? 1 : 0);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which shade of the depth map means close to you. If the 3D looks inside-out, pick the other.");
+                    if (ImGui::IsItemHovered()) WrapTooltip("Which shade of the depth map means close to you. If the 3D looks inside-out, pick the other.", m_dpiScale);
                     if (side2 != side || near2 != (m_rgbdInvert ? 1 : 0))
                     {
                         m_rgbdAuto = side2 == 0; m_rgbdLeft = side2 == 2; m_rgbdInvert = near2 == 1;
@@ -1982,7 +2019,7 @@ bool Gui::Render(GuiState& state)
                     m_actStrength = (int)(pct + 0.5f);
                     Settings::WriteWeaverActStrength(m_actStrength);
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reduces ghosting between the eyes. 100%% is the display's own amount.");
+                if (ImGui::IsItemHovered()) WrapTooltip("Reduces ghosting between the eyes. 100% is the display's own amount.", m_dpiScale);
                 ImGui::SameLine();
                 if (ImGui::Button("Reset##actMain", ImVec2(resetW, 0))) { m_actStrength = 100; Settings::WriteWeaverActStrength(100); }
                 ImGui::EndDisabled();
@@ -2396,8 +2433,11 @@ bool Gui::Render(GuiState& state)
                     ImGui::EndTooltip();
                 }
                 ImGui::SameLine(0, spc);
-                ImGui::PushStyleColor(ImGuiCol_Text, autoFmt ? g_accent : g_dim);
-                if (ImGui::Button(autoFmt ? "Auto-Format: ON" : "Auto-Format: off", ImVec2(halfW, 0)))
+                // (Three states, in turn: the saved format, the format from the
+                // window title, Automatic Detection -- format=detect in the file.)
+                const bool visFmt = state.profileEntries[s_selected].useVisualAuto;
+                ImGui::PushStyleColor(ImGuiCol_Text, (autoFmt || visFmt) ? g_accent : g_dim);
+                if (ImGui::Button(visFmt ? "Format: Detect" : autoFmt ? "Format: From Title" : "Format: Saved", ImVec2(halfW, 0)))
                     state.profileToggleAutoFormatIndex = s_selected;
                 ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered())
@@ -2406,9 +2446,11 @@ bool Gui::Render(GuiState& state)
                     ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(maxW, FLT_MAX));
                     ImGui::BeginTooltip();
                     ImGui::PushTextWrapPos(maxW - 14.0f * m_dpiScale);
-                    ImGui::TextUnformatted(autoFmt
-                        ? "Detect the stereo format from the window title (HSBS, HTAB, _2x1, MVC, anaglyph, etc.); the profile's saved format becomes the fallback when nothing is recognised. Click to disable."
-                        : "Always use the profile's saved format. Click to auto-detect from title tokens instead (recommended for media players / browsers where the file name carries the format).");
+                    ImGui::TextUnformatted(visFmt
+                        ? "Automatic Detection: SR Loom looks at the picture itself for the layout (experimental). Click to go back to the profile's saved format."
+                        : autoFmt
+                        ? "The stereo format is worked out from the window title (HSBS, HTAB, _2x1, MVC, anaglyph, etc.); the profile's saved format is the fallback when nothing is recognised. Click for Automatic Detection instead."
+                        : "Always use the profile's saved format. Click to work the format out from the window title instead (recommended for media players / browsers where the file name carries the format).");
                     ImGui::PopTextWrapPos();
                     ImGui::EndTooltip();
                 }
@@ -2770,6 +2812,26 @@ bool Gui::Render(GuiState& state)
             }
             tip("Writes frame-rate and timing lines to srweaver.log every 5 seconds "
                 "(\"Frame profile\" and \"GPU ms\"), for tracking down lag. Applies straight away.");
+            // Fourth row: the GPU scheduler's realtime class (Settings GpuRealtime).
+            if (pairToggle2("Realtime GPU", m_gpuRealtime, halfW))
+            {
+                m_gpuRealtime = !m_gpuRealtime;
+                Settings::WriteGpuRealtime(m_gpuRealtime);
+            }
+            tip("Experimental. Asks Windows to run SR Loom's graphics work ahead of everything else, "
+                "which can keep the 3D smooth while a game uses the whole GPU. Windows only allows it "
+                "when SR Loom is run as administrator; otherwise SR Loom keeps its usual high priority. "
+                "Applies the next time SR Loom starts.");
+            ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x);
+            if (pairToggle2("Straight to Display", m_autoPlaneOn, halfW))
+            {
+                m_autoPlaneOn = !m_autoPlaneOn;
+                Settings::WriteAutoPlane(m_autoPlaneOn);
+            }
+            tip("While the 3D covers the whole screen with nothing showing through it, SR Loom bypasses "
+                "Windows' compositor so the 3D follows your head more closely, and switches back when the "
+                "taskbar, the pointer or a window needs to show. Turn it off if the screen flickers at "
+                "those moments. Applies straight away.");
         }
         }   // (SETTINGS)
     }

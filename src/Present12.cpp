@@ -1,4 +1,5 @@
 #include "Present12.h"
+#include "Settings.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #pragma comment(lib, "d3d12.lib")
@@ -33,6 +34,19 @@ bool Present12::Initialize(ID3D11Device* d11, ID3D11DeviceContext* c11, IDXGIFac
     HRESULT hr = d11->QueryInterface(__uuidof(IDXGIDevice), (void**)&dd);
     if (SUCCEEDED(hr)) hr = dd->GetAdapter(&adapter);
     SAFE_RELEASE(dd);
+    // (Before the device is made: Direct3D 12 keeps a record of how far the GPU
+    // got through each command list, and of page faults -- read back if the
+    // device is ever lost, LogDeviceLoss. A driver timeout on 2026-10-04 left
+    // nothing to say what the GPU had been doing.)
+    {
+        ID3D12DeviceRemovedExtendedDataSettings* ds = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&ds))) && ds)
+        {
+            ds->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->Release();
+        }
+    }
     if (SUCCEEDED(hr)) hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_device));
     SAFE_RELEASE(adapter);
     if (FAILED(hr)) { Log("Present12: no Direct3D 12 device (0x%08X)", (unsigned)hr); return false; }
@@ -40,8 +54,12 @@ bool Present12::Initialize(ID3D11Device* d11, ID3D11DeviceContext* c11, IDXGIFac
     // Its queue a class up (as the Direct3D 11 device's GPU priority): the
     // weave is what must make the refresh.
     D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-    hr = m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue));
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    // (Settings GpuRealtime: the realtime queue first -- granted only to a
+    // process run as administrator; else High.)
+    hr = E_FAIL;
+    if (Settings::ReadGpuRealtime()) { qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME; hr = m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)); }
+    if (FAILED(hr)) { qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH; hr = m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)); }
     if (FAILED(hr)) { qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL; hr = m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)); }
     if (FAILED(hr)) { Log("Present12: no command queue (0x%08X)", (unsigned)hr); return false; }
     for (UINT i = 0; i < kBuffers && SUCCEEDED(hr); ++i)
@@ -131,6 +149,7 @@ bool Present12::Initialize(ID3D11Device* d11, ID3D11DeviceContext* c11, IDXGIFac
         pd.SampleDesc.Count = 1;
         hr = m_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_maskPSO));
     }
+    SAFE_RELEASE(m_maskVsBlob); m_maskVsBlob = vsb; vsb = nullptr;   // (kept: the HDR restore pass draws with it too)
     SAFE_RELEASE(err); SAFE_RELEASE(rsb); SAFE_RELEASE(vsb); SAFE_RELEASE(psb);
     if (FAILED(hr)) { Log("Present12: mask pipeline failed (0x%08X)", (unsigned)hr); return false; }
     // (t0: a one-descriptor heap -- empty until SetGpuResults.)
@@ -176,7 +195,7 @@ bool Present12::Initialize(ID3D11Device* d11, ID3D11DeviceContext* c11, IDXGIFac
         { SAFE_RELEASE(m_timeHeap); SAFE_RELEASE(m_timeBuf); m_gpuHz = 0; }
     }
     Log("Present12: Direct3D 12 presenter (%ux%u, %s-priority queue)", m_width, m_height,
-        qd.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high" : "normal");
+        qd.Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME ? "realtime" : qd.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH ? "high" : "normal");
     return true;
 }
 
@@ -308,12 +327,56 @@ ID3D12Resource* Present12::Share(ID3D11Texture2D* tex)
 void Present12::BeginFrame()
 {
     if (!m_swapChain3 || m_inFrame) return;
+    // Straight to the display (the tearing swap chain): presents there are not
+    // held back by Windows, so nothing stops a frame being drawn into a buffer
+    // the display still has -- and on 2026-10-04 that is where the GPU hung,
+    // three times: when something came up over the picture (the taskbar)
+    // Windows took a while to change over, the next frame's first write to the
+    // buffer still on screen stopped inside the GPU, and the changeover could
+    // not finish behind it -- the driver timed out. So, with three buffers: no
+    // frame is begun until the present before the last has reached the screen
+    // (the buffer about to be drawn into is then free). Waited for here, on
+    // the CPU, where waiting is harmless. No frame this loop if it takes long.
+    if ((m_scFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) && !m_gateFailed)
+    {
+        // (Ten frames in a row held back: the display's count is not to be had
+        // here. Said once; the renderer then leaves this path -- GateFailed.)
+        if (m_heldRun >= 10)
+        {
+            m_gateFailed = true;
+            Log("Present12: the display does not report which frames it has shown -- straight to the display is not safe here, going back through the compositor");
+        }
+        UINT last = 0;
+        if (SUCCEEDED(m_swapChain->GetLastPresentCount(&last)) && last >= 2)
+        {
+            const ULONGLONG t0 = GetTickCount64();
+            for (;;)
+            {
+                DXGI_FRAME_STATISTICS fs{};
+                const HRESULT hs = m_swapChain->GetFrameStatistics(&fs);
+                if (SUCCEEDED(hs) && fs.PresentCount + 1 >= last) break;
+                // (Not known -- a changeover in progress reads so: taken as not yet.)
+                if (GetTickCount64() - t0 > 50) { ++m_heldBack; ++m_heldRun; return; }
+                Sleep(1);
+            }
+            m_heldRun = 0;
+            const ULONGLONG waited = GetTickCount64() - t0;
+            if (waited > 8) Log("Present12: held a frame back %llu ms for the display to release its buffer", waited);
+        }
+    }
     m_index = m_swapChain3->GetCurrentBackBufferIndex() % kBuffers;
     // (This buffer's allocator and constants: free once the frame that last
     // used them has run.)
     if (m_fenceFrame->GetCompletedValue() < m_slotValue[m_index] &&
         SUCCEEDED(m_fenceFrame->SetEventOnCompletion(m_slotValue[m_index], m_event)))
-        WaitForSingleObject(m_event, 2000);
+    {
+        // (Waited out, however long: after 2 s this used to go on and reset an
+        // allocator the GPU was still reading -- over a stalled GPU, that is
+        // what turns a stall into a lost device. No frame until it has run.)
+        for (int tries = 0; tries < 5 && WaitForSingleObject(m_event, 2000) == WAIT_TIMEOUT; ++tries)
+            if (FAILED(m_device->GetDeviceRemovedReason())) return;
+        if (m_fenceFrame->GetCompletedValue() < m_slotValue[m_index]) return;
+    }
     ReadTimes(m_index);   // (what this buffer's last frame measured: it has run)
     m_alloc[m_index]->Reset();
     m_list->Reset(m_alloc[m_index], nullptr);
@@ -509,6 +572,7 @@ void Present12::Shutdown()
         SAFE_RELEASE(m_upload[i]);
     }
     SAFE_RELEASE(m_maskPSO); SAFE_RELEASE(m_maskRoot);
+    SAFE_RELEASE(m_scalePSO); SAFE_RELEASE(m_maskVsBlob);
     SAFE_RELEASE(m_gpu12); SAFE_RELEASE(m_gpuHeap); m_gpuSrc = nullptr;
     SAFE_RELEASE(m_rowsBuf);
     ReleaseBuffers();
@@ -523,7 +587,7 @@ void Present12::Shutdown()
     SAFE_RELEASE(m_device);
     if (m_event) { CloseHandle(m_event); m_event = nullptr; }
     m_inFrame = false; m_probe = 0;
-    m_sharedValue = m_frameValue = 0; m_slotValue[0] = m_slotValue[1] = 0;
+    m_sharedValue = m_frameValue = 0; for (UINT64& v : m_slotValue) v = 0;
 }
 
 // ---- Conversion apart from the weave ---------------------------------------
@@ -670,7 +734,7 @@ bool Present12::RecreateSwapChain(IDXGIFactory2* factory, bool opaque, bool tear
         Log("Present12: 16-bit float output (scRGB) %s (0x%08X)", SUCCEEDED(hc) ? "set" : "REFUSED", (unsigned)hc);
     }
     m_inFrame = false;
-    m_slotValue[0] = m_slotValue[1] = 0;
+    for (UINT64& v : m_slotValue) v = 0;
     return CreateBuffers();
 }
 
@@ -712,4 +776,92 @@ bool Present12::FetchRows(std::vector<uint8_t>& out)
     m_rowsBuf->Unmap(0, &none);
     SAFE_RELEASE(m_rowsBuf); m_rowsCount = 0;
     return true;
+}
+
+// The device lost: what Direct3D 12 itself recorded about it (DRED, switched on
+// in Initialize) -- for each command list still in flight, how far the GPU got
+// through it, and the address of a page fault if there was one. Into the log,
+// once (main.cpp calls this when it finds the device gone).
+void Present12::LogDeviceLoss()
+{
+    if (!m_device) return;
+    Log("Present12: device removed reason 0x%08X", (unsigned)m_device->GetDeviceRemovedReason());
+    ID3D12DeviceRemovedExtendedData* dred = nullptr;
+    if (FAILED(m_device->QueryInterface(IID_PPV_ARGS(&dred))) || !dred) { Log("Present12: no record of the device loss (DRED not available)"); return; }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc)))
+    {
+        int lists = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bc.pHeadAutoBreadcrumbNode; n && lists < 16; n = n->pNext, ++lists)
+        {
+            const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            char ops[256] = {}; int at = 0;
+            // (The operations round where it stopped, as Direct3D numbers them:
+            // 3 CopyResource, 2 DrawInstanced, 15 ResourceBarrier, 9 ExecuteCommandList...)
+            for (UINT k = done > 3 ? done - 3 : 0; k < n->BreadcrumbCount && k < done + 3 && at < 230; ++k)
+                at += snprintf(ops + at, sizeof(ops) - at, "%s%d", k == done ? " | next: " : " ", n->pCommandHistory ? (int)n->pCommandHistory[k] : -1);
+            Log("Present12:   command list \"%ls\" on queue \"%ls\": %u of %u operations finished%s -- operations%s",
+                n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?", n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?",
+                done, n->BreadcrumbCount, done < n->BreadcrumbCount ? " (the GPU stopped inside this one)" : "", ops);
+        }
+        if (!lists) Log("Present12:   no Direct3D 12 command list was in flight (the hang was not in SR Loom's Direct3D 12 work)");
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf)) && pf.PageFaultVA)
+        Log("Present12:   GPU page fault at 0x%llX%s", (unsigned long long)pf.PageFaultVA,
+            pf.pHeadRecentFreedAllocationNode ? " -- in memory freed shortly before (a resource released while still in use)" : "");
+    dred->Release();
+}
+
+// HDR: the back buffer times the scale, after the weave (Renderer::HdrRestore:
+// the weave is made on the picture brought down into 0..1). A pipeline of its
+// own on the mask's vertex shader and root signature; the scale is written into
+// its pixel shader, so it is made again when the scale changes.
+void Present12::SetHdrScale(float scale)
+{
+    if (scale == m_hdrScale) return;
+    m_hdrScale = scale;
+    if (m_scalePSO) { WaitIdle(); SAFE_RELEASE(m_scalePSO); }
+}
+
+void Present12::DrawHdrRestore()
+{
+    if (!m_inFrame || !m_hdr || m_hdrScale <= 1.0f || !m_maskRoot || !m_maskVsBlob) return;
+    if (!m_scalePSO)
+    {
+        char src[160];
+        snprintf(src, sizeof(src), "float4 PSMain() : SV_Target { return float4(%.6f, %.6f, %.6f, 1.0); }", m_hdrScale, m_hdrScale, m_hdrScale);
+        ID3DBlob* psb = nullptr; ID3DBlob* err = nullptr;
+        if (FAILED(D3DCompile(src, strlen(src), "HdrRestore", nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psb, &err))) { SAFE_RELEASE(err); return; }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = m_maskRoot;
+        pd.VS = { m_maskVsBlob->GetBufferPointer(), m_maskVsBlob->GetBufferSize() };
+        pd.PS = { psb->GetBufferPointer(), psb->GetBufferSize() };
+        auto& b = pd.BlendState.RenderTarget[0];
+        b.BlendEnable = TRUE; b.SrcBlend = D3D12_BLEND_ZERO; b.DestBlend = D3D12_BLEND_SRC_COLOR; b.BlendOp = D3D12_BLEND_OP_ADD;
+        b.SrcBlendAlpha = D3D12_BLEND_ZERO; b.DestBlendAlpha = D3D12_BLEND_ONE; b.BlendOpAlpha = D3D12_BLEND_OP_ADD;   // (alpha as the weave left it)
+        b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = 0xFFFFFFFF;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1; pd.RTVFormats[0] = OutputFormat();
+        pd.SampleDesc.Count = 1;
+        const HRESULT hr = m_device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_scalePSO));
+        SAFE_RELEASE(psb); SAFE_RELEASE(err);
+        if (FAILED(hr)) { Log("Present12: HDR restore pipeline failed (0x%08X)", (unsigned)hr); return; }
+        Log("Present12: HDR -- the weave is made at 1/%.2f of the picture's brightness and brought back after", m_hdrScale);
+    }
+    // (Everything set again: the weaver left its own state on the list.)
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += (SIZE_T)m_index * m_rtvStep;
+    m_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT vp = Viewport();
+    const D3D12_RECT all{ 0, 0, (LONG)m_width, (LONG)m_height };
+    m_list->RSSetViewports(1, &vp);
+    m_list->RSSetScissorRects(1, &all);
+    m_list->SetPipelineState(m_scalePSO);
+    m_list->SetGraphicsRootSignature(m_maskRoot);
+    m_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_list->DrawInstanced(3, 1, 0, 0);
 }

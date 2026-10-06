@@ -29,11 +29,18 @@ namespace srw
         // Returns true when a valid shared texture is currently bound.
         bool Update();
 
+        // Each frame while receiving, after Update. A sender that fills only
+        // the top-left part of its texture and leaves the rest black (a game
+        // rendering below the size its texture was made at) is found out
+        // here -- a few rows and columns read back once a second -- and
+        // only the filled part is handed on (SRV / Width / Height).
+        void PrepareFrame();
+
         bool IsActive()    const { return m_device != nullptr; }   // watch started
         bool IsReceiving() const { return m_srv    != nullptr; }   // texture bound this frame
-        ID3D11ShaderResourceView* SRV() const { return m_srv; }
-        int Width()  const { return m_width;  }
-        int Height() const { return m_height; }
+        ID3D11ShaderResourceView* SRV() const { return (m_cropSrv && m_srv) ? m_cropSrv : m_srv; }
+        int Width()  const { return m_cropSrv ? m_cropW : m_width;  }
+        int Height() const { return m_cropSrv ? m_cropH : m_height; }
         DXGI_FORMAT Format() const { return m_format; }
         // The texture holds sRGB colour values but can only be viewed as plain
         // UNORM (the original Katanga strips the sRGB type from the game's
@@ -59,6 +66,8 @@ namespace srw
     private:
         bool TryOpenTexture(HANDLE sharedHandle);
         void ReleaseTexture();
+        void TakeProbe(int filledW, int filledH);
+        void SetCrop(int w, int h);
 
         ID3D11Device*             m_device         = nullptr;
         // We deliberately do NOT keep a persistent handle to the named
@@ -75,5 +84,19 @@ namespace srw
         bool                      m_rightFirst     = false;
         DWORD                     m_lastPollTick   = 0;
         unsigned                  m_generation     = 0;
+        // (The filled part of the texture: PrepareFrame.)
+        static constexpr int      kProbe           = 8;         // rows, and columns, read back
+        ID3D11DeviceContext*      m_ctx            = nullptr;
+        DXGI_FORMAT               m_texFormat      = DXGI_FORMAT_UNKNOWN;   // (the texture's own)
+        ID3D11Texture2D*          m_probeRows      = nullptr;   // staging: width x kProbe
+        ID3D11Texture2D*          m_probeCols      = nullptr;   // staging: kProbe x height
+        bool                      m_probePending   = false;
+        DWORD                     m_probeTick      = 0;
+        double                    m_fill           = 0.0;       // the largest filled share seen (of width and of height alike)
+        int                       m_fillSame       = 0;         // probes in a row that agreed with it
+        int                       m_fillLow        = 0;         // probes in a row well under it
+        ID3D11Texture2D*          m_cropTex        = nullptr;
+        ID3D11ShaderResourceView* m_cropSrv        = nullptr;
+        int                       m_cropW          = 0, m_cropH = 0;
     };
 }
